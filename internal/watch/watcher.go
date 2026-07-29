@@ -6,6 +6,7 @@ package watch
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -22,8 +23,9 @@ type Watcher struct {
 	matcher  *fs.IgnoreMatcher
 	debounce time.Duration
 
-	batches chan map[string]struct{}
-	done    chan struct{}
+	batches   chan map[string]struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewWatcher creates a Watcher rooted at root. It walks root and adds every
@@ -41,10 +43,22 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
-			if addErr := fsw.Add(path); addErr != nil {
-				return addErr
+		if !d.IsDir() {
+			return nil
+		}
+		if path != root {
+			rel, relErr := fs.NormalizeRelativePath(root, path)
+			if relErr == nil && matcher.Match(rel, true) {
+				// Don't watch ignored directory subtrees at all (e.g. a
+				// pre-existing .git, node_modules, .venv): on Linux this
+				// avoids burning inotify watch descriptors (and ENOSPC)
+				// on large ignored trees, and per-event Match() already
+				// keeps their contents out of batches anyway.
+				return filepath.SkipDir
 			}
+		}
+		if addErr := fsw.Add(path); addErr != nil {
+			return addErr
 		}
 		return nil
 	})
@@ -76,16 +90,14 @@ func (w *Watcher) Batches() <-chan map[string]struct{} {
 
 // Close stops the watcher's goroutine, closes the underlying fsnotify
 // watcher, and closes the batches channel. It is safe to call more than
-// once.
+// once, including concurrently from multiple goroutines.
 func (w *Watcher) Close() error {
-	select {
-	case <-w.done:
-		// already closed
-		return nil
-	default:
+	var err error
+	w.closeOnce.Do(func() {
 		close(w.done)
-	}
-	return w.fsw.Close()
+		err = w.fsw.Close()
+	})
+	return err
 }
 
 // run is the single goroutine that owns all mutable state (pending set and
