@@ -25,6 +25,13 @@ const (
 	defaultDeepScan   = time.Hour
 )
 
+// newTicker is time.NewTicker, indirected through a package-level variable
+// purely so tests can observe which durations Run actually passes to it -
+// e.g. confirming a non-positive RemotePoll/DeepScan really gets clamped to
+// the documented 30s/1h defaults - without a full fake clock. Same pattern
+// as watcher.go's fsAdd.
+var newTicker = time.NewTicker
+
 // Run blocks until ctx is cancelled. It starts an fsnotify Watcher on
 // p.LocalRoot and drives three triggers, each running one reconcile cycle:
 //
@@ -83,9 +90,9 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 		deepScan = defaultDeepScan
 	}
 
-	pollTicker := time.NewTicker(remotePoll)
+	pollTicker := newTicker(remotePoll)
 	defer pollTicker.Stop()
-	deepTicker := time.NewTicker(deepScan)
+	deepTicker := newTicker(deepScan)
 	defer deepTicker.Stop()
 
 	// batches is a local copy of w.Batches() that gets nil'd out once the

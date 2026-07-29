@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,6 +80,63 @@ func TestRunClampsNonPositiveDurationsToDefaults(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return after ctx cancellation - possibly panicked or hung on non-positive ticker duration")
+	}
+}
+
+// TestRunClampsNonPositiveDurationsToDefaults_AssertsCadence closes the gap
+// left by TestRunClampsNonPositiveDurationsToDefaults (docs/follow-ups.md
+// #6): that test only proved Run doesn't panic or hang on a non-positive
+// duration, not that the clamp actually lands on the documented 30s/1h
+// defaults. newTicker is swapped here to record every duration Run passes to
+// it, without needing a full fake clock.
+func TestRunClampsNonPositiveDurationsToDefaults_AssertsCadence(t *testing.T) {
+	local, remote := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(remote, ".synclock"), []byte("x"), 0o644)
+	dbh, _ := db.Open(filepath.Join(t.TempDir(), "m.db"))
+	defer dbh.Close()
+	logger, _ := runtime.NewLogger(true, filepath.Join(t.TempDir(), "l.log"))
+	defer logger.Close()
+	m, _ := fs.LoadIgnoreMatcher(local)
+	p := app.RobustParams{LocalRoot: local, RemoteRoot: remote, Workers: 1, Repo: db.NewManifestRepo(dbh), DB: dbh, Logger: logger}
+
+	var mu sync.Mutex
+	var got []time.Duration
+	orig := newTicker
+	newTicker = func(d time.Duration) *time.Ticker {
+		mu.Lock()
+		got = append(got, d)
+		mu.Unlock()
+		return orig(d)
+	}
+	defer func() { newTicker = orig }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, p, m, LoopConfig{RemotePoll: 0, DeepScan: -1, Debounce: 10 * time.Millisecond})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation - possibly panicked or hung on non-positive ticker duration")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("expected exactly 2 newTicker calls (poll ticker + deep scan ticker), got %d: %v", len(got), got)
+	}
+	if got[0] != defaultRemotePoll {
+		t.Errorf("RemotePoll=0 should clamp to defaultRemotePoll (%v), got %v", defaultRemotePoll, got[0])
+	}
+	if got[1] != defaultDeepScan {
+		t.Errorf("DeepScan=-1 should clamp to defaultDeepScan (%v), got %v", defaultDeepScan, got[1])
 	}
 }
 
