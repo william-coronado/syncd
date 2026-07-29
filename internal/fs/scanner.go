@@ -183,6 +183,14 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 				relPath = path
 			}
 			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: walkErr.Error()})
+			// Load-bearing order: this write to Skipped must happen before the
+			// d.IsDir() check below. reconcile.SkipSet.Contains only ever
+			// matches a directory's OWN path via the exact Skipped set -
+			// dirPrefixes(path) never returns path itself as one of its own
+			// prefixes - so if this line moved after the IsDir branch, a
+			// skipped directory's own path would silently stop being treated
+			// as skipped by every reconciler (see
+			// TestScanTree_SkippedDirRecordedInBothSkippedAndSkippedDirs).
 			result.Skipped[relPath] = struct{}{}
 			if d != nil && d.IsDir() {
 				// Its contents couldn't be read (e.g. permission denied) -

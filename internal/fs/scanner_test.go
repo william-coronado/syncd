@@ -505,6 +505,45 @@ func TestScanTree_UnreadableSubdirectoryRecordsSkippedDir(t *testing.T) {
 	}
 }
 
+// TestScanTree_SkippedDirRecordedInBothSkippedAndSkippedDirs pins an
+// invariant load-bearing for reconcile.SkipSet: ScanTree must record an
+// unreadable directory's own relpath in BOTH Skipped (exact) and
+// SkippedDirs (subtree). reconcile.SkipSet.Contains only ever treats a path
+// as skipped via an exact Skipped match or as a descendant of a SkippedDirs
+// entry - dirPrefixes never returns a path's own name as one of its own
+// prefixes - so a directory's own path relies entirely on also being present
+// in Skipped. If scanner.go's per-entry walkErr branch ever stopped writing
+// to Skipped before the d.IsDir() check that populates SkippedDirs, this
+// would silently reopen the subtree-delete data-loss bug SkipSet exists to
+// prevent (see docs/follow-ups.md #1).
+func TestScanTree_SkippedDirRecordedInBothSkippedAndSkippedDirs(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	badDir := filepath.Join(root, "locked")
+	if err := os.Mkdir(badDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(badDir, "hidden.txt"), "hidden")
+	if err := os.Chmod(badDir, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badDir, 0o755) })
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for an unreadable subdirectory, want success: %v", err)
+	}
+	if _, ok := result.Skipped["locked"]; !ok {
+		t.Errorf("expected %q recorded in Skipped, got %+v", "locked", result.Skipped)
+	}
+	if _, ok := result.SkippedDirs["locked"]; !ok {
+		t.Errorf("expected %q recorded in SkippedDirs, got %+v", "locked", result.SkippedDirs)
+	}
+}
+
 // TestScanTree_RootWalkErrorAborts pins the other side of the abort/record
 // line: a failure on the root itself (not a per-entry problem somewhere
 // inside the tree) must still be a hard error, not a silently-empty
