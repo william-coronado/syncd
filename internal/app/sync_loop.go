@@ -114,17 +114,47 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	// committed to the manifest below before we report failure.
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
 
-	var (
-		upserts  []db.ManifestRow
-		deletes  []string
-		failures int
-	)
+	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
+
+	failures += createMissingEmptyDirs(p.Logger, p.LocalRoot, p.RemoteRoot, scans.Local.Dirs, scans.Remote.Dirs)
+	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
+
+	if len(upserts) > 0 || len(deletes) > 0 {
+		if err := p.Repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
+			return plan, failures, &robustHardError{stage: "apply manifest updates", err: err}
+		}
+	}
+
+	return plan, failures, runErr
+}
+
+// filterToOnlyPaths returns a new map containing only the entries of m whose
+// key is present in only.
+func filterToOnlyPaths[T any](m map[string]T, only map[string]struct{}) map[string]T {
+	out := make(map[string]T, len(only))
+	for k, v := range m {
+		if _, ok := only[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// collectManifestUpdates dedups a batch of execute.Result into the final set
+// of manifest upserts and deletes to commit, and counts failed actions. When
+// the same path appears more than once across results (e.g. a delete
+// followed by a recreate within one run), the later update wins and any
+// earlier one for that path is discarded - hence the seen-maps rather than
+// appending directly. Extracted from RunRobustOnce so RunRobustScoped can
+// reuse the exact same dedup logic; behavior is unchanged from its inline
+// original.
+func collectManifestUpdates(results []execute.Result, logger *runtime.Logger) (upserts []db.ManifestRow, deletes []string, failures int) {
 	seenUpserts := make(map[string]db.ManifestRow)
 	seenDeletes := make(map[string]struct{})
 	for _, res := range results {
 		if res.Error != nil {
 			failures++
-			p.Logger.Error("action failed", map[string]any{
+			logger.Error("action failed", map[string]any{
 				"action": res.Action.Type,
 				"path":   res.Action.Path,
 				"error":  res.Error.Error(),
@@ -150,29 +180,60 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	}
 	sort.Slice(upserts, func(i, j int) bool { return upserts[i].Path < upserts[j].Path })
 	sort.Strings(deletes)
-
-	failures += createMissingEmptyDirs(p.Logger, p.LocalRoot, p.RemoteRoot, scans.Local.Dirs, scans.Remote.Dirs)
-	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
-
-	if len(upserts) > 0 || len(deletes) > 0 {
-		if err := p.Repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
-			return plan, failures, &robustHardError{stage: "apply manifest updates", err: err}
-		}
-	}
-
-	return plan, failures, runErr
+	return upserts, deletes, failures
 }
 
-// filterToOnlyPaths returns a new map containing only the entries of m whose
-// key is present in only.
-func filterToOnlyPaths[T any](m map[string]T, only map[string]struct{}) map[string]T {
-	out := make(map[string]T, len(only))
-	for k, v := range m {
-		if _, ok := only[k]; ok {
-			out[k] = v
+// RunRobustScoped reconciles ONLY relPaths, scanning just those paths on
+// both sides via fs.ScanPaths (no tree walk). It mirrors RunRobustOnce's
+// scan -> plan -> execute -> manifest-commit flow but omits whole-tree
+// empty-dir CREATION (new empty dirs, and dirs emptied by a recursive
+// delete outside this batch, are picked up by the periodic deep scan
+// instead). Emptied-dir cleanup driven by this batch's own deletes still
+// runs, same as RunRobustOnce.
+func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]struct{}) (reconcile.Plan, int, error) {
+	matcher, err := fs.LoadIgnoreMatcher(p.LocalRoot)
+	if err != nil {
+		return reconcile.Plan{}, 0, err
+	}
+	manifest, err := p.Repo.LoadAll(ctx)
+	if err != nil {
+		return reconcile.Plan{}, 0, err
+	}
+	localScan, err := fs.ScanPaths(p.LocalRoot, relPaths, manifest, p.Policy, true, matcher)
+	if err != nil {
+		return reconcile.Plan{}, 0, err
+	}
+	remoteScan, err := fs.ScanPaths(p.RemoteRoot, relPaths, manifest, p.Policy, false, matcher)
+	if err != nil {
+		return reconcile.Plan{}, 0, err
+	}
+	for _, issue := range localScan.Issues {
+		p.Logger.Error("skipping local file", map[string]any{"path": issue.Path, "reason": issue.Reason})
+	}
+	scopedManifest := make(map[string]db.ManifestRow, len(relPaths))
+	for rel := range relPaths {
+		if row, ok := manifest[rel]; ok {
+			scopedManifest[rel] = row
 		}
 	}
-	return out
+	skipped := copySkipped(localScan.Skipped, remoteScan.Skipped)
+	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
+	execActions := make([]reconcile.Action, 0, len(plan.Actions))
+	for _, a := range plan.Actions {
+		if a.Type != reconcile.ActionNoOp {
+			execActions = append(execActions, a)
+		}
+	}
+	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files}
+	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
+	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
+	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
+	if len(upserts) > 0 || len(deletes) > 0 {
+		if err := p.Repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
+			return plan, failures, err
+		}
+	}
+	return plan, failures, runErr
 }
 
 func Run(ctx context.Context, cfg runtime.Config) error {
