@@ -557,6 +557,34 @@ func TestScanTree_RootWalkErrorAborts(t *testing.T) {
 	}
 }
 
+// TestScanTree_RootReadDirFailureAborts pins the other root-failure shape
+// from docs/follow-ups.md #4: TestScanTree_RootWalkErrorAborts covers "root
+// doesn't exist" (an Lstat failure on root). This covers "root exists but
+// its own ReadDir fails" (e.g. permission denied) - filepath.WalkDir invokes
+// the walk callback a SECOND time for root itself when os.ReadDir(root)
+// fails, with that error attached, and ScanTree's `if path == root { return
+// walkErr }` branch must treat that as a whole-scan abort too, not silently
+// record it as a per-entry issue and continue as if the tree were empty.
+func TestScanTree_RootReadDirFailureAborts(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	parent := t.TempDir()
+	root := filepath.Join(parent, "locked-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(root, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	_, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, parent), HashAlways, nil)
+	if err == nil {
+		t.Fatal("expected an error when the root itself exists but its ReadDir fails, got nil")
+	}
+}
+
 // TestScanTree_ContextCancellationAborts pins the same line from the
 // cancellation side: ctx.Done() must still abort the whole scan with an
 // error, never be swallowed as a per-entry issue.
