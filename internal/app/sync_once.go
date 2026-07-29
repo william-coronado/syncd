@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
 	"syncd/internal/db"
 	"syncd/internal/execute"
 	"syncd/internal/fs"
 	"syncd/internal/reconcile"
+	"syncd/internal/runtime"
 )
 
 // ErrAborted is returned by SyncOnce when the caller's Confirm callback
@@ -178,93 +178,66 @@ func fastSummary(name string, mode reconcile.FastMode, tasks []reconcile.FastTas
 }
 
 // runRobustOnce runs the robust, hash-based three-way engine for a single
-// ad-hoc job (the --hash bridge). It deliberately mirrors the
-// scan -> plan -> execute -> manifest-update shape of app.Run's always-on
-// loop (see sync_loop.go) rather than duplicating its logic from scratch:
-// it reuses the same reconcile.BuildPlan/execute.RunActions/db.ManifestRepo
-// pieces and the package-private copySkipped helper from sync_loop.go.
+// ad-hoc job (the --hash bridge) by delegating the scan -> plan -> execute
+// -> manifest-update (+ empty-dir) cycle to the shared app.RunRobustOnce
+// (see run.go / sync_loop.go), so the --hash path benefits from the same
+// empty-dir create/cleanup and scan-progress logging as app.Run's always-on
+// loop.
 //
-// Known simplification (flagged per the task-7 brief, which explicitly
-// allows a minimal --hash path for now): unlike app.Run, this does not
-// create/clean up empty directories (createMissingEmptyDirs/
-// cleanupEmptiedDirs in directories.go) since those helpers take a
-// *runtime.Logger that SyncOnce has no equivalent of, and does not emit
-// scan-progress logging. A later task (Task 9, per the brief) is expected
-// to extract a proper shared RunRobustOnce helper used by both app.Run and
-// SyncOnce; this is a deliberately minimal bridge until then.
+// RunRobustOnce has no pause point between planning and executing, but
+// SyncOnce supports an interactive confirm-before-mutate step (ptermConfirm
+// from the CLI). So when a confirmation is actually needed (!opts.Assume),
+// this builds a preview plan itself first - a second, hash-based scan -
+// purely to produce the summary text and get sign-off, then calls
+// RunRobustOnce for the (re-scanned) real run. The common automated case
+// (--yes) skips the preview and goes straight to RunRobustOnce, paying for
+// only one scan.
+//
+// RunRobustOnce takes a *runtime.Logger, which SyncOptions has no
+// equivalent of; a non-silent logger (no log file) is constructed here,
+// which is fine for this ad-hoc case - non-silent Loggers route Printf to
+// stdout and drop structured Info/Error events, matching how app.Run itself
+// behaves outside --silent.
 func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	repo := db.NewManifestRepo(sqlDB)
-	manifest, err := repo.LoadAll(ctx)
-	if err != nil {
-		return fmt.Errorf("load manifest: %w", err)
-	}
-
-	scans, err := fs.ScanPair(ctx, opts.Left, opts.Right, manifest, fs.HashAlways, nil)
-	if err != nil {
-		return fmt.Errorf("scan: %w", err)
-	}
-
-	skipped := copySkipped(scans.Local.Skipped, scans.Remote.Skipped)
-	plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
-
-	execActions := make([]reconcile.Action, 0, len(plan.Actions))
-	for _, action := range plan.Actions {
-		if action.Type != reconcile.ActionNoOp {
-			execActions = append(execActions, action)
-		}
-	}
 
 	if !opts.Assume {
+		manifest, err := repo.LoadAll(ctx)
+		if err != nil {
+			return fmt.Errorf("load manifest: %w", err)
+		}
+		scans, err := fs.ScanPair(ctx, opts.Left, opts.Right, manifest, fs.HashAlways, nil)
+		if err != nil {
+			return fmt.Errorf("scan: %w", err)
+		}
+		skipped := copySkipped(scans.Local.Skipped, scans.Remote.Skipped)
+		plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
+		execActions := make([]reconcile.Action, 0, len(plan.Actions))
+		for _, action := range plan.Actions {
+			if action.Type != reconcile.ActionNoOp {
+				execActions = append(execActions, action)
+			}
+		}
 		if !confirmOrDefault(opts.Confirm)(robustSummary(opts.Name, execActions)) {
 			return ErrAborted
 		}
 	}
 
-	state := execute.SyncState{
-		LocalRoot:   opts.Left,
-		RemoteRoot:  opts.Right,
-		LocalFiles:  scans.Local.Files,
-		RemoteFiles: scans.Remote.Files,
+	logger, err := runtime.NewLogger(false, "")
+	if err != nil {
+		return fmt.Errorf("create logger: %w", err)
 	}
-	results, runErr := execute.RunActions(ctx, opts.Workers, state, execActions)
+	defer logger.Close()
 
-	var (
-		upserts  []db.ManifestRow
-		deletes  []string
-		failures int
-	)
-	seenUpserts := make(map[string]db.ManifestRow)
-	seenDeletes := make(map[string]struct{})
-	for _, res := range results {
-		if res.Error != nil {
-			failures++
-			continue
-		}
-		for _, update := range res.Updates {
-			if update.Delete {
-				seenDeletes[update.Path] = struct{}{}
-				delete(seenUpserts, update.Path)
-				continue
-			}
-			seenUpserts[update.Path] = update.Row
-			delete(seenDeletes, update.Path)
-		}
-	}
-	for _, row := range seenUpserts {
-		upserts = append(upserts, row)
-	}
-	for path := range seenDeletes {
-		deletes = append(deletes, path)
-	}
-	sort.Slice(upserts, func(i, j int) bool { return upserts[i].Path < upserts[j].Path })
-	sort.Strings(deletes)
-
-	if len(upserts) > 0 || len(deletes) > 0 {
-		if err := repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
-			return fmt.Errorf("apply manifest updates: %w", err)
-		}
-	}
-
+	_, failures, runErr := RunRobustOnce(ctx, RobustParams{
+		LocalRoot:  opts.Left,
+		RemoteRoot: opts.Right,
+		Workers:    opts.Workers,
+		Repo:       repo,
+		DB:         sqlDB,
+		Logger:     logger,
+		Policy:     fs.HashAlways,
+	})
 	if runErr != nil {
 		return fmt.Errorf("sync run did not complete: %w", runErr)
 	}
