@@ -9,18 +9,28 @@ import (
 )
 
 // defaultIgnorePatterns are always active, whether or not a user-supplied
-// .drivesyncignore exists. ".synclock" and "*.tmp" are DriveSync's own
-// protocol filenames (the remote canary and atomic-write staging files);
-// "#recycle" and ".venv" are Synology recycle bins and Python virtualenvs,
-// neither of which should ever be synced.
+// .syncdignore exists. ".synclock" and "*.tmp" are syncd's own protocol
+// filenames (the remote canary and atomic-write staging files); "#recycle"
+// and ".venv" are Synology recycle bins and Python virtualenvs, neither of
+// which should ever be synced. The remaining entries are macOS junk files
+// folded in from file_sync_util that should never be synced either.
 var defaultIgnorePatterns = []string{
-	".synclock",
-	"*.tmp",
-	"#recycle",
-	".venv",
+	".synclock", // remote canary (protocol file) — keep name as-is
+	"*.tmp",     // atomic-write staging files
+	"#recycle",  // Synology recycle bin
+	".venv",     // Python virtualenvs
+	// macOS junk (folded in from file_sync_util):
+	".DS_Store",
+	"._*",
+	".fseventsd",
+	".DocumentRevisions-V100",
+	".Spotlight-V100",
+	".TemporaryItems",
+	".Trashes",
+	"@eaDir",
 }
 
-const ignoreFileName = ".drivesyncignore"
+const ignoreFileName = ".syncdignore"
 
 type ignoreRule struct {
 	negate  bool
@@ -30,7 +40,7 @@ type ignoreRule struct {
 
 // IgnoreMatcher decides whether a scanned path should be excluded from sync,
 // using gitignore-style patterns: the built-in defaults above, followed by
-// any patterns from a .drivesyncignore file in the local root. Rules are
+// any patterns from a .syncdignore file in the local root. Rules are
 // evaluated in order and the last match wins, so a user pattern prefixed
 // with "!" can re-include something a default (or earlier) pattern would
 // otherwise exclude.
@@ -39,7 +49,7 @@ type IgnoreMatcher struct {
 }
 
 // LoadIgnoreMatcher builds a matcher from the built-in defaults plus
-// <localRoot>/.drivesyncignore, if present. The same matcher is applied to
+// <localRoot>/.syncdignore, if present. The same matcher is applied to
 // both the local and remote scans so ignore rules behave symmetrically
 // regardless of which side a matching path actually exists on.
 func LoadIgnoreMatcher(localRoot string) (*IgnoreMatcher, error) {
@@ -127,7 +137,10 @@ func (m *IgnoreMatcher) addPattern(raw string) error {
 // patterns (no "/" in the original) match the basename at any depth;
 // anchored patterns (containing "/") match the full path from root. Supports
 // "*" (any run of non-"/" characters), "**" (any run of path segments), and
-// "?" (any single non-"/" character).
+// "?" (any single non-"/" character). A trailing "(?:/.*)?" is appended so
+// that a pattern matching a directory (e.g. ".Spotlight-V100") also matches
+// every path beneath it (e.g. ".Spotlight-V100/x"), mirroring gitignore's
+// behavior of never descending into an already-ignored directory.
 func globToRegexp(pattern string, anchored bool) (*regexp.Regexp, error) {
 	var b strings.Builder
 	b.WriteString("^")
@@ -153,6 +166,6 @@ func globToRegexp(pattern string, anchored bool) (*regexp.Regexp, error) {
 			b.WriteString(regexp.QuoteMeta(string(c)))
 		}
 	}
-	b.WriteString("$")
+	b.WriteString(`(?:/.*)?$`)
 	return regexp.Compile(b.String())
 }

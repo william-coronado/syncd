@@ -98,3 +98,30 @@ func TestIgnoreMatcher_DoubleStarMatchesAcrossPathSegments(t *testing.T) {
 		t.Error("did not expect a non-.bin file to match")
 	}
 }
+
+func TestMacOSJunkExcludedByDefault(t *testing.T) {
+	dir := t.TempDir()
+	m, err := LoadIgnoreMatcher(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a/.DS_Store", "b/._resourcefork", ".Spotlight-V100/x"} {
+		if !m.Match(p, false) {
+			t.Errorf("expected %q to be ignored by default", p)
+		}
+	}
+}
+
+func TestReadsSyncdignoreFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".syncdignore"), []byte("build/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadIgnoreMatcher(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Match("build", true) {
+		t.Error("expected build/ to be ignored from .syncdignore")
+	}
+}
