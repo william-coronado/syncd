@@ -113,9 +113,10 @@ without checking the source path first (see the data-loss guard).
 - **SMB xattr writes are rejected** on the test NAS (a mount permission quirk).
   syncd doesn't copy extended attributes, so it's unaffected — but plain `cp`
   will hit `Permission denied` on xattrs there.
-- Minor test-coverage/cosmetic items are tracked in the SDD ledger at
-  `.superpowers/sdd/progress.md` (git-ignored scratch; may be absent in a fresh
-  clone).
+- Deferred minor items (test-coverage gaps, unstated invariants worth pinning,
+  deliberate tradeoffs) live in [docs/follow-ups.md](docs/follow-ups.md) — each
+  with why it was deferred and what "done" looks like. Checked in on purpose:
+  the previous list lived in git-ignored scratch and did not survive cleanup.
 - The originals (`../macOS/file_sync_util`, `../drivesync`) were intentionally
   **kept**, not deleted — syncd supersedes both.
 
