@@ -1,15 +1,18 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"runtime"
+	stdruntime "runtime"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/dustin/go-humanize"
 	"github.com/pterm/pterm"
@@ -18,6 +21,7 @@ import (
 	"syncd/internal/app"
 	"syncd/internal/execute"
 	"syncd/internal/reconcile"
+	"syncd/internal/runtime"
 )
 
 var (
@@ -81,47 +85,44 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	ctx := cmd.Context()
+	// Mirrors runWatchCmd (watch_cmd.go): without this, Ctrl-C kills a sync
+	// mid-copy without running AtomicCopyFile's cleanup defer, orphaning
+	// temp files on the destination.
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return runSyncJobs(ctx, jobs, syncRunOptions{
+		UseHash:    syncUseHash,
+		Assume:     syncAssume,
+		JobsDBPath: jobsDBPath,
+	})
+}
+
+// syncRunOptions bundles the flags that apply uniformly across every job in
+// one `syncd sync` invocation (as opposed to SyncJob, which is per-job
+// data), so runSyncJobs/runSyncJob don't need to read cli package globals
+// directly - which keeps them callable (and testable) the same way whether
+// driven by cobra or directly from a test.
+type syncRunOptions struct {
+	UseHash bool
+	Assume  bool
+	// JobsDBPath is the shared jobs.db path for fast-mode jobs; ignored
+	// when UseHash is true, since each --hash job gets its own db from
+	// hashJobDBPath instead.
+	JobsDBPath string
+}
+
+// runSyncJobs runs every job in turn and reports a per-job outcome. A job
+// whose lock is already held (see runSyncJob) fails only that job - it must
+// not abort the rest of the batch, since distinct jobs are independent and
+// may legitimately run concurrently (e.g. from a cron overlap or a second
+// invocation).
+func runSyncJobs(ctx context.Context, jobs []SyncJob, ropts syncRunOptions) error {
 	var failures int
 	for _, job := range jobs {
-		mode, err := parseFastMode(job.Mode)
-		if err != nil {
-			return fmt.Errorf("job %q: %w", job.Name, err)
-		}
-
 		pterm.DefaultSection.Println("sync job: " + job.Name)
 
-		// execute.RunActions (the --hash/robust path) has no ProgressSink
-		// parameter, so a bar started here would never see AddBytes and
-		// would sit on screen forever without a Done() to stop it. Only
-		// build one for the fast path, which actually drives it.
-		var progress execute.ProgressSink
-		if !syncUseHash {
-			progress = newPtermProgressSink()
-		}
-
-		dbPath := jobsDBPath
-		if syncUseHash {
-			dbPath, err = hashJobDBPath(job.Name)
-			if err != nil {
-				return fmt.Errorf("job %q: resolve hash manifest db: %w", job.Name, err)
-			}
-		}
-
-		opts := app.SyncOptions{
-			Name:     job.Name,
-			Left:     job.Left,
-			Right:    job.Right,
-			Mode:     mode,
-			UseHash:  syncUseHash,
-			Assume:   syncAssume,
-			Workers:  runtime.NumCPU(),
-			DBPath:   dbPath,
-			Confirm:  ptermConfirm,
-			Progress: progress,
-		}
-
-		runErr := app.SyncOnce(ctx, opts)
+		runErr := runSyncJob(ctx, job, ropts)
 		switch {
 		case errors.Is(runErr, app.ErrAborted):
 			pterm.Warning.Printf("sync job %q aborted by user\n", job.Name)
@@ -137,6 +138,61 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("%d of %d sync job(s) failed", failures, len(jobs))
 	}
 	return nil
+}
+
+// runSyncJob runs a single job under a per-job lock: the lock file is
+// derived from the job name (via syncLockPath), so two different jobs can
+// still run concurrently - only two runs of the SAME job are serialized.
+// This guards against two concurrent runs racing on both jobs.db/the
+// per-job hash manifest db and the files themselves (`syncd sync` had no
+// lock at all before this).
+func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
+	mode, err := parseFastMode(job.Mode)
+	if err != nil {
+		return fmt.Errorf("job %q: %w", job.Name, err)
+	}
+
+	lockPath, err := syncLockPath(job.Name)
+	if err != nil {
+		return fmt.Errorf("job %q: resolve lock path: %w", job.Name, err)
+	}
+	lock, err := runtime.AcquireLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("job %q: another sync is already running for this job: %w", job.Name, err)
+	}
+	defer lock.Release()
+
+	// execute.RunActions (the --hash/robust path) has no ProgressSink
+	// parameter, so a bar started here would never see AddBytes and would
+	// sit on screen forever without a Done() to stop it. Only build one for
+	// the fast path, which actually drives it.
+	var progress execute.ProgressSink
+	if !ropts.UseHash {
+		progress = newPtermProgressSink()
+	}
+
+	dbPath := ropts.JobsDBPath
+	if ropts.UseHash {
+		dbPath, err = hashJobDBPath(job.Name)
+		if err != nil {
+			return fmt.Errorf("job %q: resolve hash manifest db: %w", job.Name, err)
+		}
+	}
+
+	opts := app.SyncOptions{
+		Name:     job.Name,
+		Left:     job.Left,
+		Right:    job.Right,
+		Mode:     mode,
+		UseHash:  ropts.UseHash,
+		Assume:   ropts.Assume,
+		Workers:  stdruntime.NumCPU(),
+		DBPath:   dbPath,
+		Confirm:  ptermConfirm,
+		Progress: progress,
+	}
+
+	return app.SyncOnce(ctx, opts)
 }
 
 // resolveSyncJobs applies the --left/--right vs. config-file precedence: an
@@ -236,6 +292,21 @@ func hashJobDBPath(jobName string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "hash-"+sanitizeJobDBName(jobName)+".db"), nil
+}
+
+// syncLockPath returns the per-job lock file path used to serialize two
+// concurrent runs of the SAME job: ~/.local/state/syncd/sync-<id>.lock,
+// where <id> is jobName run through sanitizeJobDBName (the same sanitizer
+// hashJobDBPath uses, since a job name is arbitrary user-supplied text and
+// must be made safe as a filename component either way). Distinct job
+// names get distinct lock files, so distinct jobs are never blocked by
+// each other - only two runs of one job are.
+func syncLockPath(jobName string) (string, error) {
+	dir, err := syncdStateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "sync-"+sanitizeJobDBName(jobName)+".lock"), nil
 }
 
 // sanitizeJobDBName maps a job name - arbitrary user-supplied text from the

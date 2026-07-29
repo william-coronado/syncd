@@ -9,6 +9,7 @@ import (
 
 	"syncd/internal/app"
 	"syncd/internal/reconcile"
+	"syncd/internal/runtime"
 )
 
 // withTempHome points os.UserHomeDir() (via $HOME) at a fresh temp
@@ -19,6 +20,122 @@ func withTempHome(t *testing.T) string {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	return home
+}
+
+// TestSyncLockPath_DistinctPathsForDistinctJobs checks that the per-job
+// lock file is actually per-job: two different job names must never
+// collide on the same lock path, or a lock held by one job would block a
+// completely unrelated job's run too.
+func TestSyncLockPath_DistinctPathsForDistinctJobs(t *testing.T) {
+	withTempHome(t)
+
+	a, err := syncLockPath("job-a")
+	if err != nil {
+		t.Fatalf("syncLockPath(job-a): %v", err)
+	}
+	b, err := syncLockPath("job-b")
+	if err != nil {
+		t.Fatalf("syncLockPath(job-b): %v", err)
+	}
+	if a == b {
+		t.Fatalf("expected distinct lock paths for distinct job names, both got %q", a)
+	}
+	if !strings.HasSuffix(a, "sync-job-a.lock") {
+		t.Errorf("path = %q, want suffix sync-job-a.lock", a)
+	}
+}
+
+// TestRunSyncJob_HeldLockReturnsClearErrorNamingTheJob is a regression test
+// for Task 5c: `syncd sync` previously took no lock at all, so two
+// concurrent runs of the same two-way job could race on both jobs.db and
+// the files themselves. Once a job's lock is held elsewhere, runSyncJob
+// must fail that job with a clear, non-panicking error that names the job
+// - not silently proceed and race.
+func TestRunSyncJob_HeldLockReturnsClearErrorNamingTheJob(t *testing.T) {
+	withTempHome(t)
+
+	left, right := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	job := SyncJob{Name: "locked-job", Left: left, Right: right, Mode: string(reconcile.FastMirror)}
+
+	lockPath, err := syncLockPath(job.Name)
+	if err != nil {
+		t.Fatalf("syncLockPath: %v", err)
+	}
+	heldLock, err := runtime.AcquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	defer heldLock.Release()
+
+	jobsDBPath, err := defaultJobsDBPath()
+	if err != nil {
+		t.Fatalf("defaultJobsDBPath: %v", err)
+	}
+
+	err = runSyncJob(context.Background(), job, syncRunOptions{Assume: true, JobsDBPath: jobsDBPath})
+	if err == nil {
+		t.Fatal("expected an error when the job's lock is already held")
+	}
+	if !strings.Contains(err.Error(), job.Name) {
+		t.Errorf("expected error to name the job %q, got: %v", job.Name, err)
+	}
+
+	// The held lock must have prevented the run outright - the file must
+	// not have been copied.
+	if _, statErr := os.Stat(filepath.Join(right, "a.txt")); !os.IsNotExist(statErr) {
+		t.Error("job ran despite its lock being held")
+	}
+}
+
+// TestRunSyncJobs_HeldLockDoesNotAbortOtherJobs is the batch-level half of
+// the same fix: the lock is per-job, so one job's lock being held must not
+// stop unrelated jobs in the same batch from running.
+func TestRunSyncJobs_HeldLockDoesNotAbortOtherJobs(t *testing.T) {
+	withTempHome(t)
+
+	leftA, rightA := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(leftA, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	leftB, rightB := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(leftB, "b.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+
+	lockedJob := SyncJob{Name: "locked-job", Left: leftA, Right: rightA, Mode: string(reconcile.FastMirror)}
+	freeJob := SyncJob{Name: "free-job", Left: leftB, Right: rightB, Mode: string(reconcile.FastMirror)}
+
+	lockPath, err := syncLockPath(lockedJob.Name)
+	if err != nil {
+		t.Fatalf("syncLockPath: %v", err)
+	}
+	heldLock, err := runtime.AcquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	defer heldLock.Release()
+
+	jobsDBPath, err := defaultJobsDBPath()
+	if err != nil {
+		t.Fatalf("defaultJobsDBPath: %v", err)
+	}
+
+	err = runSyncJobs(context.Background(), []SyncJob{lockedJob, freeJob}, syncRunOptions{Assume: true, JobsDBPath: jobsDBPath})
+	if err == nil {
+		t.Fatal("expected an aggregate error since locked-job's lock is held")
+	}
+
+	// free-job must still have completed despite locked-job's failure.
+	if b, readErr := os.ReadFile(filepath.Join(rightB, "b.txt")); readErr != nil || string(b) != "hi" {
+		t.Errorf("free-job did not complete: err=%v content=%q", readErr, b)
+	}
+	// locked-job's destination must remain untouched.
+	if _, statErr := os.Stat(filepath.Join(rightA, "a.txt")); !os.IsNotExist(statErr) {
+		t.Error("locked-job appears to have run despite its held lock")
+	}
 }
 
 func TestHashJobDBPath_DistinctPathsForDistinctJobs(t *testing.T) {
