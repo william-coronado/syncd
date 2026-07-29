@@ -209,8 +209,8 @@ func TestRun_HonorsDriveSyncIgnoreFile(t *testing.T) {
 	cfg := newTestConfig(t, localRoot, remoteRoot)
 	ctx := context.Background()
 
-	if err := os.WriteFile(filepath.Join(localRoot, ".drivesyncignore"), []byte("*.scratch\nbuild/\n"), 0o644); err != nil {
-		t.Fatalf("write .drivesyncignore: %v", err)
+	if err := os.WriteFile(filepath.Join(localRoot, ".syncdignore"), []byte("*.scratch\nbuild/\n"), 0o644); err != nil {
+		t.Fatalf("write .syncdignore: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(localRoot, "notes.scratch"), []byte("throwaway"), 0o644); err != nil {
 		t.Fatalf("write notes.scratch: %v", err)
@@ -232,10 +232,10 @@ func TestRun_HonorsDriveSyncIgnoreFile(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(remoteRoot, "keep.txt")); err != nil {
 		t.Fatalf("expected keep.txt to sync to remote, stat err = %v", err)
 	}
-	// .drivesyncignore itself is an ordinary file (like .gitignore in a repo)
+	// .syncdignore itself is an ordinary file (like .gitignore in a repo)
 	// and syncs like any other, so both machines end up with the same rules.
-	if _, err := os.Stat(filepath.Join(remoteRoot, ".drivesyncignore")); err != nil {
-		t.Fatalf("expected .drivesyncignore to sync to remote, stat err = %v", err)
+	if _, err := os.Stat(filepath.Join(remoteRoot, ".syncdignore")); err != nil {
+		t.Fatalf("expected .syncdignore to sync to remote, stat err = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(remoteRoot, "notes.scratch")); !os.IsNotExist(err) {
 		t.Fatalf("expected notes.scratch to be ignored, not synced to remote, stat err = %v", err)
