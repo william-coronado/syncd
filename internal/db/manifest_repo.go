@@ -55,6 +55,20 @@ func (r *ManifestRepo) ApplyUpdates(ctx context.Context, upserts []ManifestRow, 
 		}
 	}()
 
+	// Every assignment to err below (here and at the four other sites in
+	// this function) uses plain `=`, never `:=` - err is this function's
+	// NAMED RETURN, which the deferred rollback closure above inspects.
+	// This isn't cosmetic: this function's history (commit 4ee0907) is
+	// exactly this class of bug - err used to be unnamed and each failure
+	// path assigned to a separately-named local (prepErr/execErr) that the
+	// deferred rollback never looked at, so a failed transaction's
+	// connection - and SQLite's write lock - leaked permanently. `var stmt
+	// *sql.Stmt` is declared separately (rather than `stmt, err :=
+	// tx.PrepareContext(...)`) purely so this line can assign to err with
+	// `=` instead of accidentally declaring a new, block-scoped err that
+	// shadows the named return. A future "simplify" pass collapsing these
+	// two lines back into one `:=` would reintroduce the same class of bug
+	// this fixed - keep all five sites using `=`.
 	if len(upserts) > 0 {
 		var stmt *sql.Stmt
 		stmt, err = tx.PrepareContext(ctx, `

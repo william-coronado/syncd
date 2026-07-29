@@ -42,6 +42,9 @@ func TestOpen_PragmasTakeEffect(t *testing.T) {
 // next to it) and asserts Open still succeeds, falling back to the
 // default journal mode while keeping the busy_timeout.
 func TestOpen_DegradesWhenWALUnavailable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission checks")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "manifest.db")
 
