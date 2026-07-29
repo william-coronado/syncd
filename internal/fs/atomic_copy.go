@@ -60,8 +60,15 @@ func AtomicCopyFile(srcPath, dstPath string) error {
 	return nil
 }
 
+// tempFileInfix marks every atomic-write staging filename tempSiblingPath
+// generates: ".<base>" + tempFileInfix + "<nanos>-<rand>". The ignore
+// matcher's default staging-file pattern (in ignore.go) is derived from this
+// same constant, so the two can never again silently drift apart the way
+// "*.tmp" and this naming scheme once did.
+const tempFileInfix = ".tmp-"
+
 func tempSiblingPath(dstPath string) string {
 	dir := filepath.Dir(dstPath)
 	base := filepath.Base(dstPath)
-	return filepath.Join(dir, fmt.Sprintf(".%s.tmp-%d-%d", base, time.Now().UnixNano(), rand.Intn(100000)))
+	return filepath.Join(dir, fmt.Sprintf(".%s%s%d-%d", base, tempFileInfix, time.Now().UnixNano(), rand.Intn(100000)))
 }

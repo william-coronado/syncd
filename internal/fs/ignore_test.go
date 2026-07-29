@@ -140,6 +140,35 @@ func TestIgnoreMatcher_UnanchoredPatternDoesNotSubstringMatch(t *testing.T) {
 	}
 }
 
+// TestIgnoreMatcher_MatchesAtomicWriteStagingFiles is a regression test for
+// Task 3b: *.tmp alone does not cover tempSiblingPath's generated staging
+// names (".<base>.tmp-<nanos>-<rand>"), because "*.tmp" requires ".tmp" to be
+// terminal. It ties the ignore matcher directly to tempSiblingPath's actual
+// output so the two can never silently drift apart again, and additionally
+// pins the literal example from the review evidence.
+func TestIgnoreMatcher_MatchesAtomicWriteStagingFiles(t *testing.T) {
+	root := t.TempDir()
+	matcher := newTestMatcher(t, root)
+
+	generated := filepath.Base(tempSiblingPath(filepath.Join(root, "notes.txt")))
+	if !matcher.Match(generated, false) {
+		t.Errorf("expected tempSiblingPath's generated name %q to be ignored", generated)
+	}
+	nested := "sub/" + generated
+	if !matcher.Match(nested, false) {
+		t.Errorf("expected nested staging name %q to be ignored", nested)
+	}
+
+	// Literal example from the review evidence.
+	literal := ".notes.txt.tmp-1712345678901234-42"
+	if !matcher.Match(literal, false) {
+		t.Errorf("expected literal staging name %q to be ignored", literal)
+	}
+	if !matcher.Match("sub/"+literal, false) {
+		t.Errorf("expected nested literal staging name to be ignored")
+	}
+}
+
 func TestReadsSyncdignoreFile(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, ".syncdignore"), []byte("build/\n"), 0o644); err != nil {
