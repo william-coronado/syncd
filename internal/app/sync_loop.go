@@ -7,7 +7,6 @@ import (
 	"os"
 	"sort"
 
-	"syncd/internal/cli"
 	"syncd/internal/db"
 	"syncd/internal/execute"
 	"syncd/internal/fs"
@@ -20,7 +19,7 @@ type runSummary struct {
 	Errors  int                          `json:"errors"`
 }
 
-func Run(ctx context.Context, cfg cli.Config) error {
+func Run(ctx context.Context, cfg runtime.Config) error {
 	paths, err := runtime.ResolvePaths(cfg)
 	if err != nil {
 		return err
@@ -153,7 +152,7 @@ func Run(ctx context.Context, cfg cli.Config) error {
 // runInit bootstraps first-time setup: creates the local and remote root
 // directories if missing, and writes the remote canary file (.synclock) if
 // it isn't already there. It performs no reconciliation.
-func runInit(cfg cli.Config, logger *runtime.Logger) error {
+func runInit(cfg runtime.Config, logger *runtime.Logger) error {
 	if err := os.MkdirAll(cfg.LocalRoot, 0o755); err != nil {
 		return fmt.Errorf("create local root: %w", err)
 	}

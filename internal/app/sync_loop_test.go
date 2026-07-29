@@ -6,17 +6,17 @@ import (
 	"path/filepath"
 	"testing"
 
-	"syncd/internal/cli"
+	"syncd/internal/runtime"
 )
 
-func newTestConfig(t *testing.T, localRoot, remoteRoot string) cli.Config {
+func newTestConfig(t *testing.T, localRoot, remoteRoot string) runtime.Config {
 	t.Helper()
 	// Canary file: with no --init support yet, tests bootstrap it manually,
 	// mirroring what a real first-time setup must do by hand today.
 	if err := os.WriteFile(filepath.Join(remoteRoot, ".synclock"), []byte("canary"), 0o644); err != nil {
 		t.Fatalf("write canary: %v", err)
 	}
-	return cli.Config{
+	return runtime.Config{
 		LocalRoot:  localRoot,
 		RemoteRoot: remoteRoot,
 		Workers:    2,
@@ -161,7 +161,7 @@ func TestRun_InitBootstrapsDirsAndCanaryWithoutSyncing(t *testing.T) {
 	localRoot := filepath.Join(parent, "local")
 	remoteRoot := filepath.Join(parent, "remote")
 
-	cfg := cli.Config{
+	cfg := runtime.Config{
 		LocalRoot:  localRoot,
 		RemoteRoot: remoteRoot,
 		Workers:    2,
@@ -187,7 +187,7 @@ func TestRun_InitBootstrapsDirsAndCanaryWithoutSyncing(t *testing.T) {
 func TestRun_InitIsIdempotent(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
-	cfg := cli.Config{
+	cfg := runtime.Config{
 		LocalRoot:  localRoot,
 		RemoteRoot: remoteRoot,
 		Workers:    2,

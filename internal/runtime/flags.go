@@ -1,13 +1,18 @@
-package cli
+package runtime
 
 import (
 	"errors"
 	"flag"
 	"fmt"
 	"path/filepath"
-	"runtime"
+	stdruntime "runtime"
 )
 
+// Config is the legacy flags-based configuration for the always-on sync
+// daemon (app.Run). It predates the batch/ad-hoc `syncd sync` command and
+// its viper-backed config in internal/cli, and lives here (rather than in
+// internal/cli) so that internal/cli is free to import internal/app without
+// creating an import cycle.
 type Config struct {
 	LocalRoot  string
 	RemoteRoot string
@@ -30,7 +35,7 @@ func ParseArgs(args []string) (Config, error) {
 	fs.BoolVar(&cfg.DryRun, "dry-run", false, "Calculate and print sync actions only")
 	fs.BoolVar(&cfg.Silent, "silent", false, "Write structured logs only, suppress stdout")
 	fs.BoolVar(&cfg.Init, "init", false, "Bootstrap local/remote directories and the remote canary file, then exit")
-	fs.IntVar(&cfg.Workers, "workers", runtime.NumCPU(), "Worker pool size")
+	fs.IntVar(&cfg.Workers, "workers", stdruntime.NumCPU(), "Worker pool size")
 	fs.StringVar(&cfg.StateDir, "state-dir", "", "State directory for lock/db/log")
 	fs.StringVar(&cfg.DBPath, "db-path", "", "Path to SQLite manifest file")
 	fs.StringVar(&cfg.LogPath, "log-path", "", "Path to JSON log file")

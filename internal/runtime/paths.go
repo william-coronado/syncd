@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"syncd/internal/cli"
 )
 
 type RuntimePaths struct {
@@ -15,7 +13,7 @@ type RuntimePaths struct {
 	LockPath string
 }
 
-func ResolvePaths(cfg cli.Config) (RuntimePaths, error) {
+func ResolvePaths(cfg Config) (RuntimePaths, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return RuntimePaths{}, fmt.Errorf("resolve home directory: %w", err)
