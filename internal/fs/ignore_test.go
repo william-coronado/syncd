@@ -32,7 +32,7 @@ func TestIgnoreMatcher_DefaultsExcludeProtocolAndKnownJunkPaths(t *testing.T) {
 	}
 }
 
-func TestIgnoreMatcher_UserPatternsFromDriveSyncIgnoreFile(t *testing.T) {
+func TestIgnoreMatcher_UserPatternsFromSyncdignoreFile(t *testing.T) {
 	root := t.TempDir()
 	content := "# comment lines and blanks are skipped\n\nnode_modules\n/only-at-root\nbuild/\n"
 	if err := os.WriteFile(filepath.Join(root, ignoreFileName), []byte(content), 0o644); err != nil {
@@ -76,7 +76,7 @@ func TestIgnoreMatcher_NegationReincludesAPattern(t *testing.T) {
 	}
 }
 
-func TestIgnoreMatcher_MissingDriveSyncIgnoreFileIsNotAnError(t *testing.T) {
+func TestIgnoreMatcher_MissingSyncdignoreFileIsNotAnError(t *testing.T) {
 	root := t.TempDir()
 	if _, err := LoadIgnoreMatcher(root); err != nil {
 		t.Fatalf("LoadIgnoreMatcher with no ignore file present: %v", err)
@@ -108,6 +108,34 @@ func TestMacOSJunkExcludedByDefault(t *testing.T) {
 	for _, p := range []string{"a/.DS_Store", "b/._resourcefork", ".Spotlight-V100/x"} {
 		if !m.Match(p, false) {
 			t.Errorf("expected %q to be ignored by default", p)
+		}
+	}
+}
+
+// TestIgnoreMatcher_UnanchoredPatternDoesNotSubstringMatch is a boundary
+// regression test for globToRegexp: an unanchored pattern like "build" must
+// match only a path segment exactly equal to "build" (at any depth), never
+// merely contain "build" as a substring of a longer segment.
+func TestIgnoreMatcher_UnanchoredPatternDoesNotSubstringMatch(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ignoreFileName), []byte("build\n"), 0o644); err != nil {
+		t.Fatalf("write ignore file: %v", err)
+	}
+	matcher := newTestMatcher(t, root)
+
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"a/build/x", true},       // exact segment match, nested
+		{"build", true},           // exact segment match, at root
+		{"a/buildstuff/x", false}, // "build" is only a prefix of the segment
+		{"a/xbuild", false},       // "build" is only a suffix of the segment
+		{"a/xbuildy", false},      // "build" is only a substring of the segment
+	}
+	for _, tc := range cases {
+		if got := matcher.Match(tc.path, false); got != tc.want {
+			t.Errorf("Match(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 }

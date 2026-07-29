@@ -40,3 +40,17 @@ func TestRunFastTasksMove(t *testing.T) {
 		t.Error("file not moved to new path")
 	}
 }
+
+// TestRunFastTasksUnknownTaskTypeErrors guards against applyFastTask's
+// default case silently succeeding (returning nil) on an unrecognized
+// FastTaskType, mirroring applyAction's "unknown action type" handling in
+// worker_pool.go - an unknown task should surface as a failure, not be
+// dropped on the floor as a silent no-op.
+func TestRunFastTasksUnknownTaskTypeErrors(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	tasks := []reconcile.FastTask{{Type: reconcile.FastTaskType("Bogus"), RelPath: "a.txt"}}
+	err := RunFastTasks(context.Background(), 1, left, right, tasks, nil)
+	if err == nil {
+		t.Fatal("expected RunFastTasks to error on an unknown FastTaskType, got nil")
+	}
+}

@@ -2,6 +2,7 @@ package execute
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -107,7 +108,7 @@ func applyFastTask(left, right string, task reconcile.FastTask, progress Progres
 	case reconcile.MoveR:
 		return moveFastFile(right, task)
 	default:
-		return nil
+		return fmt.Errorf("unknown action type %s", task.Type)
 	}
 }
 
