@@ -287,3 +287,99 @@ func TestSyncOnceDryRun_DoesNotRequireYes(t *testing.T) {
 		t.Error("dry-run copied a.txt to right - tree was mutated")
 	}
 }
+
+// TestSyncOnceDryRun_MirrorDoesNotCreateMissingDestination is a regression
+// test for a gap the earlier --dry-run fix missed: SyncOnce called
+// prepareRoots unconditionally, and prepareRoots os.MkdirAll's the
+// destination for mirror/update/--hash - so a dry run against a
+// not-yet-existing destination silently created a real, empty directory on
+// disk (including, in production, on the mounted SMB share). "exits without
+// mutating anything" must mean the destination is never created either, not
+// just that no files are copied/deleted into it.
+func TestSyncOnceDryRun_MirrorDoesNotCreateMissingDestination(t *testing.T) {
+	left := t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	// A destination path that does NOT exist yet and is never created by
+	// the test - t.TempDir() only creates its own directory, not this
+	// child path.
+	right := filepath.Join(t.TempDir(), "does-not-exist-yet")
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, Mode: reconcile.FastMirror,
+		DryRun: true, Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err != nil {
+		t.Fatalf("dry-run SyncOnce returned error: %v", err)
+	}
+	if _, statErr := os.Stat(right); !os.IsNotExist(statErr) {
+		t.Errorf("dry-run created the destination directory %s - stat err = %v", right, statErr)
+	}
+}
+
+// TestSyncOnceDryRun_HashDoesNotCreateMissingDestination is the --hash-path
+// counterpart to TestSyncOnceDryRun_MirrorDoesNotCreateMissingDestination.
+func TestSyncOnceDryRun_HashDoesNotCreateMissingDestination(t *testing.T) {
+	left := t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	right := filepath.Join(t.TempDir(), "does-not-exist-yet")
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, UseHash: true,
+		DryRun: true, Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err != nil {
+		t.Fatalf("dry-run SyncOnce (hash) returned error: %v", err)
+	}
+	if _, statErr := os.Stat(right); !os.IsNotExist(statErr) {
+		t.Errorf("dry-run (hash) created the destination directory %s - stat err = %v", right, statErr)
+	}
+}
+
+// TestSyncOnceDryRun_TwoWayDoesNotCreateEitherMissingRoot is the two-way
+// half of the same fix, and the strictly worse case the reviewer flagged:
+// prepareRoots creates BOTH roots for two-way, so a dry run must leave
+// BOTH untouched when neither pre-exists.
+func TestSyncOnceDryRun_TwoWayDoesNotCreateEitherMissingRoot(t *testing.T) {
+	parent := t.TempDir()
+	left := filepath.Join(parent, "left-does-not-exist-yet")
+	right := filepath.Join(parent, "right-does-not-exist-yet")
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "j", Left: left, Right: right, Mode: reconcile.FastTwoWay,
+		DryRun: true, Assume: true, Workers: 1, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err != nil {
+		t.Fatalf("dry-run SyncOnce (two-way) returned error: %v", err)
+	}
+	if _, statErr := os.Stat(left); !os.IsNotExist(statErr) {
+		t.Errorf("dry-run created the left root %s - stat err = %v", left, statErr)
+	}
+	if _, statErr := os.Stat(right); !os.IsNotExist(statErr) {
+		t.Errorf("dry-run created the right root %s - stat err = %v", right, statErr)
+	}
+}
+
+// TestSyncOnceDryRun_MirrorMissingSourceStillErrors checks that skipping
+// destination creation under --dry-run did not also weaken the data-loss
+// guard: a dry run against a genuinely missing mirror SOURCE must still
+// report the same error as a real run - the guard is a validation, not a
+// creation, and only the creation half may be skipped for --dry-run.
+func TestSyncOnceDryRun_MirrorMissingSourceStillErrors(t *testing.T) {
+	right := t.TempDir()
+	missingLeft := filepath.Join(t.TempDir(), "does-not-exist")
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: missingLeft, Right: right, Mode: reconcile.FastMirror,
+		DryRun: true, Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err == nil {
+		t.Fatal("expected a dry-run mirror with a missing source to error, got nil")
+	}
+	if _, statErr := os.Stat(missingLeft); !os.IsNotExist(statErr) {
+		t.Fatalf("expected source path to remain nonexistent, stat err = %v", statErr)
+	}
+}

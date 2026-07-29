@@ -64,7 +64,22 @@ func SyncOnce(ctx context.Context, opts SyncOptions) error {
 // prepareRoots ensures both sync roots exist before scanning (ad-hoc jobs
 // are commonly pointed at a destination that doesn't exist yet - that's the
 // point of `mirror` - unlike the always-on daemon, which requires --init
-// first and so can assume both roots are already there).
+// first and so can assume both roots are already there) - except for
+// --dry-run, which must not create anything on disk at all (see
+// validateRoots/createRoots below for why the two are split).
+func prepareRoots(opts SyncOptions) error {
+	if err := validateRoots(opts); err != nil {
+		return err
+	}
+	if opts.DryRun {
+		return nil
+	}
+	return createRoots(opts)
+}
+
+// validateRoots is prepareRoots' data-loss guard, and runs unconditionally
+// - even for --dry-run, which must report the exact same error as a real
+// run against a genuinely missing source, not silently treat it as empty.
 //
 // It is deliberately mode-aware: mirror/update (fast) and the --hash/robust
 // path are directional, with opts.Left as the source of truth, so
@@ -72,26 +87,37 @@ func SyncOnce(ctx context.Context, opts SyncOptions) error {
 // mirror branch (or BuildPlan) would see "everything on the destination is
 // gone from the source" and emit deletes for the destination's entire
 // contents, silently wiping it under --yes. For those modes the source
-// (opts.Left) must already exist; only the destination (opts.Right) is
-// auto-created. two-way (fast) is symmetric and safe - a missing side with
-// no prior persisted state produces copies, not deletes - so creating both
-// roots there is fine.
-func prepareRoots(opts SyncOptions) error {
+// (opts.Left) must already exist. two-way (fast) is symmetric and safe - a
+// missing side with no prior persisted state produces copies, not deletes -
+// so it has no source-must-exist requirement at all.
+func validateRoots(opts SyncOptions) error {
 	if !opts.UseHash && opts.Mode == reconcile.FastTwoWay {
-		if err := os.MkdirAll(opts.Left, 0o755); err != nil {
-			return fmt.Errorf("create left root: %w", err)
-		}
-		if err := os.MkdirAll(opts.Right, 0o755); err != nil {
-			return fmt.Errorf("create right root: %w", err)
-		}
 		return nil
 	}
-
 	if _, err := os.Stat(opts.Left); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("source directory does not exist: %s", opts.Left)
 		}
 		return fmt.Errorf("stat source directory %s: %w", opts.Left, err)
+	}
+	return nil
+}
+
+// createRoots creates whichever roots don't exist yet, and is skipped
+// entirely for --dry-run (which must not create anything on disk - not
+// even an empty destination directory, since that's still a real mutation
+// on whatever filesystem opts.Right lives on, including a mounted SMB
+// share in production).
+//
+// mirror/update/--hash only create the destination (opts.Right) - the
+// source (opts.Left) was already validated to exist by validateRoots and
+// must never be auto-created, per the data-loss guard. two-way creates
+// both roots (see validateRoots' doc comment for why that's safe there).
+func createRoots(opts SyncOptions) error {
+	if !opts.UseHash && opts.Mode == reconcile.FastTwoWay {
+		if err := os.MkdirAll(opts.Left, 0o755); err != nil {
+			return fmt.Errorf("create left root: %w", err)
+		}
 	}
 	if err := os.MkdirAll(opts.Right, 0o755); err != nil {
 		return fmt.Errorf("create right root: %w", err)
@@ -110,7 +136,7 @@ func confirmOrDefault(confirm func(string) bool) func(string) bool {
 
 // runFastOnce executes the size+mtime fast reconciler (mirror/update/two-way).
 func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
-	scans, err := fs.ScanPair(ctx, opts.Left, opts.Right, nil, fs.HashNever, nil)
+	scans, err := scanPairForOpts(ctx, opts, nil, fs.HashNever)
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)
 	}
@@ -155,6 +181,57 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		}
 	}
 	return nil
+}
+
+// scanPairForOpts scans opts.Left/opts.Right, exactly via fs.ScanPair,
+// UNLESS opts.DryRun is set - --dry-run skips createRoots, so a root that
+// doesn't exist yet is a real possibility here (never true for a
+// non-dry-run call, since createRoots already ran by the time this is
+// called), and fs.ScanPair/ScanTree deliberately abort the whole scan if
+// the ROOT itself is missing (load-bearing: that's how a vanished SMB mount
+// is distinguished from an empty tree, and internal/fs is owned by another
+// task - that behavior must not be weakened). So for --dry-run only, this
+// treats a missing root as an empty tree for the PREVIEW rather than
+// creating it or failing the scan.
+func scanPairForOpts(ctx context.Context, opts SyncOptions, manifest map[string]db.ManifestRow, policy fs.HashPolicy) (fs.ScanPairResult, error) {
+	if !opts.DryRun {
+		return fs.ScanPair(ctx, opts.Left, opts.Right, manifest, policy, nil)
+	}
+
+	// Mirrors fs.ScanPair's own local-root-relative ignore matcher and
+	// validateSMBName (true for local/left, false for remote/right), just
+	// scanning each side in turn instead of concurrently - dry-run preview
+	// is not the hot path.
+	matcher, err := fs.LoadIgnoreMatcher(opts.Left)
+	if err != nil {
+		return fs.ScanPairResult{}, err
+	}
+	local, err := scanRootOrEmpty(ctx, opts.Left, manifest, true, matcher, policy)
+	if err != nil {
+		return fs.ScanPairResult{}, err
+	}
+	remote, err := scanRootOrEmpty(ctx, opts.Right, manifest, false, matcher, policy)
+	if err != nil {
+		return fs.ScanPairResult{}, err
+	}
+	return fs.ScanPairResult{Local: local, Remote: remote}, nil
+}
+
+// scanRootOrEmpty is fs.ScanTree, except a root that doesn't exist yet
+// yields an empty ScanResult instead of an error. Used only by
+// scanPairForOpts's --dry-run path - see its doc comment for why.
+func scanRootOrEmpty(ctx context.Context, root string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *fs.IgnoreMatcher, policy fs.HashPolicy) (fs.ScanResult, error) {
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return fs.ScanResult{
+				Files:   make(map[string]fs.FileEntry),
+				Skipped: make(map[string]struct{}),
+				Dirs:    make(map[string]struct{}),
+			}, nil
+		}
+		return fs.ScanResult{}, fmt.Errorf("stat %s: %w", root, err)
+	}
+	return fs.ScanTree(ctx, root, manifest, validateSMBName, matcher, policy, nil)
 }
 
 func toJobFileStates(files map[string]fs.FileEntry) map[string]db.JobFileState {
@@ -255,7 +332,7 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		if err != nil {
 			return fmt.Errorf("load manifest: %w", err)
 		}
-		scans, err := fs.ScanPair(ctx, opts.Left, opts.Right, manifest, fs.HashAlways, nil)
+		scans, err := scanPairForOpts(ctx, opts, manifest, fs.HashAlways)
 		if err != nil {
 			return fmt.Errorf("scan: %w", err)
 		}
