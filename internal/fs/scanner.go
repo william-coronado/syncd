@@ -54,8 +54,23 @@ type ScanProgressFunc func(scanned int, done bool)
 // since ScanPair scans both concurrently.
 type ScanPairProgressFunc func(side string, scanned int, done bool)
 
-func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[string]db.ManifestRow, progress ScanPairProgressFunc) (ScanPairResult, error) {
-	// Ignore rules live in the local root's .drivesyncignore and are applied
+// HashPolicy controls whether ScanTree/ScanPair compute a content hash for
+// each scanned file.
+type HashPolicy int
+
+const (
+	// HashIfChanged hashes only when a file's size+mtime differ from the
+	// manifest (default; this is the historical, always-on-sync behavior).
+	HashIfChanged HashPolicy = iota
+	// HashNever skips hashing entirely; FileEntry.Hash is left empty and
+	// callers compare on size+mtime alone.
+	HashNever
+	// HashAlways hashes every scanned file regardless of manifest state.
+	HashAlways
+)
+
+func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[string]db.ManifestRow, policy HashPolicy, progress ScanPairProgressFunc) (ScanPairResult, error) {
+	// Ignore rules live in the local root's .syncdignore and are applied
 	// identically to both trees, so a pattern excludes a path regardless of
 	// which side it actually exists on.
 	matcher, err := LoadIgnoreMatcher(localRoot)
@@ -80,12 +95,12 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		res, err := ScanTree(ctx, localRoot, manifest, true, matcher, localProgress)
+		res, err := ScanTree(ctx, localRoot, manifest, true, matcher, policy, localProgress)
 		ch <- item{key: "local", res: res, err: err}
 	}()
 	go func() {
 		defer wg.Done()
-		res, err := ScanTree(ctx, remoteRoot, manifest, false, matcher, remoteProgress)
+		res, err := ScanTree(ctx, remoteRoot, manifest, false, matcher, policy, remoteProgress)
 		ch <- item{key: "remote", res: res, err: err}
 	}()
 	wg.Wait()
@@ -111,7 +126,7 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 // from having hung) without spamming a line per file.
 const progressReportInterval = 3 * time.Second
 
-func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, progress ScanProgressFunc) (ScanResult, error) {
+func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy, progress ScanProgressFunc) (ScanResult, error) {
 	result := ScanResult{
 		Files:   make(map[string]FileEntry),
 		Skipped: make(map[string]struct{}),
@@ -168,12 +183,22 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 		mtime := info.ModTime().Unix()
 
 		hash := ""
-		if row, ok := manifest[relPath]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
-			hash = row.Hash
-		} else {
+		switch policy {
+		case HashNever:
+			// leave hash empty; reconciler compares on size+mtime
+		case HashAlways:
 			hash, err = FileBLAKE3(path)
 			if err != nil {
 				return fmt.Errorf("hash file %s: %w", path, err)
+			}
+		default: // HashIfChanged
+			if row, ok := manifest[relPath]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
+				hash = row.Hash
+			} else {
+				hash, err = FileBLAKE3(path)
+				if err != nil {
+					return fmt.Errorf("hash file %s: %w", path, err)
+				}
 			}
 		}
 		result.Files[relPath] = FileEntry{

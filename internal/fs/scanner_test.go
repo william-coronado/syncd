@@ -36,7 +36,7 @@ func TestScanTree_RecordsDirectoriesIncludingEmptyOnes(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(root, "withfile", "a.txt"), "content")
 
-	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestScanTree_SkipsSMBForbiddenCharacters(t *testing.T) {
 	writeFile(t, filepath.Join(root, "good.txt"), "ok")
 	writeFile(t, filepath.Join(root, "bad?name.txt"), "not ok")
 
-	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestScanTree_DoesNotValidateSMBNamesWhenDisabled(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "bad?name.txt"), "content")
 
-	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestScanTree_ExcludesSynclockAndTmpFiles(t *testing.T) {
 	writeFile(t, filepath.Join(root, "partial.tmp"), "leftover")
 	writeFile(t, filepath.Join(root, "real.txt"), "content")
 
-	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestScanTree_PrunesDefaultIgnoredDirectoriesEntirely(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(root, ".venv", "lib", "site.py"), "must never be scanned")
 
-	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestScanTree_ReportsFinalProgressWithFileCount(t *testing.T) {
 		}{scanned, done})
 	}
 
-	if _, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), progress); err != nil {
+	if _, err := ScanTree(context.Background(), root, nil, true, newTestMatcher(t, root), HashIfChanged, progress); err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
 
@@ -205,7 +205,7 @@ func TestScanTree_ReusesManifestHashWhenSizeAndMtimeMatch(t *testing.T) {
 		},
 	}
 
-	result, err := ScanTree(context.Background(), root, manifest, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, manifest, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestScanTree_RecomputesHashWhenMtimeDiffers(t *testing.T) {
 		t.Fatalf("FileBLAKE3: %v", err)
 	}
 
-	result, err := ScanTree(context.Background(), root, manifest, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, manifest, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}
@@ -249,6 +249,43 @@ func TestScanTree_RecomputesHashWhenMtimeDiffers(t *testing.T) {
 	}
 	if got == "sentinel-hash-from-manifest" {
 		t.Fatalf("scanner incorrectly reused stale manifest hash despite mtime mismatch")
+	}
+}
+
+func TestScanTreeHashNeverSkipsHashing(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := LoadIgnoreMatcher(dir)
+	res, err := ScanTree(context.Background(), dir, nil, false, m, HashNever, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := res.Files["a.txt"]
+	if !ok {
+		t.Fatal("a.txt missing from scan")
+	}
+	if e.Hash != "" {
+		t.Errorf("HashNever must not hash; got %q", e.Hash)
+	}
+	if e.Size != 5 {
+		t.Errorf("size = %d, want 5", e.Size)
+	}
+}
+
+func TestScanTreeHashAlwaysHashes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := LoadIgnoreMatcher(dir)
+	res, err := ScanTree(context.Background(), dir, nil, false, m, HashAlways, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Files["a.txt"].Hash == "" {
+		t.Error("HashAlways must populate Hash")
 	}
 }
 
@@ -280,7 +317,7 @@ func TestScanTree_RecomputesHashForSameSecondMtime_RacyMtimeGuard(t *testing.T) 
 		t.Fatalf("FileBLAKE3: %v", err)
 	}
 
-	result, err := ScanTree(context.Background(), root, manifest, true, newTestMatcher(t, root), nil)
+	result, err := ScanTree(context.Background(), root, manifest, true, newTestMatcher(t, root), HashIfChanged, nil)
 	if err != nil {
 		t.Fatalf("ScanTree returned error: %v", err)
 	}

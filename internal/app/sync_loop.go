@@ -57,7 +57,7 @@ func Run(ctx context.Context, cfg cli.Config) error {
 		return err
 	}
 
-	scans, err := fs.ScanPair(ctx, cfg.LocalRoot, cfg.RemoteRoot, manifest, scanProgressLogger(logger))
+	scans, err := fs.ScanPair(ctx, cfg.LocalRoot, cfg.RemoteRoot, manifest, fs.HashIfChanged, scanProgressLogger(logger))
 	if err != nil {
 		return err
 	}
