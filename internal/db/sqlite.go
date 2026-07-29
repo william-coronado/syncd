@@ -7,11 +7,52 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// dsn builds the modernc.org/sqlite connection string for path. The driver
+// treats each "_pragma" query parameter as a verbatim PRAGMA statement to run
+// on every new physical connection (see modernc.org/sqlite's
+// applyQueryParams), so this is how busy_timeout and journal_mode get set
+// before any of our own SQL runs.
+func dsn(path string, wal bool) string {
+	q := "?_pragma=busy_timeout(5000)"
+	if wal {
+		q += "&_pragma=journal_mode(WAL)"
+	}
+	return path + q
+}
+
+// Open opens (creating if needed) the SQLite database at path.
+//
+// It sets a 5s busy_timeout so a contended writer waits instead of failing
+// instantly with SQLITE_BUSY, and tries to enable WAL journaling for better
+// concurrent read/write behavior. WAL isn't available on every filesystem
+// (e.g. a read-only mount, or certain network mounts) — if it can't be
+// enabled, Open degrades to the default journal mode rather than failing;
+// busy_timeout still applies either way.
+//
+// The pool is capped at one connection (SetMaxOpenConns(1)): the manifest is
+// a single-writer store, so there is never a legitimate reason for a second
+// concurrent connection. Capping it means a future leaked transaction (one
+// that checks out the only connection and never returns it) surfaces as an
+// obvious blocked/timed-out caller on the very next call, rather than
+// quietly growing the pool and masking the leak.
 func Open(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", dsn(path, true))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	if pingErr := db.Ping(); pingErr != nil {
+		_ = db.Close()
+		db, err = sql.Open("sqlite", dsn(path, false))
+		if err != nil {
+			return nil, fmt.Errorf("open sqlite (WAL fallback): %w", err)
+		}
+		if pingErr := db.Ping(); pingErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open sqlite: %w", pingErr)
+		}
+	}
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS file_manifest (
 			path TEXT PRIMARY KEY,

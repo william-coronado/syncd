@@ -99,6 +99,50 @@ func TestManifestRepo_Delete(t *testing.T) {
 	}
 }
 
+func TestManifestRepo_ApplyUpdates_RollsBackAndFreesConnOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.db")
+	sqlDB, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	repo := NewManifestRepo(sqlDB)
+	ctx := context.Background()
+
+	// Force a mid-transaction failure inside ApplyUpdates: this trigger fires
+	// on every INSERT into file_manifest (including the upsert's INSERT ...
+	// ON CONFLICT path) and aborts the statement.
+	if _, err := sqlDB.Exec(`
+		CREATE TRIGGER fail_on_insert
+		BEFORE INSERT ON file_manifest
+		BEGIN
+			SELECT RAISE(ABORT, 'forced failure for test');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	row := ManifestRow{Path: "a.txt", Size: 10, Mtime: 100, Hash: "h1", LastSynced: 200}
+	if err := repo.ApplyUpdates(ctx, []ManifestRow{row}, nil); err == nil {
+		t.Fatal("expected ApplyUpdates to fail because of the trigger")
+	}
+
+	if stats := sqlDB.Stats(); stats.InUse != 0 {
+		t.Fatalf("expected no connections in use after a failed ApplyUpdates (leaked tx holds the conn), got InUse=%d idle=%d open=%d",
+			stats.InUse, stats.Idle, stats.OpenConnections)
+	}
+
+	if _, err := sqlDB.Exec(`DROP TRIGGER fail_on_insert`); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+
+	// A previously leaked tx holds SQLite's write lock, so this must fail
+	// with SQLITE_BUSY if the rollback above didn't actually happen.
+	if err := repo.ApplyUpdates(ctx, []ManifestRow{row}, nil); err != nil {
+		t.Fatalf("expected a healthy ApplyUpdates to succeed after dropping the trigger, got: %v", err)
+	}
+}
+
 func TestManifestRepo_UpsertFillsLastSyncedWhenZero(t *testing.T) {
 	repo := openTestDB(t)
 	ctx := context.Background()
