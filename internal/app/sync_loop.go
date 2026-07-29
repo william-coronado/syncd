@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -14,11 +13,6 @@ import (
 	"syncd/internal/reconcile"
 	"syncd/internal/runtime"
 )
-
-type runSummary struct {
-	Actions map[reconcile.ActionType]int `json:"actions"`
-	Errors  int                          `json:"errors"`
-}
 
 // RobustParams configures a single robust, hash-based three-way sync cycle
 // run by RunRobustOnce. It is the shared engine behind the `syncd watch`
@@ -255,36 +249,4 @@ func copySkipped(sets ...map[string]struct{}) map[string]struct{} {
 		}
 	}
 	return out
-}
-
-// printRunSummary logs the outcome of a completed run (action-type counts
-// plus failure count), either as structured JSON (--silent) or human-
-// readable Printf lines. It has no current production caller - it was
-// app.Run's post-RunRobustOnce reporting step, and app.Run (the old
-// always-on-daemon entrypoint superseded by the `syncd sync`/`syncd watch`
-// cobra commands) was removed as dead code in this cleanup round - but it is
-// kept intentionally as a small, self-contained run-summary formatter that a
-// future caller (e.g. `syncd watch`'s cycle logging) may still want.
-func printRunSummary(logger *runtime.Logger, silent bool, actions []reconcile.Action, failures int) error {
-	counts := make(map[reconcile.ActionType]int)
-	for _, action := range actions {
-		counts[action.Type]++
-	}
-	sum := runSummary{
-		Actions: counts,
-		Errors:  failures,
-	}
-	if silent {
-		b, err := json.Marshal(sum)
-		if err != nil {
-			return fmt.Errorf("marshal run summary: %w", err)
-		}
-		logger.Info("sync run summary", map[string]any{"summary": json.RawMessage(b)})
-		return nil
-	}
-	logger.Printf("sync completed with %d error(s)", failures)
-	for actionType, count := range counts {
-		logger.Printf("%s: %d", actionType, count)
-	}
-	return nil
 }
