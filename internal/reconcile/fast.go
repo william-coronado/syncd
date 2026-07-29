@@ -1,6 +1,10 @@
 package reconcile
 
-import "syncd/internal/db"
+import (
+	"sort"
+
+	"syncd/internal/db"
+)
 
 // FastMode selects the reconciliation strategy for the fast (size+mtime)
 // reconciler used by the ad-hoc `sync` command.
@@ -53,12 +57,24 @@ func fastGetSig(s db.JobFileState) fastSignature {
 // internal/sync.Compare, with FileState{Size,ModTime} swapped for
 // db.JobFileState{Size,Mtime} (mtime as unix seconds). prev is the previous
 // two-way state and is only consulted in FastTwoWay mode.
-func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState) FastResult {
+//
+// skipped identifies paths this run's scan could not read (a symlink, an
+// unreadable file, or anything beneath an unreadable subdirectory - see
+// SkipSet). Such a path is excluded from every branch below, in both
+// directions: a path we know nothing about must never drive a copy, a
+// delete, or a move, since "not in left/right" is ambiguous between "really
+// absent" and "couldn't be read this scan" (see the Critical 1/2 findings
+// this parameter exists to close - a skipped counterpart used to look
+// "deleted" and drive a real delete on the other side).
+func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, skipped SkipSet) FastResult {
 	var tasks []FastTask
 	newState := make(map[string]db.JobFileState)
 
 	if mode == FastMirror {
 		for relPath, lState := range left {
+			if skipped.Contains(relPath) {
+				continue
+			}
 			newState[relPath] = lState
 			rState, rExists := right[relPath]
 			if !rExists {
@@ -68,12 +84,18 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState) Fa
 			}
 		}
 		for relPath := range right {
+			if skipped.Contains(relPath) {
+				continue
+			}
 			if _, lExists := left[relPath]; !lExists {
 				tasks = append(tasks, FastTask{Type: DeleteR, RelPath: relPath})
 			}
 		}
 	} else if mode == FastUpdate {
 		for relPath, lState := range left {
+			if skipped.Contains(relPath) {
+				continue
+			}
 			newState[relPath] = lState
 			rState, rExists := right[relPath]
 			if !rExists || lState.Size != rState.Size || lState.Mtime > rState.Mtime {
@@ -81,38 +103,134 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState) Fa
 			}
 		}
 		for relPath, rState := range right {
+			if skipped.Contains(relPath) {
+				continue
+			}
 			if _, exists := newState[relPath]; !exists {
 				newState[relPath] = rState
 			}
 		}
 	} else if mode == FastTwoWay {
+		// Build signature -> path lookups for files that vanished from each
+		// side since prev, so a "new" path elsewhere can be matched back to
+		// where it came from (a rename/move). Signatures are {Size,Mtime}
+		// only, so two vanished files can collide on the same signature; a
+		// collision must not let either be picked arbitrarily (that risks
+		// emitting a move to the wrong destination, which is data loss). If
+		// a signature collides, drop it from the map entirely so the later
+		// lookup simply misses and both paths safely fall through to the
+		// slower-but-always-correct copy/delete path.
 		leftMissingSigs := make(map[fastSignature]string)
+		leftMissingCollided := make(map[fastSignature]bool)
 		rightMissingSigs := make(map[fastSignature]string)
+		rightMissingCollided := make(map[fastSignature]bool)
 
 		for path, state := range prev {
+			if skipped.Contains(path) {
+				// Ambiguous: we don't know this scan whether path is really
+				// gone from left/right or just unreadable, so it must not
+				// seed a move-detection candidate (that could pair it with
+				// an unrelated new path and emit a wrong move) or a delete
+				// (handled by the same check in pass 2 below).
+				continue
+			}
+			sig := fastGetSig(state)
 			if _, ok := left[path]; !ok {
-				leftMissingSigs[fastGetSig(state)] = path
+				if leftMissingCollided[sig] {
+					// already known to collide; nothing to do
+				} else if _, exists := leftMissingSigs[sig]; exists {
+					delete(leftMissingSigs, sig)
+					leftMissingCollided[sig] = true
+				} else {
+					leftMissingSigs[sig] = path
+				}
 			}
 			if _, ok := right[path]; !ok {
-				rightMissingSigs[fastGetSig(state)] = path
+				if rightMissingCollided[sig] {
+					// already known to collide; nothing to do
+				} else if _, exists := rightMissingSigs[sig]; exists {
+					delete(rightMissingSigs, sig)
+					rightMissingCollided[sig] = true
+				} else {
+					rightMissingSigs[sig] = path
+				}
 			}
 		}
 
-		allPaths := make(map[string]bool)
+		allPathsSet := make(map[string]bool, len(left)+len(right)+len(prev))
 		for p := range left {
-			allPaths[p] = true
+			allPathsSet[p] = true
 		}
 		for p := range right {
-			allPaths[p] = true
+			allPathsSet[p] = true
 		}
 		for p := range prev {
-			allPaths[p] = true
+			allPathsSet[p] = true
 		}
 
-		processedMoves := make(map[string]bool)
+		// Iterate a sorted slice, never a bare map, anywhere the classification
+		// below has an order-dependent side effect. This is what makes
+		// FastCompare's output deterministic: identical inputs always produce
+		// an identical task list and NewState.
+		allPaths := make([]string, 0, len(allPathsSet))
+		for p := range allPathsSet {
+			allPaths = append(allPaths, p)
+		}
+		sort.Strings(allPaths)
 
-		for p := range allPaths {
+		// Pass 1: resolve every move before classifying anything else, so
+		// `processedMoves` is fully populated before a delete for either side
+		// of a move can be considered. This is the fix for the historical bug:
+		// previously moves and deletes were decided in the same single pass
+		// over a Go map, so whichever of {old path, new path} the (randomized)
+		// map order visited first determined whether a spurious extra DeleteR
+		// was also emitted alongside the correct MoveR/MoveL.
+		processedMoves := make(map[string]bool)
+		for _, p := range allPaths {
+			_, prevOk := prev[p]
+			if prevOk {
+				continue // a move is only ever a genuinely new path (not in prev)
+			}
+			if skipped.Contains(p) {
+				continue // unknown this scan; never a move source or destination
+			}
+
+			lState, lOk := left[p]
+			rState, rOk := right[p]
+
+			if lOk && !rOk {
+				if oldPath, ok := leftMissingSigs[fastGetSig(lState)]; ok {
+					tasks = append(tasks, FastTask{Type: MoveR, RelPath: p, OldRelPath: oldPath})
+					newState[p] = lState
+					delete(leftMissingSigs, fastGetSig(lState))
+					processedMoves[oldPath] = true
+					processedMoves[p] = true
+				}
+			} else if rOk && !lOk {
+				if oldPath, ok := rightMissingSigs[fastGetSig(rState)]; ok {
+					tasks = append(tasks, FastTask{Type: MoveL, RelPath: p, OldRelPath: oldPath})
+					newState[p] = rState
+					delete(rightMissingSigs, fastGetSig(rState))
+					processedMoves[oldPath] = true
+					processedMoves[p] = true
+				}
+			}
+		}
+
+		// Pass 2: classify every remaining path (moves already fully handled
+		// and skipped via processedMoves).
+		for _, p := range allPaths {
 			if processedMoves[p] {
+				continue
+			}
+			if skipped.Contains(p) {
+				// Unknown this scan: take no action, but preserve whatever
+				// baseline prev already had (if any) so the next
+				// successful scan can still compute a correct diff instead
+				// of this path looking brand new.
+				if prevState, ok := prev[p]; ok {
+					newState[p] = prevState
+				}
 				continue
 			}
 
@@ -137,40 +255,14 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState) Fa
 					newState[p] = lState // identical
 				}
 			} else if lChanged {
-				// Check for move in Left
-				isMove := false
-				if !prevOk {
-					if oldPath, ok := leftMissingSigs[fastGetSig(lState)]; ok {
-						tasks = append(tasks, FastTask{Type: MoveR, RelPath: p, OldRelPath: oldPath})
-						newState[p] = lState
-						delete(leftMissingSigs, fastGetSig(lState))
-						processedMoves[oldPath] = true // prevent OldRelPath from triggering deletion logic
-						isMove = true
-					}
-				}
-				if !isMove {
-					tasks = append(tasks, FastTask{Type: CopyL2R, RelPath: p, Size: lState.Size})
-					newState[p] = lState
-				}
+				tasks = append(tasks, FastTask{Type: CopyL2R, RelPath: p, Size: lState.Size})
+				newState[p] = lState
 			} else if rChanged {
-				// Check for move in Right
-				isMove := false
-				if !prevOk {
-					if oldPath, ok := rightMissingSigs[fastGetSig(rState)]; ok {
-						tasks = append(tasks, FastTask{Type: MoveL, RelPath: p, OldRelPath: oldPath})
-						newState[p] = rState
-						delete(rightMissingSigs, fastGetSig(rState))
-						processedMoves[oldPath] = true // prevent OldRelPath from triggering deletion logic
-						isMove = true
-					}
-				}
-				if !isMove {
-					tasks = append(tasks, FastTask{Type: CopyR2L, RelPath: p, Size: rState.Size})
-					newState[p] = rState
-				}
-			} else if lDeleted && !rDeleted && !processedMoves[p] {
+				tasks = append(tasks, FastTask{Type: CopyR2L, RelPath: p, Size: rState.Size})
+				newState[p] = rState
+			} else if lDeleted && !rDeleted {
 				tasks = append(tasks, FastTask{Type: DeleteR, RelPath: p})
-			} else if rDeleted && !lDeleted && !processedMoves[p] {
+			} else if rDeleted && !lDeleted {
 				tasks = append(tasks, FastTask{Type: DeleteL, RelPath: p})
 			} else if !lDeleted && !rDeleted {
 				newState[p] = lState

@@ -32,13 +32,13 @@ func BuildPlan(
 	local map[string]fs.FileEntry,
 	remote map[string]fs.FileEntry,
 	manifest map[string]db.ManifestRow,
-	skipped map[string]struct{},
+	skipped SkipSet,
 ) Plan {
 	keys := allKeys(local, remote, manifest)
 	actions := make([]Action, 0, len(keys))
 
 	for _, path := range keys {
-		if _, skip := skipped[path]; skip {
+		if skipped.Contains(path) {
 			continue
 		}
 		manifestRow, inManifest := manifest[path]

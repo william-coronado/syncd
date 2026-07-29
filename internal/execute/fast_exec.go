@@ -29,6 +29,10 @@ type ProgressSink interface {
 // RunFastTasks executes fast tasks against the two roots using atomic writes.
 // progress may be nil (non-interactive). Returns the first error encountered.
 func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []reconcile.FastTask, progress ProgressSink) error {
+	if workers < 1 {
+		workers = 1
+	}
+
 	jobs := make(chan reconcile.FastTask)
 	errs := make(chan error, len(tasks))
 

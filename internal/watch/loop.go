@@ -17,6 +17,14 @@ type LoopConfig struct {
 	Debounce   time.Duration // watcher batch window (default 500ms)
 }
 
+// Defaults substituted for a non-positive RemotePoll/DeepScan (see Run):
+// these match the --remote-poll/--deep-scan flag defaults documented in
+// internal/cli/watch_cmd.go.
+const (
+	defaultRemotePoll = 30 * time.Second
+	defaultDeepScan   = time.Hour
+)
+
 // Run blocks until ctx is cancelled. It starts an fsnotify Watcher on
 // p.LocalRoot and drives three triggers, each running one reconcile cycle:
 //
@@ -25,7 +33,7 @@ type LoopConfig struct {
 //     see new empty directories or the children of a recursively-deleted
 //     local directory (fsnotify only surfaces the top-level path for those).
 //   - cfg.RemotePoll ticks -> a full RunRobustOnce (whole tree, HashIfChanged)
-//     - this is what catches writes made directly on the remote by another
+//   - this is what catches writes made directly on the remote by another
 //     machine, since a network mount can't be watched by fsnotify.
 //   - cfg.DeepScan ticks -> the same full RunRobustOnce, run as a periodic
 //     safety net; it is the ONLY trigger that reconciles new empty
@@ -48,9 +56,36 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 	}
 	defer w.Close()
 
-	pollTicker := time.NewTicker(cfg.RemotePoll)
+	// NewWatcher degrades to partial coverage rather than failing outright
+	// when some directories couldn't be added (e.g. Linux's
+	// max_user_watches exhausted partway through the walk) - log that once
+	// here so it's observable, even though the Watcher itself has no
+	// logger (see CLAUDE.md's known follow-up). The periodic deep scan
+	// backstops whatever coverage was lost.
+	if addErrs := w.AddErrors(); len(addErrs) > 0 {
+		p.Logger.Error("watch: some directories could not be watched; coverage is degraded (deep scan will backstop)", map[string]any{
+			"count":       len(addErrs),
+			"first_error": addErrs[0].Error(),
+		})
+	}
+
+	// time.NewTicker panics on a non-positive duration. The CLI validates
+	// --remote-poll/--deep-scan before they ever get here, but Run defends
+	// on its own too - a library must not be able to be made to panic by a
+	// caller passing 0 or a negative duration - falling back to the
+	// documented flag defaults.
+	remotePoll := cfg.RemotePoll
+	if remotePoll <= 0 {
+		remotePoll = defaultRemotePoll
+	}
+	deepScan := cfg.DeepScan
+	if deepScan <= 0 {
+		deepScan = defaultDeepScan
+	}
+
+	pollTicker := time.NewTicker(remotePoll)
 	defer pollTicker.Stop()
-	deepTicker := time.NewTicker(cfg.DeepScan)
+	deepTicker := time.NewTicker(deepScan)
 	defer deepTicker.Stop()
 
 	// batches is a local copy of w.Batches() that gets nil'd out once the

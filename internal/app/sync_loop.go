@@ -66,15 +66,11 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	if err != nil {
 		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
 	}
-	for _, issue := range scans.Local.Issues {
-		p.Logger.Error("skipping local file", map[string]any{
-			"path":   issue.Path,
-			"reason": issue.Reason,
-		})
-	}
+	logScanIssues(p.Logger, "local", scans.Local.Issues)
+	logScanIssues(p.Logger, "remote", scans.Remote.Issues)
 
 	localFiles, remoteFiles := scans.Local.Files, scans.Remote.Files
-	skipped := copySkipped(scans.Local.Skipped, scans.Remote.Skipped)
+	skipped := mergeSkipSet(scans.Local, scans.Remote)
 	plan := reconcile.BuildPlan(localFiles, remoteFiles, manifest, skipped)
 
 	execActions := make([]reconcile.Action, 0, len(plan.Actions))
@@ -176,16 +172,15 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	for _, issue := range localScan.Issues {
-		p.Logger.Error("skipping local file", map[string]any{"path": issue.Path, "reason": issue.Reason})
-	}
+	logScanIssues(p.Logger, "local", localScan.Issues)
+	logScanIssues(p.Logger, "remote", remoteScan.Issues)
 	scopedManifest := make(map[string]db.ManifestRow, len(relPaths))
 	for rel := range relPaths {
 		if row, ok := manifest[rel]; ok {
 			scopedManifest[rel] = row
 		}
 	}
-	skipped := copySkipped(localScan.Skipped, remoteScan.Skipped)
+	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
 	execActions := make([]reconcile.Action, 0, len(plan.Actions))
 	for _, a := range plan.Actions {
@@ -241,12 +236,55 @@ func scanProgressLogger(logger *runtime.Logger) fs.ScanPairProgressFunc {
 	}
 }
 
-func copySkipped(sets ...map[string]struct{}) map[string]struct{} {
-	out := make(map[string]struct{})
-	for _, set := range sets {
-		for k := range set {
-			out[k] = struct{}{}
+// mergeSkipSet builds the reconcile.SkipSet both reconcilers use to suppress
+// action generation for paths this scan couldn't read, from one or more
+// fs.ScanResults (typically a local+remote pair) - merging both their exact
+// Skipped paths and their SkippedDirs, so a directory unreadable on either
+// side covers its whole subtree via reconcile.SkipSet.Contains regardless of
+// which side hit the problem.
+func mergeSkipSet(scans ...fs.ScanResult) reconcile.SkipSet {
+	exact := make(map[string]struct{})
+	dirs := make(map[string]struct{})
+	for _, s := range scans {
+		for k := range s.Skipped {
+			exact[k] = struct{}{}
+		}
+		for k := range s.SkippedDirs {
+			dirs[k] = struct{}{}
 		}
 	}
-	return out
+	return reconcile.NewSkipSet(exact, dirs)
+}
+
+// logScanIssues records each scan issue from one side (side is "local" or
+// "remote") at Info level - log file only, never stderr - and, if there were
+// any, a single aggregated Warn line (which per Logger's contract always
+// reaches stderr, regardless of --silent) so the condition stays visible to
+// the operator without flooding stderr/the log file.
+//
+// This is the fix for the review's Important 4 finding: RunRobustOnce runs
+// on every --remote-poll tick (30s by default), and the previous code logged
+// one Logger.Error per issue - since Task 2 made Error unconditionally reach
+// both stderr and the log file, a tree with 50 permanently-unreadable
+// symlinks produced ~100 stderr lines/minute forever, growing the log by
+// ~17MB/day. Per-path detail is still fully available (in the log file, at
+// Info), just not re-blasted to stderr every cycle for a condition the
+// operator often cannot immediately fix. This also fixes the asymmetry the
+// same finding called out: the old code only ever logged Local.Issues, so a
+// remote-side (over SMB) read/hash failure was reported to nobody; callers
+// must invoke this for both sides.
+func logScanIssues(logger *runtime.Logger, side string, issues []fs.ScanIssue) {
+	for _, issue := range issues {
+		logger.Info("skipping file", map[string]any{
+			"side":   side,
+			"path":   issue.Path,
+			"reason": issue.Reason,
+		})
+	}
+	if len(issues) > 0 {
+		logger.Warn(fmt.Sprintf("skipped %d %s file(s) during scan; see log for per-path detail", len(issues), side), map[string]any{
+			"side":  side,
+			"count": len(issues),
+		})
+	}
 }

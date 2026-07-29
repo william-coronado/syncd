@@ -1,11 +1,14 @@
 package watch
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"syncd/internal/fs"
 )
@@ -89,6 +92,111 @@ func TestWatcherConcurrentCloseNoPanic(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("batches channel never closed after concurrent Close")
 	}
+}
+
+// TestNewWatcherDegradesOnPartialAddFailure is a regression test: NewWatcher
+// used to return the first fsw.Add error straight out of WalkDir, so on
+// Linux, exhausting max_user_watches partway through the walk meant the
+// watcher didn't start at ALL - rather than degrading to partial coverage
+// (which the hourly deep scan already backstops). A per-directory Add
+// failure must be best-effort: skip that directory, keep walking, and
+// record the error so the caller can observe it via AddErrors().
+//
+// fsAdd is swapped for a fake so this is deterministic and cross-platform,
+// rather than relying on actually exhausting OS-level watch resources.
+func TestNewWatcherDegradesOnPartialAddFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "good"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "bad"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := fsAdd
+	fsAdd = func(fsw *fsnotify.Watcher, path string) error {
+		if filepath.Base(path) == "bad" {
+			return fmt.Errorf("simulated add failure")
+		}
+		return orig(fsw, path)
+	}
+	defer func() { fsAdd = orig }()
+
+	m, _ := fs.LoadIgnoreMatcher(root)
+	w, err := NewWatcher(root, m, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected NewWatcher to degrade gracefully on a partial Add failure, got error: %v", err)
+	}
+	defer w.Close()
+
+	errs := w.AddErrors()
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 recorded add error, got %d: %v", len(errs), errs)
+	}
+}
+
+// TestNewWatcherErrorsWhenNoDirectoryCouldBeWatched checks the other half
+// of the same fix: degrading to partial coverage is fine, but if literally
+// zero directories could be watched, that's a real failure (not
+// degradation) and NewWatcher must still return an error.
+func TestNewWatcherErrorsWhenNoDirectoryCouldBeWatched(t *testing.T) {
+	root := t.TempDir()
+
+	orig := fsAdd
+	fsAdd = func(fsw *fsnotify.Watcher, path string) error {
+		return fmt.Errorf("simulated add failure")
+	}
+	defer func() { fsAdd = orig }()
+
+	m, _ := fs.LoadIgnoreMatcher(root)
+	_, err := NewWatcher(root, m, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected NewWatcher to error when zero directories could be watched")
+	}
+}
+
+// TestNewWatcher_SymlinkedRootDoesNotPanic is a regression test for Important
+// 3: a previous reviewer claimed "root is always attempted, so watched==0
+// implies >=1 add error" and cleared NewWatcher's addErrors[0] index as
+// unreachable. That reasoning is wrong when --local points at a symlinked
+// directory: filepath.Abs doesn't resolve symlinks, so root here is a
+// symlink; fs.WalkDir's very first callback sees d.IsDir()==false for the
+// symlink itself (WalkDir lstats, never follows, the root entry) and the
+// walk function returns nil without ever calling fsAdd - so watched==0 AND
+// addErrors is empty, and the old `addErrors[0]` indexing panicked with
+// "index out of range [0] with length 0". NewWatcher must instead return a
+// clean error (or otherwise handle a symlinked root without crashing).
+func TestNewWatcher_SymlinkedRootDoesNotPanic(t *testing.T) {
+	parent := t.TempDir()
+	realDir := filepath.Join(parent, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("mkdir real: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	symlinkRoot := filepath.Join(parent, "link")
+	if err := os.Symlink(realDir, symlinkRoot); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	m, _ := fs.LoadIgnoreMatcher(symlinkRoot)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("NewWatcher panicked on a symlinked root: %v", r)
+		}
+	}()
+	w, err := NewWatcher(symlinkRoot, m, 50*time.Millisecond)
+	if err != nil {
+		// A clear, non-panicking error is an acceptable outcome too - the
+		// finding's fix options were "guard the index... and separately
+		// handle a non-directory root with a clear error (or resolve the
+		// symlink)". Either is fine; a panic is not.
+		t.Logf("NewWatcher returned a clean error for a symlinked root (acceptable): %v", err)
+		return
+	}
+	defer w.Close()
 }
 
 // TestWatcherSkipsIgnoredDirSubtree is a light check that a pre-existing
