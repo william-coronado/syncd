@@ -2,10 +2,14 @@ package watch
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"syncd/internal/app"
 	"syncd/internal/db"
@@ -75,5 +79,49 @@ func TestRunClampsNonPositiveDurationsToDefaults(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return after ctx cancellation - possibly panicked or hung on non-positive ticker duration")
+	}
+}
+
+// TestRunLogsWatcherAddErrorsOnce checks that Run surfaces NewWatcher's
+// best-effort AddErrors (Task 5d): the Watcher itself has no logger (kept
+// as a known follow-up per CLAUDE.md), so Run - which does have p.Logger -
+// must log them once after NewWatcher returns, rather than the degraded
+// coverage passing silently.
+func TestRunLogsWatcherAddErrorsOnce(t *testing.T) {
+	local, remote := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(remote, ".synclock"), []byte("x"), 0o644)
+	if err := os.MkdirAll(filepath.Join(local, "bad"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := fsAdd
+	fsAdd = func(fsw *fsnotify.Watcher, path string) error {
+		if filepath.Base(path) == "bad" {
+			return fmt.Errorf("simulated add failure")
+		}
+		return orig(fsw, path)
+	}
+	defer func() { fsAdd = orig }()
+
+	dbh, _ := db.Open(filepath.Join(t.TempDir(), "m.db"))
+	defer dbh.Close()
+	logPath := filepath.Join(t.TempDir(), "l.log")
+	logger, _ := runtime.NewLogger(true, logPath)
+	defer logger.Close()
+	m, _ := fs.LoadIgnoreMatcher(local)
+	p := app.RobustParams{LocalRoot: local, RemoteRoot: remote, Workers: 1, Repo: db.NewManifestRepo(dbh), DB: dbh, Logger: logger}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := Run(ctx, p, m, LoopConfig{RemotePoll: time.Hour, DeepScan: time.Hour, Debounce: 50 * time.Millisecond}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	if !strings.Contains(string(data), "could not be watched") {
+		t.Errorf("expected the watcher's add errors to be logged, got log contents:\n%s", data)
 	}
 }

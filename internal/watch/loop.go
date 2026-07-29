@@ -56,6 +56,19 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 	}
 	defer w.Close()
 
+	// NewWatcher degrades to partial coverage rather than failing outright
+	// when some directories couldn't be added (e.g. Linux's
+	// max_user_watches exhausted partway through the walk) - log that once
+	// here so it's observable, even though the Watcher itself has no
+	// logger (see CLAUDE.md's known follow-up). The periodic deep scan
+	// backstops whatever coverage was lost.
+	if addErrs := w.AddErrors(); len(addErrs) > 0 {
+		p.Logger.Error("watch: some directories could not be watched; coverage is degraded (deep scan will backstop)", map[string]any{
+			"count":       len(addErrs),
+			"first_error": addErrs[0].Error(),
+		})
+	}
+
 	// time.NewTicker panics on a non-positive duration. The CLI validates
 	// --remote-poll/--deep-scan before they ever get here, but Run defends
 	// on its own too - a library must not be able to be made to panic by a
