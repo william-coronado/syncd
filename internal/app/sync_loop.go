@@ -31,7 +31,7 @@ func Run(ctx context.Context, cfg runtime.Config) error {
 	defer logger.Close()
 
 	if cfg.Init {
-		return runInit(cfg, logger)
+		return RunInit(cfg.LocalRoot, cfg.RemoteRoot, logger)
 	}
 
 	lock, err := runtime.AcquireLock(paths.LockPath)
@@ -149,26 +149,26 @@ func Run(ctx context.Context, cfg runtime.Config) error {
 	return nil
 }
 
-// runInit bootstraps first-time setup: creates the local and remote root
+// RunInit bootstraps first-time setup: creates the local and remote root
 // directories if missing, and writes the remote canary file (.synclock) if
 // it isn't already there. It performs no reconciliation.
-func runInit(cfg runtime.Config, logger *runtime.Logger) error {
-	if err := os.MkdirAll(cfg.LocalRoot, 0o755); err != nil {
+func RunInit(localRoot, remoteRoot string, logger *runtime.Logger) error {
+	if err := os.MkdirAll(localRoot, 0o755); err != nil {
 		return fmt.Errorf("create local root: %w", err)
 	}
-	if err := os.MkdirAll(cfg.RemoteRoot, 0o755); err != nil {
+	if err := os.MkdirAll(remoteRoot, 0o755); err != nil {
 		return fmt.Errorf("create remote root: %w", err)
 	}
-	created, err := runtime.EnsureRemoteCanary(cfg.RemoteRoot)
+	created, err := runtime.EnsureRemoteCanary(remoteRoot)
 	if err != nil {
 		return err
 	}
 	if created {
-		logger.Printf("created remote canary file in %s", cfg.RemoteRoot)
+		logger.Printf("created remote canary file in %s", remoteRoot)
 	} else {
-		logger.Printf("remote canary file already present in %s", cfg.RemoteRoot)
+		logger.Printf("remote canary file already present in %s", remoteRoot)
 	}
-	logger.Printf("drivesync initialized: local=%s remote=%s", cfg.LocalRoot, cfg.RemoteRoot)
+	logger.Printf("drivesync initialized: local=%s remote=%s", localRoot, remoteRoot)
 	return nil
 }
 
