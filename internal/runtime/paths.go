@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"drivesync/internal/cli"
+	"syncd/internal/cli"
 )
 
 type RuntimePaths struct {

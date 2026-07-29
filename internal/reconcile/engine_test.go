@@ -3,8 +3,8 @@ package reconcile
 import (
 	"testing"
 
-	"drivesync/internal/db"
-	"drivesync/internal/fs"
+	"syncd/internal/db"
+	"syncd/internal/fs"
 )
 
 func entry(hash string) fs.FileEntry {

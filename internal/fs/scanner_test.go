@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"drivesync/internal/db"
+	"syncd/internal/db"
 )
 
 func writeFile(t *testing.T, path, content string) {

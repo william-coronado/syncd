@@ -3,8 +3,8 @@ package reconcile
 import (
 	"sort"
 
-	"drivesync/internal/db"
-	"drivesync/internal/fs"
+	"syncd/internal/db"
+	"syncd/internal/fs"
 )
 
 type ActionType string

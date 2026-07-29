@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"drivesync/internal/db"
+	"syncd/internal/db"
 )
 
 var smbForbidden = []string{`\`, ":", "*", "?", `"`, "<", ">", "|"}

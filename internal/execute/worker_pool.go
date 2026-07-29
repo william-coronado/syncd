@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"drivesync/internal/db"
-	"drivesync/internal/fs"
-	"drivesync/internal/reconcile"
+	"syncd/internal/db"
+	"syncd/internal/fs"
+	"syncd/internal/reconcile"
 )
 
 type SyncState struct {

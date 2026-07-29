@@ -8,9 +8,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"drivesync/internal/db"
-	"drivesync/internal/fs"
-	"drivesync/internal/reconcile"
+	"syncd/internal/db"
+	"syncd/internal/fs"
+	"syncd/internal/reconcile"
 )
 
 func runConflict(state SyncState, action reconcile.Action) Result {

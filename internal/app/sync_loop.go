@@ -7,12 +7,12 @@ import (
 	"os"
 	"sort"
 
-	"drivesync/internal/cli"
-	"drivesync/internal/db"
-	"drivesync/internal/execute"
-	"drivesync/internal/fs"
-	"drivesync/internal/reconcile"
-	"drivesync/internal/runtime"
+	"syncd/internal/cli"
+	"syncd/internal/db"
+	"syncd/internal/execute"
+	"syncd/internal/fs"
+	"syncd/internal/reconcile"
+	"syncd/internal/runtime"
 )
 
 type runSummary struct {

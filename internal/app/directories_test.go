@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"drivesync/internal/runtime"
+	"syncd/internal/runtime"
 )
 
 func newTestLogger(t *testing.T) *runtime.Logger {

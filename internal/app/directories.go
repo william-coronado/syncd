@@ -5,7 +5,7 @@ import (
 	"path"
 	"path/filepath"
 
-	"drivesync/internal/runtime"
+	"syncd/internal/runtime"
 )
 
 // createMissingEmptyDirs mirrors directories that exist on one side but not

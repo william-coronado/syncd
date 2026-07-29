@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"drivesync/internal/cli"
+	"syncd/internal/cli"
 )
 
 func newTestConfig(t *testing.T, localRoot, remoteRoot string) cli.Config {

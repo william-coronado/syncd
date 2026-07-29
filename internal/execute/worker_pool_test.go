@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"drivesync/internal/reconcile"
+	"syncd/internal/reconcile"
 )
 
 // Regression test: RunActions must never hang when ctx is cancelled while
