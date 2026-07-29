@@ -322,6 +322,66 @@ func TestLogger_RotatesWhileRunning(t *testing.T) {
 	}
 }
 
+// TestLogger_RotationFailureIsVisibleOnStderr is the regression test for the
+// review finding on rotateLocked: a failed rotation (close/rename/reopen
+// error) used to disable file logging with zero operator-visible
+// indication - silently swallowing an error, the exact bug class this whole
+// task exists to eliminate, in the new rotation code itself. Rotation must
+// now report the failure on stderr before giving up on the file.
+//
+// The rename step is forced to fail deterministically and portably (no
+// permission-bit games, which behave differently when a test runs as root):
+// os.Rename cannot replace an existing directory with a file, so pre-seeding
+// logPath+".old" as a directory guarantees the rotation's rename call fails.
+func TestLogger_RotationFailureIsVisibleOnStderr(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "sync.log")
+
+	logger, err := NewLogger(true, logPath)
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	defer logger.Close()
+
+	if err := os.Mkdir(logPath+".old", 0o755); err != nil {
+		t.Fatalf("seed .old directory to force rotation's rename to fail: %v", err)
+	}
+
+	filler := strings.Repeat("x", 4096)
+	maxIterations := maxLogSizeBytes/len(filler) + 16
+	rotationDisabledFile := false
+
+	out := captureStderr(t, func() {
+		for i := 0; i < maxIterations; i++ {
+			logger.Info("filler", map[string]any{"data": filler})
+			if logger.file == nil {
+				rotationDisabledFile = true
+				break
+			}
+		}
+	})
+
+	if !rotationDisabledFile {
+		t.Fatalf("expected the forced rename failure to disable file logging within %d writes", maxIterations)
+	}
+	// This is the crux of the finding: a test that only checked the internal
+	// file==nil state (or a returned error) would still miss an operator
+	// never seeing anything. Assert stderr actually got a human-readable
+	// line about it.
+	if !strings.Contains(out, "log rotation failed") {
+		t.Fatalf("expected rotation failure to be reported on stderr, got %q", out)
+	}
+
+	// The Logger must keep working afterward: Error still reaches stderr
+	// even with file logging permanently disabled for this run.
+	out2 := captureStderr(t, func() {
+		logger.Error("still alive after rotation failure", nil)
+	})
+	if !strings.Contains(out2, "still alive after rotation failure") {
+		t.Fatalf("expected Error to still reach stderr after rotation failure, got %q", out2)
+	}
+}
+
 // TestLogger_ConcurrentWritesAreRaceFree exercises Error/Info/Warn from many
 // goroutines at once - Logger is written from concurrent worker goroutines
 // in production (execute.RunWorkerPool). Run with -race.

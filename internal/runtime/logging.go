@@ -130,8 +130,8 @@ func (l *Logger) IsSilent() bool {
 
 // write records a structured event to the log file (if one is open) and,
 // for level == "warn"/"error", always prints a human-readable line to
-// stderr - --silent suppresses stdout chatter, it must never hide an error
-// or warning from the operator (task-2-brief.md, 2a).
+// stderr. --silent only suppresses stdout chatter (see Println); it must
+// never be able to hide an error or warning from the operator.
 func (l *Logger) write(level, msg string, ctx map[string]any) {
 	ev := LogEvent{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -170,22 +170,44 @@ func (l *Logger) writeToFileLocked(b []byte) {
 // (overwriting any previous .old), and reopens a fresh file at logPath so a
 // long-running watch daemon keeps logging past the size cap instead of
 // growing the file forever. Must be called with l.mu held.
+//
+// Any failure disables file logging for the rest of the process (l.file is
+// left nil, so future writes just skip the file) - but per this same task's
+// premise, that failure must not be swallowed: rotationFailedLocked reports
+// it to the operator on stderr before giving up.
 func (l *Logger) rotateLocked() {
 	if err := l.file.Close(); err != nil {
-		l.file = nil
+		l.rotationFailedLocked(fmt.Errorf("close log file before rotate: %w", err))
 		return
 	}
 	if err := os.Rename(l.logPath, l.logPath+".old"); err != nil {
-		l.file = nil
+		l.rotationFailedLocked(fmt.Errorf("rename log file to .old: %w", err))
 		return
 	}
 	f, err := os.OpenFile(l.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		l.file = nil
+		l.rotationFailedLocked(fmt.Errorf("reopen log file after rotate: %w", err))
 		return
 	}
 	l.file = f
 	l.fileSize = 0
+}
+
+// rotationFailedLocked disables file logging (l.file = nil, so subsequent
+// writes stop touching the file instead of erroring against a stale/closed
+// handle) and prints the failure straight to stderr, unconditionally -
+// exactly the operator-visible path Warn/Error use, but inlined here on
+// purpose: write() already holds l.mu when it calls writeToFileLocked ->
+// rotateLocked, and Warn/Error both go through write(), which locks l.mu
+// itself. Calling them here would deadlock (or recurse) on that
+// non-reentrant mutex, so this writes to os.Stderr directly instead. Must
+// be called with l.mu held.
+func (l *Logger) rotationFailedLocked(err error) {
+	l.file = nil
+	fmt.Fprintln(os.Stderr, formatHuman(levelError, "log rotation failed, file logging disabled for the rest of this run", map[string]any{
+		"path":  l.logPath,
+		"error": err.Error(),
+	}))
 }
 
 // formatHuman renders a warn/error event as a single stderr line. Context
