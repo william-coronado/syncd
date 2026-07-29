@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,10 +16,23 @@ import (
 // cleanups.
 const maxLogSizeBytes = 20 * 1024 * 1024 // 20 MB
 
+const (
+	levelInfo  = "info"
+	levelWarn  = "warn"
+	levelError = "error"
+)
+
 type Logger struct {
 	silent bool
-	file   *os.File
-	mu     sync.Mutex
+	// logPath is the path the log file was opened from, needed to rotate it
+	// (close, rename to .old, reopen) in place from write(). Empty when the
+	// logger has no log file at all (e.g. sync --hash, init).
+	logPath string
+	file    *os.File
+	// fileSize tracks the current log file's size so write() can decide to
+	// rotate without stat-ing the file on every single line.
+	fileSize int64
+	mu       sync.Mutex
 }
 
 type LogEvent struct {
@@ -27,9 +42,14 @@ type LogEvent struct {
 	Context   map[string]any `json:"context,omitempty"`
 }
 
+// NewLogger opens the log file at logPath, if any, regardless of silent:
+// --silent only controls whether Println/Printf go to stdout, it must never
+// be able to make errors or the log file itself disappear. Callers that have
+// no log file to write (sync --hash, init) pass logPath == "" and get a
+// Logger that reports errors on stderr only.
 func NewLogger(silent bool, logPath string) (*Logger, error) {
-	l := &Logger{silent: silent}
-	if !silent {
+	l := &Logger{silent: silent, logPath: logPath}
+	if logPath == "" {
 		return l, nil
 	}
 	if err := rotateLogIfNeeded(logPath); err != nil {
@@ -39,7 +59,13 @@ func NewLogger(silent bool, logPath string) (*Logger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat log file: %w", err)
+	}
 	l.file = f
+	l.fileSize = info.Size()
 	return l, nil
 }
 
@@ -73,15 +99,15 @@ func (l *Logger) Close() error {
 }
 
 func (l *Logger) Info(msg string, ctx map[string]any) {
-	l.write("info", msg, ctx)
+	l.write(levelInfo, msg, ctx)
 }
 
 func (l *Logger) Warn(msg string, ctx map[string]any) {
-	l.write("warn", msg, ctx)
+	l.write(levelWarn, msg, ctx)
 }
 
 func (l *Logger) Error(msg string, ctx map[string]any) {
-	l.write("error", msg, ctx)
+	l.write(levelError, msg, ctx)
 }
 
 func (l *Logger) Println(msg string) {
@@ -102,21 +128,103 @@ func (l *Logger) IsSilent() bool {
 	return l.silent
 }
 
+// write records a structured event to the log file (if one is open) and,
+// for level == "warn"/"error", always prints a human-readable line to
+// stderr. --silent only suppresses stdout chatter (see Println); it must
+// never be able to hide an error or warning from the operator.
 func (l *Logger) write(level, msg string, ctx map[string]any) {
-	if !l.silent {
-		return
-	}
 	ev := LogEvent{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Level:     level,
 		Message:   msg,
 		Context:   ctx,
 	}
-	b, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
+	b, marshalErr := json.Marshal(ev)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, _ = l.file.Write(append(b, '\n'))
+
+	if marshalErr == nil && l.file != nil {
+		l.writeToFileLocked(append(b, '\n'))
+	}
+	if level == levelWarn || level == levelError {
+		fmt.Fprintln(os.Stderr, formatHuman(level, msg, ctx))
+	}
+}
+
+// writeToFileLocked writes b to the open log file and rotates in place
+// (close, rename to .old, reopen) once the running size crosses
+// maxLogSizeBytes. Tracking fileSize in memory avoids an os.Stat call on
+// every line - the only per-write cost is an integer comparison. Must be
+// called with l.mu held.
+func (l *Logger) writeToFileLocked(b []byte) {
+	n, err := l.file.Write(b)
+	l.fileSize += int64(n)
+	if err != nil || l.fileSize < maxLogSizeBytes {
+		return
+	}
+	l.rotateLocked()
+}
+
+// rotateLocked closes the current log file, renames it to logPath+".old"
+// (overwriting any previous .old), and reopens a fresh file at logPath so a
+// long-running watch daemon keeps logging past the size cap instead of
+// growing the file forever. Must be called with l.mu held.
+//
+// Any failure disables file logging for the rest of the process (l.file is
+// left nil, so future writes just skip the file) - but per this same task's
+// premise, that failure must not be swallowed: rotationFailedLocked reports
+// it to the operator on stderr before giving up.
+func (l *Logger) rotateLocked() {
+	if err := l.file.Close(); err != nil {
+		l.rotationFailedLocked(fmt.Errorf("close log file before rotate: %w", err))
+		return
+	}
+	if err := os.Rename(l.logPath, l.logPath+".old"); err != nil {
+		l.rotationFailedLocked(fmt.Errorf("rename log file to .old: %w", err))
+		return
+	}
+	f, err := os.OpenFile(l.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		l.rotationFailedLocked(fmt.Errorf("reopen log file after rotate: %w", err))
+		return
+	}
+	l.file = f
+	l.fileSize = 0
+}
+
+// rotationFailedLocked disables file logging (l.file = nil, so subsequent
+// writes stop touching the file instead of erroring against a stale/closed
+// handle) and prints the failure straight to stderr, unconditionally -
+// exactly the operator-visible path Warn/Error use, but inlined here on
+// purpose: write() already holds l.mu when it calls writeToFileLocked ->
+// rotateLocked, and Warn/Error both go through write(), which locks l.mu
+// itself. Calling them here would deadlock (or recurse) on that
+// non-reentrant mutex, so this writes to os.Stderr directly instead. Must
+// be called with l.mu held.
+func (l *Logger) rotationFailedLocked(err error) {
+	l.file = nil
+	fmt.Fprintln(os.Stderr, formatHuman(levelError, "log rotation failed, file logging disabled for the rest of this run", map[string]any{
+		"path":  l.logPath,
+		"error": err.Error(),
+	}))
+}
+
+// formatHuman renders a warn/error event as a single stderr line. Context
+// keys are sorted for stable, testable output.
+func formatHuman(level, msg string, ctx map[string]any) string {
+	label := strings.ToUpper(level)
+	if len(ctx) == 0 {
+		return fmt.Sprintf("%s: %s", label, msg)
+	}
+	keys := make([]string, 0, len(ctx))
+	for k := range ctx {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, ctx[k]))
+	}
+	return fmt.Sprintf("%s: %s (%s)", label, msg, strings.Join(parts, ", "))
 }
