@@ -33,6 +33,10 @@ type Result struct {
 }
 
 func RunActions(ctx context.Context, workers int, state SyncState, actions []reconcile.Action) ([]Result, error) {
+	if workers < 1 {
+		workers = 1
+	}
+
 	jobs := make(chan reconcile.Action)
 	results := make(chan Result, len(actions))
 

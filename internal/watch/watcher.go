@@ -4,6 +4,7 @@
 package watch
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,14 @@ import (
 
 	"syncd/internal/fs"
 )
+
+// fsAdd is fsw.Add, indirected through a package-level variable purely so
+// tests can simulate a per-directory Add failure (e.g. Linux's
+// max_user_watches exhaustion) deterministically, without needing to
+// actually exhaust OS-level watch resources.
+var fsAdd = func(fsw *fsnotify.Watcher, path string) error {
+	return fsw.Add(path)
+}
 
 // Watcher recursively watches root and emits coalesced batches of changed,
 // root-relative, NFC-normalized paths. Events within `debounce` of each
@@ -26,6 +35,14 @@ type Watcher struct {
 	batches   chan map[string]struct{}
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// addErrors records every fsw.Add failure hit while walking root in
+	// NewWatcher. It is only ever written during that synchronous walk,
+	// before w.run's goroutine starts, so it needs no lock: any later
+	// caller of AddErrors is reading after that write has already
+	// happened-before it (NewWatcher returning is the synchronization
+	// point).
+	addErrors []error
 }
 
 // NewWatcher creates a Watcher rooted at root. It walks root and adds every
@@ -33,11 +50,22 @@ type Watcher struct {
 // non-recursive, so newly created directories are added on the fly as
 // events for them arrive). The returned Watcher must be closed with Close
 // when no longer needed.
+//
+// A directory that fails to be added (e.g. Linux's max_user_watches
+// exhausted partway through the walk) is skipped best-effort rather than
+// failing the whole walk - the resulting partial coverage is degraded, not
+// broken, and the hourly deep scan already backstops paths the watcher
+// missed. Each such failure is recorded and available via AddErrors(); if
+// literally zero directories could be watched, that IS a real failure and
+// NewWatcher returns an error.
 func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
+
+	var addErrors []error
+	watched := 0
 
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -57,28 +85,44 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 				return filepath.SkipDir
 			}
 		}
-		if addErr := fsw.Add(path); addErr != nil {
-			return addErr
+		if addErr := fsAdd(fsw, path); addErr != nil {
+			addErrors = append(addErrors, fmt.Errorf("watch %s: %w", path, addErr))
+			return nil // best-effort: skip this directory, keep walking
 		}
+		watched++
 		return nil
 	})
 	if err != nil {
 		fsw.Close()
 		return nil, err
 	}
+	if watched == 0 {
+		fsw.Close()
+		return nil, fmt.Errorf("watcher: no directories could be watched under %s (%d add error(s), first: %v)", root, len(addErrors), addErrors[0])
+	}
 
 	w := &Watcher{
-		fsw:      fsw,
-		root:     root,
-		matcher:  matcher,
-		debounce: debounce,
-		batches:  make(chan map[string]struct{}),
-		done:     make(chan struct{}),
+		fsw:       fsw,
+		root:      root,
+		matcher:   matcher,
+		debounce:  debounce,
+		batches:   make(chan map[string]struct{}),
+		done:      make(chan struct{}),
+		addErrors: addErrors,
 	}
 
 	go w.run()
 
 	return w, nil
+}
+
+// AddErrors returns every fsw.Add failure hit while walking root in
+// NewWatcher (nil if none). It reflects best-effort, degraded watch
+// coverage - not a startup failure, since NewWatcher only errors outright
+// when zero directories could be watched - so a caller (watch.Run) can log
+// it once and let the periodic deep scan backstop the gap.
+func (w *Watcher) AddErrors() []error {
+	return w.addErrors
 }
 
 // Batches returns the receive-only channel of coalesced batches. Each value

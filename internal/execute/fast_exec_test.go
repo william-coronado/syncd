@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"syncd/internal/reconcile"
 )
@@ -26,6 +27,35 @@ func TestRunFastTasksCopyAndDelete(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(right, "stale.txt")); !os.IsNotExist(err) {
 		t.Error("stale.txt not deleted")
+	}
+}
+
+// TestRunFastTasksWorkersClampedToMinimumOne is a regression test mirroring
+// TestRunActions_WorkersClampedToMinimumOne in worker_pool_test.go: with
+// workers == 0, no worker goroutines start, so RunFastTasks must clamp to a
+// minimum of 1 instead of hanging (feeder blocked on the unbuffered jobs
+// channel) or silently completing without doing the copy.
+func TestRunFastTasksWorkersClampedToMinimumOne(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644)
+	tasks := []reconcile.FastTask{{Type: reconcile.CopyL2R, RelPath: "a.txt", Size: 2}}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- RunFastTasks(context.Background(), 0, left, right, tasks, nil)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunFastTasks returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunFastTasks(workers=0) did not return within 5s - feeder goroutine leaked")
+	}
+
+	if b, err := os.ReadFile(filepath.Join(right, "a.txt")); err != nil || string(b) != "hi" {
+		t.Fatalf("copy did not happen with workers=0: err=%v content=%q", err, b)
 	}
 }
 
