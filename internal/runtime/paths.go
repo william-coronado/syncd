@@ -21,7 +21,7 @@ func ResolvePaths(cfg Config) (RuntimePaths, error) {
 
 	stateDir := cfg.StateDir
 	if stateDir == "" {
-		stateDir = filepath.Join(homeDir, ".local", "state", "drivesync")
+		stateDir = filepath.Join(homeDir, ".local", "state", "syncd")
 	}
 	dbPath := cfg.DBPath
 	if dbPath == "" {

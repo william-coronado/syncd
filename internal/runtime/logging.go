@@ -8,9 +8,10 @@ import (
 	"time"
 )
 
-// maxLogSizeBytes caps sync.log before it gets rotated. drivesync is meant to
-// run unattended (systemd timer / launchd / cron) indefinitely, so the log
-// can't be allowed to grow forever between manual cleanups.
+// maxLogSizeBytes caps sync.log before it gets rotated. syncd is meant to
+// run unattended (systemd/launchd, as a watch daemon or a scheduled sync)
+// indefinitely, so the log can't be allowed to grow forever between manual
+// cleanups.
 const maxLogSizeBytes = 20 * 1024 * 1024 // 20 MB
 
 type Logger struct {

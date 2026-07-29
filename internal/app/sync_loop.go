@@ -336,7 +336,7 @@ func RunInit(localRoot, remoteRoot string, logger *runtime.Logger) error {
 	} else {
 		logger.Printf("remote canary file already present in %s", remoteRoot)
 	}
-	logger.Printf("drivesync initialized: local=%s remote=%s", localRoot, remoteRoot)
+	logger.Printf("syncd initialized: local=%s remote=%s", localRoot, remoteRoot)
 	return nil
 }
 

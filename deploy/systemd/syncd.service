@@ -1,0 +1,16 @@
+[Unit]
+Description=syncd always-on watch daemon (local events + remote poll + deep scan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace the placeholder paths below with the real local root and mounted
+# SMB/remote share for this machine before installing.
+ExecStart=/usr/local/bin/syncd watch --local /srv/dev/local --remote /mnt/synology/share --silent
+WorkingDirectory=/srv/dev/local
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

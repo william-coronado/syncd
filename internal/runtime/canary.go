@@ -16,7 +16,7 @@ func EnsureRemoteCanary(remoteRoot string) (created bool, err error) {
 	} else if !os.IsNotExist(statErr) {
 		return false, fmt.Errorf("stat remote canary: %w", statErr)
 	}
-	if err := os.WriteFile(canaryPath, []byte("drivesync canary\n"), 0o644); err != nil {
+	if err := os.WriteFile(canaryPath, []byte("syncd canary\n"), 0o644); err != nil {
 		return false, fmt.Errorf("create remote canary: %w", err)
 	}
 	return true, nil

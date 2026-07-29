@@ -28,7 +28,7 @@ type Config struct {
 
 func ParseArgs(args []string) (Config, error) {
 	cfg := Config{}
-	fs := flag.NewFlagSet("drivesync", flag.ContinueOnError)
+	fs := flag.NewFlagSet("syncd", flag.ContinueOnError)
 
 	fs.StringVar(&cfg.LocalRoot, "local", "", "Local directory path")
 	fs.StringVar(&cfg.RemoteRoot, "remote", "", "Mounted SMB directory path")

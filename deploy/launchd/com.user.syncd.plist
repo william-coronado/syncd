@@ -3,11 +3,14 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.user.drivesync</string>
+  <string>com.user.syncd</string>
 
+  <!-- Replace the placeholder paths below with the real local root and
+       mounted SMB/remote share for this machine before installing. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/drivesync</string>
+    <string>/usr/local/bin/syncd</string>
+    <string>watch</string>
     <string>--local</string>
     <string>/Users/youruser/dev/local</string>
     <string>--remote</string>
@@ -15,15 +18,15 @@
     <string>--silent</string>
   </array>
 
-  <key>StartInterval</key>
-  <integer>300</integer>
+  <key>KeepAlive</key>
+  <true/>
 
   <key>RunAtLoad</key>
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/tmp/drivesync.out.log</string>
+  <string>/tmp/syncd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/drivesync.err.log</string>
+  <string>/tmp/syncd.err.log</string>
 </dict>
 </plist>

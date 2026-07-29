@@ -1,0 +1,30 @@
+# OPTIONAL. syncd.service (the `syncd watch` daemon, see syncd.service in
+# this directory) is the primary always-on mode and already keeps local and
+# remote reconciled continuously - installing this timer is not required
+# alongside it. Install it only if you additionally want a periodic,
+# hash-verified full-tree integrity pass (`syncd sync --hash`) as a belt-
+# and-suspenders check independent of the watch daemon's own periodic deep
+# scan (see --deep-scan in `syncd watch --help`).
+#
+# This timer pairs with syncd-verify.service (a companion oneshot unit, not
+# installed by default - copy it alongside this file, filling in the same
+# --left/--right paths used by syncd.service's --local/--remote):
+#
+#   [Unit]
+#   Description=syncd hash-verify pass (paired with syncd.timer)
+#
+#   [Service]
+#   Type=oneshot
+#   ExecStart=/usr/local/bin/syncd sync --left /srv/dev/local --right /mnt/synology/share --hash --yes
+
+[Unit]
+Description=Periodic syncd hash-verify pass (optional; syncd.service is the primary mode)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=syncd-verify.service
+
+[Install]
+WantedBy=timers.target

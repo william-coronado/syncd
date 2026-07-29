@@ -1,136 +1,185 @@
-# DriveSync
+# syncd
 
-DriveSync is a cross-platform Go CLI that performs **state-based three-way synchronization** between:
+`syncd` is a cross-platform Go CLI that synchronizes files between a local
+directory and a remote directory (typically a mounted SMB/network share). It
+is one tool with two complementary modes:
 
-- a local directory (`--local`)
-- a mounted SMB directory (`--remote`)
-- a local SQLite manifest database (`file_manifest`)
+- **`syncd sync`** — a fast, ad-hoc or batch-scheduled sync: point it at two
+  folders (or a config file of jobs) and it reconciles them once and exits.
+- **`syncd watch`** — an always-on daemon: it reacts to local filesystem
+  events almost instantly, polls the remote periodically to catch changes
+  made by other machines, and runs a periodic full deep scan as a safety
+  net.
 
-It is designed for macOS and Ubuntu environments where direct SMB development can cause lock or write instability.
+Both modes share the same underlying pieces: ignore rules (`.syncdignore`),
+path normalization, the atomic-write/conflict executor, and (for the robust
+hash-based path) the same SQLite manifest and three-way reconciliation
+engine. `syncd sync` additionally has its own fast, size+mtime-based
+reconciler for day-to-day ad-hoc use, ported from the old `file_sync_util`
+tool, whose functionality now lives entirely inside `syncd sync`.
 
-## Features
+It is designed for macOS and Ubuntu environments where direct SMB writes can
+cause lock or write instability.
 
-- Three-way reconciliation (`local`, `remote`, `manifest`)
-- `--dry-run` action planning with no filesystem mutation
-- `--silent` JSON logging for unattended runs, with automatic log rotation
-- Exclusive lockfile to prevent overlapping sync runs
-- Remote canary validation (`.synclock`), with `--init` to bootstrap it
-- NFC path normalization for macOS/Ubuntu interoperability
-- SMB-invalid local filename detection and skip logging
-- Atomic writes via temp-file + rename (including SMB targets)
-- Preserve-both conflict pipeline with timestamped conflict files
-- Empty directory sync (create on the missing side; clean up directories
-  this run's deletes just emptied)
-- `.drivesyncignore`, gitignore-style, for excluding files/directories from
-  sync entirely, with sensible defaults built in
-- Non-zero exit code whenever any action fails or the run is interrupted, so
-  cron/systemd/launchd can actually alert on it
-- Periodic scan progress logging, so a large tree over a slow SMB mount stays
-  visibly alive instead of printing nothing until it's entirely done
+## Commands
 
-## Build
+### `syncd init`
 
-```bash
-go build ./cmd/drivesync
-```
-
-## First-time setup
-
-Before the first real sync, bootstrap both roots and the remote canary file:
+Bootstraps a local/remote pair before the first real sync: creates `--local`
+and `--remote` if they don't exist, and writes the remote canary file
+(`.synclock`) if it isn't already there. Performs no reconciliation. Safe to
+run again later — it's a no-op if everything is already in place.
 
 ```bash
-./drivesync --init --local /path/to/local --remote /path/to/mounted/smb
+syncd init --local /path/to/local --remote /path/to/mounted/smb
 ```
 
-This creates `--local` and `--remote` if they don't exist yet and writes
-`.synclock` on the remote if it's missing, then exits without syncing.
-Safe to run again later; it's a no-op if everything is already in place.
+Run this once per local/remote pair before your first `syncd watch` or
+`syncd sync --hash` run.
 
-## Usage
+### `syncd sync` — fast ad-hoc / batch sync
+
+Runs a fast, size+mtime-based sync job (`mirror`, `update`, or `two-way`),
+either as a single one-off job or as a batch of named jobs from a config
+file.
 
 ```bash
-./drivesync --local /path/to/local --remote /path/to/mounted/smb
+# One-off job
+syncd sync --left /path/a --right /path/b --mode mirror
+
+# Every job in ~/.syncd.yaml
+syncd sync
+
+# Just one named job from the config file
+syncd sync --job photos
 ```
 
-### Dry run
+Flags:
+
+- `--left`, `--right` — one-off job paths (must be given together; skips the
+  config file entirely when set)
+- `--mode` — `mirror` (default), `update`, or `two-way`
+- `--job` — run only this named job from the config file
+- `--config` — config file path (default `~/.syncd.yaml`)
+- `--hash` — use the robust, hash-based engine (same three-way reconciler as
+  `syncd watch`) instead of the fast size+mtime reconciler for this run
+- `--yes` — skip the interactive confirmation prompt (needed for unattended/
+  scripted runs)
+
+#### Batch config file (`~/.syncd.yaml`)
+
+```yaml
+jobs:
+  - name: photos
+    left: /Users/me/Pictures
+    right: /Volumes/nas/Pictures
+    mode: mirror
+  - name: docs
+    left: /Users/me/Documents
+    right: /Volumes/nas/Documents
+    mode: two-way
+```
+
+Running `syncd sync` with no `--left`/`--right` runs every job listed here
+(or just the one named by `--job`).
+
+#### Sync modes
+
+- **`mirror`** — left is authoritative: right is made to match left exactly
+  (copies left→right, deletes anything on right that isn't on left).
+- **`update`** — left is authoritative but right is never deleted from: only
+  copies left→right for new/changed/newer files.
+- **`two-way`** — both sides can change between runs; persisted per-job state
+  (keyed by job name) is used to detect which side changed, propagate that
+  change to the other side, detect moves/renames, and apply "newer wins" if
+  both sides changed the same file since the last run.
+
+#### The `--hash` bridge
+
+By default `syncd sync` uses the fast reconciler (size+mtime comparison,
+no hashing — quick, but it can't detect a same-size/same-mtime edit or
+reliably reconcile drift after external changes). Passing `--hash` runs the
+same run through the robust, BLAKE3-hash-based three-way engine that
+`syncd watch` uses instead, backed by the SQLite manifest rather than the
+fast reconciler's own job-state table. Use it for an occasional, more
+thorough verification pass, or when you don't trust size+mtime alone (e.g.
+after an interrupted run, a restore, or clock skew between machines).
+
+### `syncd watch` — always-on daemon
+
+Runs `syncd` as a long-lived daemon combining three triggers, so that local
+changes propagate almost instantly while remote-side and structural changes
+are still eventually caught:
 
 ```bash
-./drivesync --local /path/to/local --remote /path/to/mounted/smb --dry-run
+syncd watch --local /path/to/local --remote /path/to/mounted/smb
 ```
 
-Both `--dry-run` and normal runs scan and hash the full local and remote
-trees before any plan is printed or any action executes, so the first sync
-against a large pre-existing tree (or a slow SMB link) can take a while
-before producing output. Every few seconds each side logs how many files
-it's scanned so far, so a long scan reads as "still working," not "hung."
-Excluding heavy, regenerable content you don't need synced (`.git/`,
-`node_modules/`, `__pycache__/`, build output, etc.) via `.drivesyncignore`
-(see below) is the main way to cut that first-scan time down.
+- **fsnotify watcher** — local filesystem events under `--local` are
+  debounced/coalesced (500ms) and reconciled via a **scoped** reconcile:
+  only the changed relative paths are scanned and planned, not the whole
+  tree. This is what makes local edits propagate almost instantly even on a
+  large tree.
+- **`--remote-poll`** (default `30s`) — a full, whole-tree reconcile cycle
+  (`HashIfChanged` policy) against both sides. This is the only way to catch
+  writes made directly on the remote by another machine, since a network
+  mount generally can't be watched by fsnotify.
+- **`--deep-scan`** (default `1h`) — the same full, whole-tree reconcile,
+  run periodically as a safety net. It is the *only* trigger that picks up
+  newly created empty directories and directories that were deleted
+  recursively on the local side — the fsnotify-driven scoped reconcile only
+  sees the top-level path for those and can't walk into what's already
+  gone. Do not disable this in production.
 
-### Silent mode
+All three triggers are serialized so cycles never overlap, and each cycle
+re-checks the remote canary file first; if the canary is missing (e.g. the
+network mount vanished), that cycle is logged and skipped rather than
+crashing the daemon — the next tick or event batch retries.
 
-```bash
-./drivesync --local /path/to/local --remote /path/to/mounted/smb --silent
-```
+Other flags: `--silent` (structured JSON logs only, no stdout), `--workers`,
+`--state-dir`/`--db-path`/`--log-path`/`--lock-path` overrides (see
+"State directory" below).
 
-`sync.log` is capped at 20MB; once it hits that size, the existing log is
-rotated to `sync.log.old` (overwriting any previous one) before the next
-run's log lines are written.
+### Choosing a mode
 
-By default, state artifacts are written under:
+Run `syncd watch` as your primary, continuous sync (via systemd/launchd —
+see "Deployment" below). Use `syncd sync` for one-off jobs, folders you only
+want synced occasionally or on demand, or as a periodic `--hash` integrity
+verification pass alongside a running `syncd watch` daemon.
 
-```text
-~/.local/state/drivesync/
-```
+## Hash policies
 
-- `manifest.db`
-- `sync.lock`
-- `sync.log`
+The robust engine (used by `syncd watch` and `syncd sync --hash`) controls
+when it computes a BLAKE3 content hash per scanned file:
 
-Override with:
+- **`HashIfChanged`** (used for the watch daemon's remote poll and deep
+  scan) — hashes only when a file's size+mtime differ from what's recorded
+  in the manifest; unchanged files reuse the cached hash. This is the normal
+  steady-state policy.
+- **`HashAlways`** — hashes every scanned file regardless of manifest state.
+  Used for a full-trust verification pass.
+- **`HashNever`** — skips hashing entirely (`Hash` is left empty). Not used
+  by the robust engine's normal paths; the fast reconciler doesn't hash at
+  all regardless of policy, since it only compares size+mtime.
 
-- `--state-dir`
-- `--db-path`
-- `--lock-path`
-- `--log-path`
+## `.syncdignore`
 
-## Conflict Strategy
-
-When both sides changed since last manifest and content differs:
-
-1. Rename local file to `*_conflict_YYYYMMDD_HHMMSS.ext` (truncating basename if needed).
-2. Download remote canonical file to local canonical path.
-3. Upload conflict copy to remote conflict path.
-4. Update manifest for both canonical and conflict paths.
-
-## Directory Sync
-
-File reconciliation drives directory handling; there's no separate directory
-entry in the manifest. After file actions run each sync:
-
-- Any directory that exists on one side but not the other is created on the
-  missing side (handles creating an empty folder ahead of adding files to it).
-- A directory is removed, on both sides, only if one of *this run's* delete
-  actions just emptied it. A directory that was already empty before the run
-  - and that the run didn't touch - is always left alone, so intentionally
-  empty folders are never swept away as a side effect.
-
-This is not previewed in `--dry-run` output; only file-level actions are.
-
-## Ignoring Files and Directories
-
-DriveSync always excludes a small set of built-in defaults, regardless of
+`syncd` always excludes a small set of built-in defaults, regardless of
 configuration:
 
 ```text
-.synclock   # the remote canary file itself
-*.tmp       # atomic-write staging files
-#recycle    # Synology recycle bin
-.venv       # Python virtualenvs
+.synclock                  # the remote canary file itself
+*.tmp                      # atomic-write staging files
+#recycle                   # Synology recycle bin
+.venv                      # Python virtualenvs
+.DS_Store, ._*, .fseventsd,
+.DocumentRevisions-V100,
+.Spotlight-V100, .TemporaryItems,
+.Trashes, @eaDir           # macOS/Synology junk
 ```
 
-To exclude anything else, add a `.drivesyncignore` file to the **local**
-root, one pattern per line, using gitignore syntax:
+To exclude anything else, add a `.syncdignore` file to the **local** root,
+one pattern per line, using gitignore syntax:
 
 - Blank lines and lines starting with `#` are comments (escape a literal
   leading `#` or `!` with a backslash: `\#weird-folder`).
@@ -150,29 +199,114 @@ Matching is symmetric: the same ruleset is applied to both the local and
 remote scan, using paths relative to the local root, so an ignored path is
 skipped no matter which side it happens to exist on. Ignored directories are
 pruned outright — files inside them are never scanned or hashed. Files that
-were already synced before being added to `.drivesyncignore` are left alone
-on both sides; ignoring only stops *future* syncing, it doesn't retroactively
+were already synced before being added to `.syncdignore` are left alone on
+both sides; ignoring only stops *future* syncing, it doesn't retroactively
 delete existing copies.
 
-`.drivesyncignore` is itself an ordinary file — like `.gitignore` in a repo,
-it syncs like anything else, so once it's synced once, both machines share
-the same rules. On a brand-new local root with nothing synced yet, only the
+`.syncdignore` is itself an ordinary file — like `.gitignore` in a repo, it
+syncs like anything else, so once it's synced once, both machines share the
+same rules. On a brand-new local root with nothing synced yet, only the
 built-in defaults apply until the first run pulls the file down.
 
-## Scheduling
+## Conflict strategy
 
-Boilerplate launch configurations are included in:
+When both sides changed since the last manifest record and their content
+differs (robust/hash-based engine only):
 
-- `deploy/systemd/drivesync.service`
-- `deploy/systemd/drivesync.timer`
-- `deploy/launchd/com.user.drivesync.plist`
+1. Rename the local file to `*_conflict_YYYYMMDD_HHMMSS.ext` (truncating the
+   basename if needed to stay under filesystem name-length limits).
+2. Download the remote canonical file to the local canonical path.
+3. Upload the local conflict copy to the remote conflict path.
+4. Update the manifest for both the canonical and the conflict paths.
 
-Fill in the real `--local`/`--remote` paths for each machine before
-installing. Cross-compile binaries for each target from macOS with:
+The fast reconciler's `two-way` mode instead applies "newer mtime wins" when
+both sides changed the same file since the last run — no conflict copy is
+created.
 
-```bash
-GOOS=darwin GOARCH=arm64 go build -o dist/drivesync-darwin-arm64 ./cmd/drivesync
-GOOS=linux  GOARCH=amd64 go build -o dist/drivesync-linux-amd64  ./cmd/drivesync
+## Directory sync
+
+File reconciliation drives directory handling; there's no separate directory
+entry in the manifest. After file actions run each robust-engine cycle:
+
+- Any directory that exists on one side but not the other is created on the
+  missing side (handles creating an empty folder ahead of adding files to
+  it).
+- A directory is removed, on both sides, only if one of *that cycle's*
+  delete actions just emptied it. A directory that was already empty before
+  the cycle — and that the cycle didn't touch — is always left alone, so
+  intentionally empty folders are never swept away as a side effect.
+
+This is not previewed in `syncd sync --dry-run`-style output; only
+file-level actions are (n/a for `syncd watch`, which has no dry-run mode).
+In `syncd watch`, whole-tree directory reconciliation only happens on the
+`--remote-poll` and `--deep-scan` cycles, not on the fsnotify-driven scoped
+reconcile — see "`syncd watch`" above.
+
+## State directory
+
+By default, state artifacts (SQLite manifest, lock file, JSON log) are
+written under:
+
+```text
+~/.local/state/syncd/
 ```
 
-(swap `GOARCH=amd64` for `arm64` if the Ubuntu Server target is ARM).
+- `manifest.db` (or `jobs.db` for `syncd sync`'s own job state and `--hash`
+  manifest, kept separate from the watch daemon's `manifest.db`)
+- `sync.lock`
+- `sync.log`
+
+`sync.log` is capped at 20MB; once it hits that size, the existing log is
+rotated to `sync.log.old` (overwriting any previous one) before the next
+run's log lines are written.
+
+Override with `--state-dir`, `--db-path`, `--log-path`, `--lock-path`
+(available on both `syncd sync`'s underlying runtime config and
+`syncd watch`).
+
+`syncd` also maintains an exclusive lockfile so overlapping runs against the
+same state directory can't corrupt each other, and validates a remote canary
+file (`.synclock`) before touching the remote — `syncd init` bootstraps it,
+and every sync/watch cycle re-checks it before making changes, so a network
+mount that vanished mid-run is caught rather than silently writing nowhere
+(or somewhere unexpected, if the mount point got reused by something else).
+
+## Cross-compiling
+
+Build for the current platform:
+
+```bash
+go build -o syncd ./cmd/syncd
+```
+
+Cross-compile binaries for other targets from macOS:
+
+```bash
+GOOS=darwin GOARCH=arm64 go build -o dist/syncd-darwin-arm64 ./cmd/syncd
+GOOS=linux  GOARCH=amd64 go build -o dist/syncd-linux-amd64  ./cmd/syncd
+```
+
+(swap `GOARCH=amd64` for `arm64` if the Linux target is ARM).
+
+## Deployment
+
+Boilerplate service definitions are included in:
+
+- `deploy/systemd/syncd.service` — the primary always-on mode: a long-lived
+  `syncd watch` daemon (`Type=simple`, `Restart=on-failure`).
+- `deploy/systemd/syncd.timer` — **optional**: a periodic `syncd sync --hash`
+  verification pass, for when you want an independent integrity check on top
+  of the watch daemon's own periodic deep scan. Not required for normal
+  operation. See the comments in that file for its companion oneshot unit.
+- `deploy/launchd/com.user.syncd.plist` — the macOS launchd equivalent of
+  `syncd.service`: `KeepAlive=true` keeps the `syncd watch` daemon running
+  continuously, restarting it if it exits.
+
+Fill in the real `--local`/`--remote` paths (marked as placeholders) for
+each machine before installing.
+
+## Build
+
+```bash
+go build ./cmd/syncd
+```
