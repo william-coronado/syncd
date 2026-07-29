@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -76,6 +78,15 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 
 		pterm.DefaultSection.Println("sync job: " + job.Name)
 
+		// execute.RunActions (the --hash/robust path) has no ProgressSink
+		// parameter, so a bar started here would never see AddBytes and
+		// would sit on screen forever without a Done() to stop it. Only
+		// build one for the fast path, which actually drives it.
+		var progress execute.ProgressSink
+		if !syncUseHash {
+			progress = newPtermProgressSink()
+		}
+
 		opts := app.SyncOptions{
 			Name:     job.Name,
 			Left:     job.Left,
@@ -86,7 +97,7 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 			Workers:  runtime.NumCPU(),
 			DBPath:   dbPath,
 			Confirm:  ptermConfirm,
-			Progress: newPtermProgressSink(),
+			Progress: progress,
 		}
 
 		runErr := app.SyncOnce(ctx, opts)
@@ -116,7 +127,7 @@ func resolveSyncJobs() ([]SyncJob, error) {
 		if syncLeft == "" || syncRight == "" {
 			return nil, errors.New("--left and --right must be given together")
 		}
-		return []SyncJob{{Name: "cli-job", Left: syncLeft, Right: syncRight, Mode: syncMode}}, nil
+		return []SyncJob{{Name: adHocJobName(syncLeft, syncRight), Left: syncLeft, Right: syncRight, Mode: syncMode}}, nil
 	}
 
 	cfg, err := loadSyncConfig(syncCfgFile)
@@ -136,6 +147,16 @@ func resolveSyncJobs() ([]SyncJob, error) {
 		}
 	}
 	return nil, fmt.Errorf("job %q not found in config", syncJobName)
+}
+
+// adHocJobName derives a stable job name for a one-off --left/--right pair
+// from a short hash of the pair itself, rather than a constant. Mirror and
+// update ignore Name entirely, but two-way persists state keyed by it in
+// job_state - a constant name would let two different ad-hoc two-way pairs
+// collide on the same row and corrupt each other's state.
+func adHocJobName(left, right string) string {
+	sum := sha256.Sum256([]byte(left + "\x00" + right))
+	return "cli-" + hex.EncodeToString(sum[:6])
 }
 
 func parseFastMode(mode string) (reconcile.FastMode, error) {

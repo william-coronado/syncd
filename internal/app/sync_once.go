@@ -43,15 +43,8 @@ func SyncOnce(ctx context.Context, opts SyncOptions) error {
 		opts.Workers = 1
 	}
 
-	// Ad-hoc jobs are commonly pointed at a destination that doesn't exist
-	// yet (that's the point of `mirror`), unlike the always-on daemon which
-	// requires --init first. fs.ScanTree walks with filepath.WalkDir, which
-	// errors if root is missing, so create both roots up front.
-	if err := os.MkdirAll(opts.Left, 0o755); err != nil {
-		return fmt.Errorf("create left root: %w", err)
-	}
-	if err := os.MkdirAll(opts.Right, 0o755); err != nil {
-		return fmt.Errorf("create right root: %w", err)
+	if err := prepareRoots(opts); err != nil {
+		return err
 	}
 
 	sqlDB, err := db.Open(opts.DBPath)
@@ -64,6 +57,44 @@ func SyncOnce(ctx context.Context, opts SyncOptions) error {
 		return runRobustOnce(ctx, sqlDB, opts)
 	}
 	return runFastOnce(ctx, sqlDB, opts)
+}
+
+// prepareRoots ensures both sync roots exist before scanning (ad-hoc jobs
+// are commonly pointed at a destination that doesn't exist yet - that's the
+// point of `mirror` - unlike the always-on daemon, which requires --init
+// first and so can assume both roots are already there).
+//
+// It is deliberately mode-aware: mirror/update (fast) and the --hash/robust
+// path are directional, with opts.Left as the source of truth, so
+// fabricating an empty source there would be a footgun - FastCompare's
+// mirror branch (or BuildPlan) would see "everything on the destination is
+// gone from the source" and emit deletes for the destination's entire
+// contents, silently wiping it under --yes. For those modes the source
+// (opts.Left) must already exist; only the destination (opts.Right) is
+// auto-created. two-way (fast) is symmetric and safe - a missing side with
+// no prior persisted state produces copies, not deletes - so creating both
+// roots there is fine.
+func prepareRoots(opts SyncOptions) error {
+	if !opts.UseHash && opts.Mode == reconcile.FastTwoWay {
+		if err := os.MkdirAll(opts.Left, 0o755); err != nil {
+			return fmt.Errorf("create left root: %w", err)
+		}
+		if err := os.MkdirAll(opts.Right, 0o755); err != nil {
+			return fmt.Errorf("create right root: %w", err)
+		}
+		return nil
+	}
+
+	if _, err := os.Stat(opts.Left); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("source directory does not exist: %s", opts.Left)
+		}
+		return fmt.Errorf("stat source directory %s: %w", opts.Left, err)
+	}
+	if err := os.MkdirAll(opts.Right, 0o755); err != nil {
+		return fmt.Errorf("create right root: %w", err)
+	}
+	return nil
 }
 
 // confirmOrDefault returns opts.Confirm, defaulting to an always-yes
