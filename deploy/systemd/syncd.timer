@@ -6,16 +6,10 @@
 # and-suspenders check independent of the watch daemon's own periodic deep
 # scan (see --deep-scan in `syncd watch --help`).
 #
-# This timer pairs with syncd-verify.service (a companion oneshot unit, not
-# installed by default - copy it alongside this file, filling in the same
-# --left/--right paths used by syncd.service's --local/--remote):
-#
-#   [Unit]
-#   Description=syncd hash-verify pass (paired with syncd.timer)
-#
-#   [Service]
-#   Type=oneshot
-#   ExecStart=/usr/local/bin/syncd sync --left /srv/dev/local --right /mnt/synology/share --hash --yes
+# This timer pairs with syncd-verify.service (deploy/systemd/syncd-verify.service
+# in this directory) - install both together, filling in the same
+# --left/--right paths in syncd-verify.service as syncd.service's
+# --local/--remote.
 
 [Unit]
 Description=Periodic syncd hash-verify pass (optional; syncd.service is the primary mode)

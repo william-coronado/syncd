@@ -1,0 +1,9 @@
+[Unit]
+Description=syncd periodic hash-verify (optional)
+
+[Service]
+Type=oneshot
+# Replace the placeholder paths below with the real local root and mounted
+# SMB/remote share for this machine — same pair as syncd.service's
+# --local/--remote.
+ExecStart=/usr/local/bin/syncd sync --hash --left /path/to/local --right /path/to/mounted/smb --yes

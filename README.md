@@ -236,11 +236,14 @@ entry in the manifest. After file actions run each robust-engine cycle:
   the cycle — and that the cycle didn't touch — is always left alone, so
   intentionally empty folders are never swept away as a side effect.
 
-This is not previewed in `syncd sync --dry-run`-style output; only
-file-level actions are (n/a for `syncd watch`, which has no dry-run mode).
-In `syncd watch`, whole-tree directory reconciliation only happens on the
-`--remote-poll` and `--deep-scan` cycles, not on the fsnotify-driven scoped
-reconcile — see "`syncd watch`" above.
+`syncd sync` has no dry-run/preview mode at all (for either file or
+directory actions): before mutating anything it shows an interactive
+confirmation summary of the planned file-level actions and waits for
+approval, unless `--yes` is given to skip the prompt; directory create/
+cleanup is never previewed in that summary either way. `syncd watch` has no
+preview step of any kind — whole-tree directory reconciliation there only
+happens on the `--remote-poll` and `--deep-scan` cycles, not on the
+fsnotify-driven scoped reconcile — see "`syncd watch`" above.
 
 ## State directory
 
@@ -251,8 +254,9 @@ written under:
 ~/.local/state/syncd/
 ```
 
-- `manifest.db` (or `jobs.db` for `syncd sync`'s own job state and `--hash`
-  manifest, kept separate from the watch daemon's `manifest.db`)
+- `manifest.db` — `syncd watch`'s manifest
+- `jobs.db` — `syncd sync`'s own job state and `--hash` manifest, kept
+  separate from the watch daemon's `manifest.db`
 - `sync.lock`
 - `sync.log`
 
@@ -260,9 +264,10 @@ written under:
 rotated to `sync.log.old` (overwriting any previous one) before the next
 run's log lines are written.
 
-Override with `--state-dir`, `--db-path`, `--log-path`, `--lock-path`
-(available on both `syncd sync`'s underlying runtime config and
-`syncd watch`).
+`syncd watch` accepts `--state-dir`, `--db-path`, `--log-path`, and
+`--lock-path` to override any of the above. **`syncd sync` has no such
+flags** — its `jobs.db` path is currently fixed at
+`~/.local/state/syncd/jobs.db` and is not user-overridable.
 
 `syncd` also maintains an exclusive lockfile so overlapping runs against the
 same state directory can't corrupt each other, and validates a remote canary
@@ -294,10 +299,12 @@ Boilerplate service definitions are included in:
 
 - `deploy/systemd/syncd.service` — the primary always-on mode: a long-lived
   `syncd watch` daemon (`Type=simple`, `Restart=on-failure`).
-- `deploy/systemd/syncd.timer` — **optional**: a periodic `syncd sync --hash`
-  verification pass, for when you want an independent integrity check on top
-  of the watch daemon's own periodic deep scan. Not required for normal
-  operation. See the comments in that file for its companion oneshot unit.
+- `deploy/systemd/syncd.timer` + `deploy/systemd/syncd-verify.service` —
+  **optional**, install both together: the timer periodically triggers the
+  oneshot `syncd-verify.service`, which runs a `syncd sync --hash`
+  verification pass. This is an independent integrity check on top of the
+  watch daemon's own periodic deep scan; it is not required for normal
+  operation.
 - `deploy/launchd/com.user.syncd.plist` — the macOS launchd equivalent of
   `syncd.service`: `KeepAlive=true` keeps the `syncd watch` daemon running
   continuously, restarting it if it exits.
