@@ -64,6 +64,27 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 		return nil, err
 	}
 
+	// filepath.Abs (used to resolve --local before this is ever called)
+	// does not resolve symlinks, so root may itself be a symlink to a
+	// directory. filepath.WalkDir lstats its root argument and never
+	// follows a symlink there, so d.IsDir() is false for the root entry and
+	// the walk below visits nothing at all (not even an attempt to fsAdd
+	// it) - resolving here makes watching a symlinked root actually work,
+	// instead of silently watching zero directories.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		fsw.Close()
+		return nil, fmt.Errorf("watcher: resolve root %s: %w", root, err)
+	}
+	if info, statErr := os.Stat(resolvedRoot); statErr != nil {
+		fsw.Close()
+		return nil, fmt.Errorf("watcher: stat root %s: %w", root, statErr)
+	} else if !info.IsDir() {
+		fsw.Close()
+		return nil, fmt.Errorf("watcher: root %s is not a directory", root)
+	}
+	root = resolvedRoot
+
 	var addErrors []error
 	watched := 0
 
@@ -98,6 +119,17 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 	}
 	if watched == 0 {
 		fsw.Close()
+		// A previous reviewer argued indexing addErrors[0] here was safe
+		// because "root is always attempted, so watched==0 implies >=1 add
+		// error" - and was wrong (see TestNewWatcher_SymlinkedRootDoesNotPanic,
+		// which panicked here with a symlinked root before the resolve+IsDir
+		// check above was added). Even with that check in place, never index
+		// addErrors without first confirming it's non-empty - the whole
+		// point of this fix is that "reasoning" is exactly what got this
+		// wrong the first time.
+		if len(addErrors) == 0 {
+			return nil, fmt.Errorf("watcher: no directories could be watched under %s", root)
+		}
 		return nil, fmt.Errorf("watcher: no directories could be watched under %s (%d add error(s), first: %v)", root, len(addErrors), addErrors[0])
 	}
 
