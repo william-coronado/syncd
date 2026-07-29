@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"reflect"
 	"testing"
 
 	"syncd/internal/db"
@@ -38,6 +39,79 @@ func TestFastTwoWayDetectsMove(t *testing.T) {
 	right := map[string]db.JobFileState{"old": {Path: "old", Size: 3, Mtime: 5}}
 	res := FastCompare(FastTwoWay, left, right, prev)
 	assertHasTask(t, res, FastTask{Type: MoveR, RelPath: "new", OldRelPath: "old"})
+}
+
+// TestFastTwoWayMoveIsDeterministic guards against the race described in
+// review-fixes task 4: fast.go used to iterate `allPaths` (a Go map) in a
+// single pass where `processedMoves[oldPath]` was only set once the *new*
+// path was visited, but the delete branch fired as soon as the *old* path
+// was visited. When map order happened to visit the old path first, a run
+// emitted BOTH a spurious DeleteR for the old path AND the correct MoveR -
+// two different task sets from identical inputs, observed ~13.5% of the
+// time. Since execute.RunFastTasks runs tasks concurrently, a stray DeleteR
+// racing the MoveR can destroy the file's only remaining copy.
+//
+// This asserts every one of >=200 runs on the same inputs produces the
+// exact same, complete task list (and the same NewState, since that is
+// persisted as the next run's baseline).
+func TestFastTwoWayMoveIsDeterministic(t *testing.T) {
+	prev := map[string]db.JobFileState{"old.txt": {Path: "old.txt", Size: 3, Mtime: 5}}
+	left := map[string]db.JobFileState{"new.txt": {Path: "new.txt", Size: 3, Mtime: 5}}
+	right := map[string]db.JobFileState{"old.txt": {Path: "old.txt", Size: 3, Mtime: 5}}
+
+	wantTasks := []FastTask{
+		{Type: MoveR, RelPath: "new.txt", OldRelPath: "old.txt"},
+	}
+	wantState := map[string]db.JobFileState{
+		"new.txt": {Path: "new.txt", Size: 3, Mtime: 5},
+	}
+
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		res := FastCompare(FastTwoWay, left, right, prev)
+		if !reflect.DeepEqual(res.Tasks, wantTasks) {
+			t.Fatalf("run %d: task list not deterministic/correct: got %+v, want %+v", i, res.Tasks, wantTasks)
+		}
+		if !reflect.DeepEqual(res.NewState, wantState) {
+			t.Fatalf("run %d: NewState not deterministic/correct: got %+v, want %+v", i, res.NewState, wantState)
+		}
+	}
+}
+
+// TestFastTwoWaySignatureCollisionFallsBackToCopyDelete: two files deleted
+// from left share the same {Size,Mtime} signature. leftMissingSigs/
+// rightMissingSigs are keyed by signature alone, so a naive implementation
+// silently drops one of the two candidates and may pick an arbitrary (wrong)
+// move. The safe behavior is to treat a colliding signature as "no match" -
+// never emit a move for it - and fall through to copy/delete, which is
+// always correct (if slower).
+func TestFastTwoWaySignatureCollisionFallsBackToCopyDelete(t *testing.T) {
+	prev := map[string]db.JobFileState{
+		"old1.txt": {Path: "old1.txt", Size: 5, Mtime: 100},
+		"old2.txt": {Path: "old2.txt", Size: 5, Mtime: 100},
+	}
+	left := map[string]db.JobFileState{
+		"new.txt": {Path: "new.txt", Size: 5, Mtime: 100},
+	}
+	right := map[string]db.JobFileState{
+		"old1.txt": {Path: "old1.txt", Size: 5, Mtime: 100},
+		"old2.txt": {Path: "old2.txt", Size: 5, Mtime: 100},
+	}
+
+	for i := 0; i < 50; i++ {
+		res := FastCompare(FastTwoWay, left, right, prev)
+		for _, task := range res.Tasks {
+			if task.Type == MoveR || task.Type == MoveL {
+				t.Fatalf("run %d: expected no move for colliding signatures, got %+v in %+v", i, task, res.Tasks)
+			}
+		}
+		if len(res.Tasks) != 3 {
+			t.Fatalf("run %d: expected exactly 3 tasks (1 copy + 2 deletes), got %d: %+v", i, len(res.Tasks), res.Tasks)
+		}
+		assertHasTask(t, res, FastTask{Type: CopyL2R, RelPath: "new.txt", Size: 5})
+		assertHasTask(t, res, FastTask{Type: DeleteR, RelPath: "old1.txt"})
+		assertHasTask(t, res, FastTask{Type: DeleteR, RelPath: "old2.txt"})
+	}
 }
 
 // --- Cases ported from file_sync_util/internal/sync/compare_test.go ---
