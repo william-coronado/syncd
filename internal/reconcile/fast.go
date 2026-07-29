@@ -125,7 +125,22 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, sk
 		rightMissingSigs := make(map[fastSignature]string)
 		rightMissingCollided := make(map[fastSignature]bool)
 
-		for path, state := range prev {
+		// Iterate prev via a sorted slice, not a bare map. This loop has no
+		// order-dependent side effect today - collision handling is symmetric
+		// (see leftMissingCollided/rightMissingCollided below), so any visit
+		// order converges on the same leftMissingSigs/rightMissingSigs - but
+		// sorting costs nothing at these sizes and matches the determinism
+		// this whole function is documented to guarantee (see the allPaths
+		// sort a few lines below), rather than leaving that reasoning
+		// unstated (docs/follow-ups.md #2).
+		prevPaths := make([]string, 0, len(prev))
+		for p := range prev {
+			prevPaths = append(prevPaths, p)
+		}
+		sort.Strings(prevPaths)
+
+		for _, path := range prevPaths {
+			state := prev[path]
 			if skipped.Contains(path) {
 				// Ambiguous: we don't know this scan whether path is really
 				// gone from left/right or just unreadable, so it must not
