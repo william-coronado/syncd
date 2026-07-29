@@ -21,8 +21,8 @@ type runSummary struct {
 }
 
 // RobustParams configures a single robust, hash-based three-way sync cycle
-// run by RunRobustOnce. It is the shared engine behind app.Run's always-on
-// loop, the future watch loop, and the `syncd sync --hash` bridge (see
+// run by RunRobustOnce. It is the shared engine behind the `syncd watch`
+// daemon (internal/watch) and the `syncd sync --hash` bridge (see
 // sync_once.go).
 type RobustParams struct {
 	LocalRoot, RemoteRoot string
@@ -46,8 +46,8 @@ type RobustParams struct {
 // (possibly stage-specific) wrapping of the plain underlying error; a runErr
 // or failures>0 result is reported only after a run summary is emitted,
 // wrapped as "sync run did not complete" / "sync completed with N failed
-// action(s)" respectively. See app.Run and sync_once.go's runRobustOnce for
-// the two call sites that branch on this.
+// action(s)" respectively. See sync_once.go's runRobustOnce for the call
+// site that branches on this.
 type robustHardError struct {
 	stage string // "load manifest", "scan", or "apply manifest updates"
 	err   error
@@ -236,87 +236,6 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	return plan, failures, runErr
 }
 
-func Run(ctx context.Context, cfg runtime.Config) error {
-	paths, err := runtime.ResolvePaths(cfg)
-	if err != nil {
-		return err
-	}
-	logger, err := runtime.NewLogger(cfg.Silent, paths.LogPath)
-	if err != nil {
-		return err
-	}
-	defer logger.Close()
-
-	if cfg.Init {
-		return RunInit(cfg.LocalRoot, cfg.RemoteRoot, logger)
-	}
-
-	lock, err := runtime.AcquireLock(paths.LockPath)
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-
-	if err := runtime.CheckRemoteCanary(cfg.RemoteRoot); err != nil {
-		return err
-	}
-
-	sqlDB, err := db.Open(paths.DBPath)
-	if err != nil {
-		return err
-	}
-	defer sqlDB.Close()
-	repo := db.NewManifestRepo(sqlDB)
-
-	if cfg.DryRun {
-		manifest, err := repo.LoadAll(ctx)
-		if err != nil {
-			return err
-		}
-		scans, err := fs.ScanPair(ctx, cfg.LocalRoot, cfg.RemoteRoot, manifest, fs.HashIfChanged, scanProgressLogger(logger))
-		if err != nil {
-			return err
-		}
-		for _, issue := range scans.Local.Issues {
-			logger.Error("skipping local file", map[string]any{
-				"path":   issue.Path,
-				"reason": issue.Reason,
-			})
-		}
-		skipped := copySkipped(scans.Local.Skipped, scans.Remote.Skipped)
-		plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
-		return printPlan(logger, cfg.Silent, plan)
-	}
-
-	plan, failures, runErr := RunRobustOnce(ctx, RobustParams{
-		LocalRoot:  cfg.LocalRoot,
-		RemoteRoot: cfg.RemoteRoot,
-		Workers:    cfg.Workers,
-		Repo:       repo,
-		DB:         sqlDB,
-		Logger:     logger,
-		Policy:     fs.HashIfChanged,
-	})
-
-	// A hard failure (manifest LoadAll, ScanPair, or ApplyUpdates) is
-	// reported immediately with its own bare error text, exactly as before
-	// RunRobustOnce existed - no run summary is printed for it.
-	if hard, ok := runErr.(*robustHardError); ok {
-		return hard.err
-	}
-
-	if err := printRunSummary(logger, cfg.Silent, plan.Actions, failures); err != nil {
-		return err
-	}
-	if runErr != nil {
-		return fmt.Errorf("sync run did not complete: %w", runErr)
-	}
-	if failures > 0 {
-		return fmt.Errorf("sync completed with %d failed action(s)", failures)
-	}
-	return nil
-}
-
 // RunInit bootstraps first-time setup: creates the local and remote root
 // directories if missing, and writes the remote canary file (.synclock) if
 // it isn't already there. It performs no reconciliation.
@@ -363,22 +282,14 @@ func copySkipped(sets ...map[string]struct{}) map[string]struct{} {
 	return out
 }
 
-func printPlan(logger *runtime.Logger, silent bool, plan reconcile.Plan) error {
-	if silent {
-		b, err := json.Marshal(plan)
-		if err != nil {
-			return fmt.Errorf("marshal dry-run plan: %w", err)
-		}
-		logger.Info("dry-run plan", map[string]any{"plan": json.RawMessage(b)})
-		return nil
-	}
-
-	for _, action := range plan.Actions {
-		logger.Printf("%s\t%s\t%s", action.Type, action.Path, action.Reason)
-	}
-	return nil
-}
-
+// printRunSummary logs the outcome of a completed run (action-type counts
+// plus failure count), either as structured JSON (--silent) or human-
+// readable Printf lines. It has no current production caller - it was
+// app.Run's post-RunRobustOnce reporting step, and app.Run (the old
+// always-on-daemon entrypoint superseded by the `syncd sync`/`syncd watch`
+// cobra commands) was removed as dead code in this cleanup round - but it is
+// kept intentionally as a small, self-contained run-summary formatter that a
+// future caller (e.g. `syncd watch`'s cycle logging) may still want.
 func printRunSummary(logger *runtime.Logger, silent bool, actions []reconcile.Action, failures int) error {
 	counts := make(map[reconcile.ActionType]int)
 	for _, action := range actions {

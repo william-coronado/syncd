@@ -75,3 +75,32 @@ func TestSyncOnceMirrorMissingSourceErrorsWithoutTouchingDest(t *testing.T) {
 		t.Fatalf("expected source path to remain nonexistent (must not be auto-created), stat err = %v", statErr)
 	}
 }
+
+// TestSyncOnceHashFailedActionSurfacesAsError covers, for the --hash/robust
+// path, the same "a failed action must surface as a non-nil error" behavior
+// the old TestRun_FailedActionSurfacesAsError checked via the now-removed
+// app.Run. That behavior still lives in runRobustOnce's failures>0 check
+// (sync_once.go), reached here through the exported SyncOnce entry point,
+// same as the real `syncd sync --hash` CLI path.
+func TestSyncOnceHashFailedActionSurfacesAsError(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+
+	// Block the upload deterministically: put a directory where the
+	// uploaded file needs to land, so the final atomic rename fails. This
+	// avoids relying on permission bits, which root/CI environments can
+	// bypass.
+	if err := os.WriteFile(filepath.Join(left, "blocked.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(right, "blocked.txt"), 0o755); err != nil {
+		t.Fatalf("create blocking directory: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, UseHash: true,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err == nil {
+		t.Fatal("expected SyncOnce to return an error when an action fails, got nil")
+	}
+}

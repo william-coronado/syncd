@@ -6,21 +6,35 @@ import (
 	"path/filepath"
 	"testing"
 
+	"syncd/internal/db"
+	"syncd/internal/fs"
 	"syncd/internal/runtime"
 )
 
-func newTestConfig(t *testing.T, localRoot, remoteRoot string) runtime.Config {
+// newTestRobustParams opens a fresh manifest db and a discard-friendly
+// logger and returns RobustParams wired to sync local<->remote, ready to
+// pass to RunRobustOnce/RunRobustScoped. The db and logger are closed
+// automatically via t.Cleanup.
+func newTestRobustParams(t *testing.T, local, remote string) RobustParams {
 	t.Helper()
-	// Canary file: with no --init support yet, tests bootstrap it manually,
-	// mirroring what a real first-time setup must do by hand today.
-	if err := os.WriteFile(filepath.Join(remoteRoot, ".synclock"), []byte("canary"), 0o644); err != nil {
-		t.Fatalf("write canary: %v", err)
+	sqlDB, err := db.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
 	}
-	return runtime.Config{
-		LocalRoot:  localRoot,
-		RemoteRoot: remoteRoot,
+	t.Cleanup(func() { sqlDB.Close() })
+	logger, err := runtime.NewLogger(true, filepath.Join(t.TempDir(), "l.log"))
+	if err != nil {
+		t.Fatalf("runtime.NewLogger: %v", err)
+	}
+	t.Cleanup(func() { logger.Close() })
+	return RobustParams{
+		LocalRoot:  local,
+		RemoteRoot: remote,
 		Workers:    2,
-		StateDir:   t.TempDir(),
+		Repo:       db.NewManifestRepo(sqlDB),
+		DB:         sqlDB,
+		Logger:     logger,
+		Policy:     fs.HashIfChanged,
 	}
 }
 
@@ -33,11 +47,18 @@ func mustReadFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-func TestRun_EndToEndSyncLifecycle(t *testing.T) {
+// TestRunRobustOnce_EndToEndSyncLifecycle exercises the full scan -> plan ->
+// execute -> manifest-update cycle across several runs: new-file upload,
+// local-only edit propagation, a same-file conflict on both sides (preserve-
+// both), and delete propagation. This is the same scenario the old
+// TestRun_EndToEndSyncLifecycle drove through app.Run before app.Run (the
+// superseded always-on-daemon entrypoint) was removed as dead code - the
+// behavior itself is unchanged and still lives entirely in RunRobustOnce.
+func TestRunRobustOnce_EndToEndSyncLifecycle(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
-	cfg := newTestConfig(t, localRoot, remoteRoot)
 	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
 
 	localPath := filepath.Join(localRoot, "a.txt")
 	remotePath := filepath.Join(remoteRoot, "a.txt")
@@ -46,7 +67,7 @@ func TestRun_EndToEndSyncLifecycle(t *testing.T) {
 	if err := os.WriteFile(localPath, []byte("v1"), 0o644); err != nil {
 		t.Fatalf("write local v1: %v", err)
 	}
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run 1 (upload new file): %v", err)
 	}
 	if got := mustReadFile(t, remotePath); got != "v1" {
@@ -57,7 +78,7 @@ func TestRun_EndToEndSyncLifecycle(t *testing.T) {
 	if err := os.WriteFile(localPath, []byte("v2"), 0o644); err != nil {
 		t.Fatalf("write local v2: %v", err)
 	}
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run 2 (local edit): %v", err)
 	}
 	if got := mustReadFile(t, remotePath); got != "v2" {
@@ -71,7 +92,7 @@ func TestRun_EndToEndSyncLifecycle(t *testing.T) {
 	if err := os.WriteFile(remotePath, []byte("v3-remote"), 0o644); err != nil {
 		t.Fatalf("write remote v3: %v", err)
 	}
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run 3 (conflict): %v", err)
 	}
 	if got := mustReadFile(t, localPath); got != "v3-remote" {
@@ -105,7 +126,7 @@ func TestRun_EndToEndSyncLifecycle(t *testing.T) {
 	if err := os.Remove(localPath); err != nil {
 		t.Fatalf("remove local canonical: %v", err)
 	}
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run 4 (delete propagation): %v", err)
 	}
 	if _, err := os.Stat(remotePath); !os.IsNotExist(err) {
@@ -113,64 +134,20 @@ func TestRun_EndToEndSyncLifecycle(t *testing.T) {
 	}
 }
 
-func TestRun_DryRunDoesNotMutateFilesystem(t *testing.T) {
-	localRoot := t.TempDir()
-	remoteRoot := t.TempDir()
-	cfg := newTestConfig(t, localRoot, remoteRoot)
-	cfg.DryRun = true
-	ctx := context.Background()
-
-	if err := os.WriteFile(filepath.Join(localRoot, "new.txt"), []byte("content"), 0o644); err != nil {
-		t.Fatalf("write local file: %v", err)
-	}
-
-	if err := Run(ctx, cfg); err != nil {
-		t.Fatalf("dry-run: %v", err)
-	}
-
-	if _, err := os.Stat(filepath.Join(remoteRoot, "new.txt")); !os.IsNotExist(err) {
-		t.Fatalf("dry-run must not create files on remote, stat err = %v", err)
-	}
-}
-
-func TestRun_FailedActionSurfacesAsError(t *testing.T) {
-	localRoot := t.TempDir()
-	remoteRoot := t.TempDir()
-	cfg := newTestConfig(t, localRoot, remoteRoot)
-	ctx := context.Background()
-
-	// Block the upload deterministically: put a directory where the uploaded
-	// file needs to land, so the final atomic rename fails. This avoids
-	// relying on permission bits, which root/CI environments can bypass.
-	if err := os.WriteFile(filepath.Join(localRoot, "blocked.txt"), []byte("content"), 0o644); err != nil {
-		t.Fatalf("write local file: %v", err)
-	}
-	if err := os.Mkdir(filepath.Join(remoteRoot, "blocked.txt"), 0o755); err != nil {
-		t.Fatalf("create blocking directory: %v", err)
-	}
-
-	err := Run(ctx, cfg)
-	if err == nil {
-		t.Fatal("expected Run to return an error when an action fails, got nil")
-	}
-}
-
-func TestRun_InitBootstrapsDirsAndCanaryWithoutSyncing(t *testing.T) {
+func TestRunInit_BootstrapsDirsAndCanaryWithoutSyncing(t *testing.T) {
 	parent := t.TempDir()
-	// Local/remote roots deliberately don't exist yet - --init must create them.
+	// Local/remote roots deliberately don't exist yet - RunInit must create them.
 	localRoot := filepath.Join(parent, "local")
 	remoteRoot := filepath.Join(parent, "remote")
 
-	cfg := runtime.Config{
-		LocalRoot:  localRoot,
-		RemoteRoot: remoteRoot,
-		Workers:    2,
-		StateDir:   t.TempDir(),
-		Init:       true,
+	logger, err := runtime.NewLogger(true, filepath.Join(t.TempDir(), "l.log"))
+	if err != nil {
+		t.Fatalf("runtime.NewLogger: %v", err)
 	}
+	defer logger.Close()
 
-	if err := Run(context.Background(), cfg); err != nil {
-		t.Fatalf("Run(--init): %v", err)
+	if err := RunInit(localRoot, remoteRoot, logger); err != nil {
+		t.Fatalf("RunInit: %v", err)
 	}
 
 	if info, err := os.Stat(localRoot); err != nil || !info.IsDir() {
@@ -184,30 +161,29 @@ func TestRun_InitBootstrapsDirsAndCanaryWithoutSyncing(t *testing.T) {
 	}
 }
 
-func TestRun_InitIsIdempotent(t *testing.T) {
+func TestRunInit_IsIdempotent(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
-	cfg := runtime.Config{
-		LocalRoot:  localRoot,
-		RemoteRoot: remoteRoot,
-		Workers:    2,
-		StateDir:   t.TempDir(),
-		Init:       true,
-	}
 
-	if err := Run(context.Background(), cfg); err != nil {
-		t.Fatalf("first Run(--init): %v", err)
+	logger, err := runtime.NewLogger(true, filepath.Join(t.TempDir(), "l.log"))
+	if err != nil {
+		t.Fatalf("runtime.NewLogger: %v", err)
 	}
-	if err := Run(context.Background(), cfg); err != nil {
-		t.Fatalf("second Run(--init) should be a harmless no-op, got: %v", err)
+	defer logger.Close()
+
+	if err := RunInit(localRoot, remoteRoot, logger); err != nil {
+		t.Fatalf("first RunInit: %v", err)
+	}
+	if err := RunInit(localRoot, remoteRoot, logger); err != nil {
+		t.Fatalf("second RunInit should be a harmless no-op, got: %v", err)
 	}
 }
 
-func TestRun_HonorsDriveSyncIgnoreFile(t *testing.T) {
+func TestRunRobustOnce_HonorsSyncdignoreFile(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
-	cfg := newTestConfig(t, localRoot, remoteRoot)
 	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
 
 	if err := os.WriteFile(filepath.Join(localRoot, ".syncdignore"), []byte("*.scratch\nbuild/\n"), 0o644); err != nil {
 		t.Fatalf("write .syncdignore: %v", err)
@@ -225,7 +201,7 @@ func TestRun_HonorsDriveSyncIgnoreFile(t *testing.T) {
 		t.Fatalf("write keep.txt: %v", err)
 	}
 
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
@@ -245,11 +221,11 @@ func TestRun_HonorsDriveSyncIgnoreFile(t *testing.T) {
 	}
 }
 
-func TestRun_SyncsEmptyDirectoriesAndCleansUpAfterDelete(t *testing.T) {
+func TestRunRobustOnce_SyncsEmptyDirectoriesAndCleansUpAfterDelete(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
-	cfg := newTestConfig(t, localRoot, remoteRoot)
 	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
 
 	// An empty directory on the local side only should be mirrored to remote.
 	if err := os.MkdirAll(filepath.Join(localRoot, "empty-folder"), 0o755); err != nil {
@@ -265,7 +241,7 @@ func TestRun_SyncsEmptyDirectoriesAndCleansUpAfterDelete(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run 1: %v", err)
 	}
 	if info, err := os.Stat(filepath.Join(remoteRoot, "empty-folder")); err != nil || !info.IsDir() {
@@ -282,7 +258,7 @@ func TestRun_SyncsEmptyDirectoriesAndCleansUpAfterDelete(t *testing.T) {
 	if err := os.Remove(tempFilePath); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if err := Run(ctx, cfg); err != nil {
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("run 2: %v", err)
 	}
 
