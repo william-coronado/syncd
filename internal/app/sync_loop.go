@@ -30,8 +30,7 @@ type RobustParams struct {
 	Repo                  *db.ManifestRepo
 	DB                    *sql.DB
 	Logger                *runtime.Logger
-	Policy                fs.HashPolicy       // HashIfChanged for polls, HashAlways for deep verify
-	OnlyPaths             map[string]struct{} // nil => whole tree; non-nil => restrict scan+plan to these rel paths
+	Policy                fs.HashPolicy // HashIfChanged for polls, HashAlways for deep verify
 }
 
 // robustHardError marks an error from RunRobustOnce that happened before -
@@ -63,12 +62,6 @@ func (e *robustHardError) Unwrap() error { return e.err }
 // The returned error is either nil, a *robustHardError (LoadAll/ScanPair/
 // ApplyUpdates failed - see its doc comment), or the bare execute.RunActions
 // runErr (e.g. context cancellation) after a manifest commit was attempted.
-//
-// When p.OnlyPaths is non-nil, the local/remote/manifest file maps produced
-// by the scan are filtered down to just those relative paths before
-// reconcile.BuildPlan runs, so only that subset is reconciled - everything
-// else is left untouched. This does not restrict empty-directory
-// create/cleanup, which always considers the whole tree.
 func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, error) {
 	manifest, err := p.Repo.LoadAll(ctx)
 	if err != nil {
@@ -87,12 +80,6 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	}
 
 	localFiles, remoteFiles := scans.Local.Files, scans.Remote.Files
-	if p.OnlyPaths != nil {
-		localFiles = filterToOnlyPaths(localFiles, p.OnlyPaths)
-		remoteFiles = filterToOnlyPaths(remoteFiles, p.OnlyPaths)
-		manifest = filterToOnlyPaths(manifest, p.OnlyPaths)
-	}
-
 	skipped := copySkipped(scans.Local.Skipped, scans.Remote.Skipped)
 	plan := reconcile.BuildPlan(localFiles, remoteFiles, manifest, skipped)
 
@@ -126,18 +113,6 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	}
 
 	return plan, failures, runErr
-}
-
-// filterToOnlyPaths returns a new map containing only the entries of m whose
-// key is present in only.
-func filterToOnlyPaths[T any](m map[string]T, only map[string]struct{}) map[string]T {
-	out := make(map[string]T, len(only))
-	for k, v := range m {
-		if _, ok := only[k]; ok {
-			out[k] = v
-		}
-	}
-	return out
 }
 
 // collectManifestUpdates dedups a batch of execute.Result into the final set

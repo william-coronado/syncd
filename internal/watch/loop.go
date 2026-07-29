@@ -99,7 +99,6 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			guardedCycle(func() error {
 				pollParams := p
 				pollParams.Policy = fs.HashIfChanged
-				pollParams.OnlyPaths = nil
 				_, _, err := app.RunRobustOnce(ctx, pollParams)
 				return err
 			})
@@ -108,7 +107,6 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			guardedCycle(func() error {
 				deepParams := p
 				deepParams.Policy = fs.HashIfChanged
-				deepParams.OnlyPaths = nil
 				_, _, err := app.RunRobustOnce(ctx, deepParams)
 				return err
 			})
