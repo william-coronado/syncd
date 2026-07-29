@@ -16,7 +16,8 @@ import (
 // basename has an SMB-forbidden char, record it in Issues+Skipped;
 // otherwise produce a FileEntry with Hash per policy (HashIfChanged reuses
 // the manifest cache exactly as ScanTree does). Returns a ScanResult (Dirs
-// is always empty here).
+// and SkippedDirs are always empty here: ScanPaths never walks a subtree, so
+// there is no "unreadable subdirectory" case for it to record).
 //
 // Like ScanTree, a per-entry problem (an unreadable file, a symlink, a
 // non-regular file) is recorded in Issues+Skipped and does not fail the
@@ -25,9 +26,10 @@ import (
 // bug (there is no ctx to cancel).
 func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db.ManifestRow, policy HashPolicy, validateSMBName bool, matcher *IgnoreMatcher) (ScanResult, error) {
 	result := ScanResult{
-		Files:   make(map[string]FileEntry),
-		Skipped: make(map[string]struct{}),
-		Dirs:    make(map[string]struct{}),
+		Files:       make(map[string]FileEntry),
+		Skipped:     make(map[string]struct{}),
+		SkippedDirs: make(map[string]struct{}),
+		Dirs:        make(map[string]struct{}),
 	}
 	scanStart := time.Now().Unix()
 	for rel := range relPaths {

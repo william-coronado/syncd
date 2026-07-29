@@ -38,6 +38,16 @@ type ScanResult struct {
 	Files   map[string]FileEntry
 	Issues  []ScanIssue
 	Skipped map[string]struct{}
+	// SkippedDirs holds the root-relative path of every directory whose
+	// contents could not be enumerated (e.g. permission denied) - a subset
+	// of Skipped's keys, specifically the ones that are directories. Its
+	// descendants were never visited, so they appear in neither Files nor
+	// Skipped: reconcilers must treat every path beneath a SkippedDirs entry
+	// as unknown too (see reconcile.SkipSet, which both reconcilers use for
+	// this), not just the directory's own path - otherwise an unreadable
+	// subdirectory's whole contents read as "deleted" on this side. Always
+	// empty from ScanPaths, which never walks a subtree.
+	SkippedDirs map[string]struct{}
 	// Dirs holds every directory encountered under root (relative, NFC
 	// normalized, excluding root itself), regardless of whether it contains
 	// files. Used for empty-directory create/cleanup, which manifest-based
@@ -141,9 +151,10 @@ const progressReportInterval = 3 * time.Second
 // cancellation, aborts the whole scan and returns an error.
 func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy, progress ScanProgressFunc) (ScanResult, error) {
 	result := ScanResult{
-		Files:   make(map[string]FileEntry),
-		Skipped: make(map[string]struct{}),
-		Dirs:    make(map[string]struct{}),
+		Files:       make(map[string]FileEntry),
+		Skipped:     make(map[string]struct{}),
+		SkippedDirs: make(map[string]struct{}),
+		Dirs:        make(map[string]struct{}),
 	}
 	// mtime has only 1-second resolution, so a file touched within the same
 	// second as this scan can't be trusted to have a stable mtime yet (the
@@ -175,7 +186,11 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 			result.Skipped[relPath] = struct{}{}
 			if d != nil && d.IsDir() {
 				// Its contents couldn't be read (e.g. permission denied) -
-				// nothing more to walk under it.
+				// nothing more to walk under it. Record it as a skipped
+				// DIRECTORY too (not just an exact skipped path): its
+				// descendants are never visited, so reconcile.SkipSet needs
+				// this to treat every path beneath it as unknown as well.
+				result.SkippedDirs[relPath] = struct{}{}
 				return filepath.SkipDir
 			}
 			return nil

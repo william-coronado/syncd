@@ -472,6 +472,39 @@ func TestScanTree_SkipsUnreadableSubdirectoryAndRecordsIssue(t *testing.T) {
 	assertIssueRecorded(t, result, "locked", "")
 }
 
+// TestScanTree_UnreadableSubdirectoryRecordsSkippedDir is a regression test
+// for Critical 2: an unreadable subdirectory's own relpath used to be the
+// ONLY thing recorded anywhere - its descendants (never visited, since
+// ReadDir failed) appeared in neither Files nor Skipped, so a reconciler
+// comparing this scan's result against a manifest that already knew about
+// "locked/hidden.txt" would read it as "locally deleted" and propagate a
+// delete. SkippedDirs must record "locked" so reconcile.SkipSet can treat
+// every path beneath it as unknown too, not just "locked" itself.
+func TestScanTree_UnreadableSubdirectoryRecordsSkippedDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	badDir := filepath.Join(root, "locked")
+	if err := os.Mkdir(badDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(badDir, "hidden.txt"), "hidden")
+	if err := os.Chmod(badDir, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badDir, 0o755) })
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for an unreadable subdirectory, want success: %v", err)
+	}
+	if _, ok := result.SkippedDirs["locked"]; !ok {
+		t.Errorf("expected %q recorded in SkippedDirs, got %+v", "locked", result.SkippedDirs)
+	}
+}
+
 // TestScanTree_RootWalkErrorAborts pins the other side of the abort/record
 // line: a failure on the root itself (not a per-entry problem somewhere
 // inside the tree) must still be a hard error, not a silently-empty
