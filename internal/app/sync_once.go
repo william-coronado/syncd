@@ -238,6 +238,12 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		Logger:     logger,
 		Policy:     fs.HashAlways,
 	})
+	// A hard failure (manifest LoadAll, ScanPair, or ApplyUpdates) is
+	// reported with this call site's own original per-stage wrapping,
+	// matching this function's pre-RunRobustOnce error text exactly.
+	if hard, ok := runErr.(*robustHardError); ok {
+		return fmt.Errorf("%s: %w", hard.stage, hard.err)
+	}
 	if runErr != nil {
 		return fmt.Errorf("sync run did not complete: %w", runErr)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"syncd/internal/db"
@@ -51,5 +52,48 @@ func TestRunRobustOnceOnlyPathsRestrictsScope(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(remote, "b.txt")); !os.IsNotExist(err) {
 		t.Error("b.txt was out of scope and must not sync")
+	}
+}
+
+// TestRun_HardScanFailureSkipsRunSummaryInSilentMode is a regression test
+// for a behavior-preservation bug introduced when RunRobustOnce was
+// extracted from Run: a hard, pre-execution failure (here, fs.ScanPair
+// erroring because the local root doesn't exist) must be reported
+// immediately, with NO run-summary log event - exactly like the original
+// (pre-extraction) Run, which returned such errors before ever reaching its
+// printRunSummary call. Driving it in --silent mode, where the run summary
+// (and everything else) is a structured JSON log line, makes this directly
+// observable: a spurious "sync run summary" event in the log file would
+// mean Run started treating a hard failure like a completed-with-errors
+// run, which it must not.
+func TestRun_HardScanFailureSkipsRunSummaryInSilentMode(t *testing.T) {
+	remoteRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(remoteRoot, ".synclock"), []byte("canary"), 0o644); err != nil {
+		t.Fatalf("write canary: %v", err)
+	}
+	stateDir := t.TempDir()
+	// Deliberately never created - fs.ScanPair's local-side walk will fail
+	// on this before any plan/execute/manifest work happens.
+	localRoot := filepath.Join(t.TempDir(), "does-not-exist")
+
+	cfg := runtime.Config{
+		LocalRoot:  localRoot,
+		RemoteRoot: remoteRoot,
+		Workers:    2,
+		StateDir:   stateDir,
+		Silent:     true,
+	}
+
+	err := Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("expected Run to return an error when the local root does not exist")
+	}
+
+	logBytes, readErr := os.ReadFile(filepath.Join(stateDir, "sync.log"))
+	if readErr != nil {
+		t.Fatalf("read sync.log: %v", readErr)
+	}
+	if strings.Contains(string(logBytes), "sync run summary") {
+		t.Fatalf("expected no run-summary event on a hard scan failure, got log:\n%s", logBytes)
 	}
 }

@@ -34,9 +34,35 @@ type RobustParams struct {
 	OnlyPaths             map[string]struct{} // nil => whole tree; non-nil => restrict scan+plan to these rel paths
 }
 
+// robustHardError marks an error from RunRobustOnce that happened before -
+// or in the course of committing - a run's results: Repo.LoadAll,
+// fs.ScanPair, or Repo.ApplyUpdates. It is distinct from the
+// execute.RunActions runErr (e.g. context cancellation), which RunRobustOnce
+// returns bare after the manifest commit has already been attempted.
+//
+// Callers use this distinction to reproduce the pre-RunRobustOnce
+// error-reporting shape of their own call site: a hard failure is reported
+// immediately (no run-summary logging), using that call site's own
+// (possibly stage-specific) wrapping of the plain underlying error; a runErr
+// or failures>0 result is reported only after a run summary is emitted,
+// wrapped as "sync run did not complete" / "sync completed with N failed
+// action(s)" respectively. See app.Run and sync_once.go's runRobustOnce for
+// the two call sites that branch on this.
+type robustHardError struct {
+	stage string // "load manifest", "scan", or "apply manifest updates"
+	err   error
+}
+
+func (e *robustHardError) Error() string { return e.err.Error() }
+func (e *robustHardError) Unwrap() error { return e.err }
+
 // RunRobustOnce performs one scan -> plan -> execute -> manifest-update
 // (plus empty-dir create/cleanup) cycle of the robust, hash-based three-way
 // engine and returns the executed plan and the number of failed actions.
+//
+// The returned error is either nil, a *robustHardError (LoadAll/ScanPair/
+// ApplyUpdates failed - see its doc comment), or the bare execute.RunActions
+// runErr (e.g. context cancellation) after a manifest commit was attempted.
 //
 // When p.OnlyPaths is non-nil, the local/remote/manifest file maps produced
 // by the scan are filtered down to just those relative paths before
@@ -46,12 +72,12 @@ type RobustParams struct {
 func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, error) {
 	manifest, err := p.Repo.LoadAll(ctx)
 	if err != nil {
-		return reconcile.Plan{}, 0, err
+		return reconcile.Plan{}, 0, &robustHardError{stage: "load manifest", err: err}
 	}
 
 	scans, err := fs.ScanPair(ctx, p.LocalRoot, p.RemoteRoot, manifest, p.Policy, scanProgressLogger(p.Logger))
 	if err != nil {
-		return reconcile.Plan{}, 0, err
+		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
 	}
 	for _, issue := range scans.Local.Issues {
 		p.Logger.Error("skipping local file", map[string]any{
@@ -130,7 +156,7 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 
 	if len(upserts) > 0 || len(deletes) > 0 {
 		if err := p.Repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
-			return plan, failures, fmt.Errorf("apply manifest updates: %w", err)
+			return plan, failures, &robustHardError{stage: "apply manifest updates", err: err}
 		}
 	}
 
@@ -210,6 +236,13 @@ func Run(ctx context.Context, cfg runtime.Config) error {
 		Logger:     logger,
 		Policy:     fs.HashIfChanged,
 	})
+
+	// A hard failure (manifest LoadAll, ScanPair, or ApplyUpdates) is
+	// reported immediately with its own bare error text, exactly as before
+	// RunRobustOnce existed - no run summary is printed for it.
+	if hard, ok := runErr.(*robustHardError); ok {
+		return hard.err
+	}
 
 	if err := printRunSummary(logger, cfg.Silent, plan.Actions, failures); err != nil {
 		return err
