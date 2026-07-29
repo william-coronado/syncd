@@ -29,7 +29,7 @@ type SyncOptions struct {
 	Mode              reconcile.FastMode
 	UseHash           bool
 	Assume            bool // --yes: skip interactive confirm
-	DryRun            bool // --dry-run: print the summary and exit without mutating anything or persisting job state
+	DryRun            bool // --dry-run: print the summary and exit without mutating anything or persisting job state. Still acquires the per-job lock (cli.runSyncJob) and opens/creates the state db (SyncOnce below) - deliberate, since this is a read of shared job state, not a mutation; see docs/follow-ups.md #3.
 	Workers           int
 	DBPath            string
 	Confirm           func(summary string) bool // nil => auto-yes; cli passes a pterm confirm
