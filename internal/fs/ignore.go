@@ -16,16 +16,21 @@ import (
 // atomic_copy.go) — "*.tmp" alone does not match these because ".tmp" isn't
 // terminal in that name, so it's a distinct pattern derived from the same
 // constant tempSiblingPath uses, to keep the two from silently diverging
-// again. "#recycle" and ".venv" are Synology recycle bins and Python
-// virtualenvs, neither of which should ever be synced. The remaining entries
-// are macOS junk files folded in from file_sync_util that should never be
-// synced either.
+// again. That pattern is anchored with a leading "." (".*" + tempFileInfix +
+// "*", not a bare "*" + tempFileInfix + "*"): tempSiblingPath always
+// generates a name starting with ".", so anchoring on it is free for every
+// real staging file, but without it the unanchored form also matched an
+// ordinary user file that merely contains ".tmp-" anywhere in its name (e.g.
+// "report.tmp-final.docx"), silently excluding it from sync. "#recycle" and
+// ".venv" are Synology recycle bins and Python virtualenvs, neither of which
+// should ever be synced. The remaining entries are macOS junk files folded
+// in from file_sync_util that should never be synced either.
 var defaultIgnorePatterns = []string{
-	".synclock",               // remote canary (protocol file) — keep name as-is
-	"*.tmp",                   // user/legacy .tmp files
-	"*" + tempFileInfix + "*", // atomic-write staging files (tempSiblingPath)
-	"#recycle",                // Synology recycle bin
-	".venv",                   // Python virtualenvs
+	".synclock",                // remote canary (protocol file) — keep name as-is
+	"*.tmp",                    // user/legacy .tmp files
+	".*" + tempFileInfix + "*", // atomic-write staging files (tempSiblingPath)
+	"#recycle",                 // Synology recycle bin
+	".venv",                    // Python virtualenvs
 	// macOS junk (folded in from file_sync_util):
 	".DS_Store",
 	"._*",
