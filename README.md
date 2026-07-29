@@ -255,8 +255,16 @@ written under:
 ```
 
 - `manifest.db` — `syncd watch`'s manifest
-- `jobs.db` — `syncd sync`'s own job state and `--hash` manifest, kept
-  separate from the watch daemon's `manifest.db`
+- `jobs.db` — `syncd sync`'s own job state for fast (mirror/update/two-way)
+  jobs, kept separate from the watch daemon's `manifest.db`
+- `hash-<id>.db` — one file per `--hash` job, where `<id>` is a sanitized
+  form of the job's name (or, for an ad-hoc `--left`/`--right --hash` run,
+  the same short hash used as its job name). Each `--hash` job gets its own
+  manifest db rather than sharing `jobs.db`, because its `file_manifest`
+  table is keyed by relative path only (no job column) — sharing one db
+  across jobs would let two jobs whose trees contain the same relative path
+  corrupt each other's three-way baseline. The fast path doesn't need this:
+  its `job_state` table is already namespaced per job.
 - `sync.lock`
 - `sync.log`
 
@@ -266,8 +274,9 @@ run's log lines are written.
 
 `syncd watch` accepts `--state-dir`, `--db-path`, `--log-path`, and
 `--lock-path` to override any of the above. **`syncd sync` has no such
-flags** — its `jobs.db` path is currently fixed at
-`~/.local/state/syncd/jobs.db` and is not user-overridable.
+flags** — its db paths under `~/.local/state/syncd/` (`jobs.db`, and each
+`--hash` job's own `hash-<id>.db`) are currently fixed and not
+user-overridable.
 
 `syncd` also maintains an exclusive lockfile so overlapping runs against the
 same state directory can't corrupt each other, and validates a remote canary

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/dustin/go-humanize"
@@ -63,9 +64,21 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	dbPath, err := defaultJobsDBPath()
-	if err != nil {
-		return err
+	// Fast-mode jobs all share one jobs.db: its job_state table is already
+	// namespaced per job via a (job, path) composite primary key, so
+	// concurrent/sequential jobs can't corrupt each other's state there.
+	// --hash jobs instead get their own per-job db computed inside the loop
+	// below (see hashJobDBPath) - file_manifest has no job/name column, only
+	// a path primary key, so sharing one db across --hash jobs would let two
+	// jobs whose trees contain the same relative path corrupt each other's
+	// three-way baseline.
+	var jobsDBPath string
+	if !syncUseHash {
+		var err error
+		jobsDBPath, err = defaultJobsDBPath()
+		if err != nil {
+			return err
+		}
 	}
 
 	ctx := cmd.Context()
@@ -85,6 +98,14 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 		var progress execute.ProgressSink
 		if !syncUseHash {
 			progress = newPtermProgressSink()
+		}
+
+		dbPath := jobsDBPath
+		if syncUseHash {
+			dbPath, err = hashJobDBPath(job.Name)
+			if err != nil {
+				return fmt.Errorf("job %q: resolve hash manifest db: %w", job.Name, err)
+			}
 		}
 
 		opts := app.SyncOptions{
@@ -170,10 +191,10 @@ func parseFastMode(mode string) (reconcile.FastMode, error) {
 	}
 }
 
-// defaultJobsDBPath is where fast-mode job state (and, for --hash runs, the
-// robust manifest) is persisted for ad-hoc/batch `syncd sync` jobs. It is
-// deliberately separate from the always-on daemon's manifest.db.
-func defaultJobsDBPath() (string, error) {
+// syncdStateDir returns (creating it if necessary) the shared syncd state
+// directory, ~/.local/state/syncd - the parent of jobs.db, watch's
+// manifest.db, and each --hash job's own hash-<id>.db.
+func syncdStateDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
@@ -182,7 +203,59 @@ func defaultJobsDBPath() (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create state dir: %w", err)
 	}
+	return dir, nil
+}
+
+// defaultJobsDBPath is where fast-mode (mirror/update/two-way) job state is
+// persisted for ad-hoc/batch `syncd sync` jobs. It is deliberately separate
+// from the always-on daemon's manifest.db, and is never used for --hash jobs
+// - those get their own per-job db from hashJobDBPath instead.
+func defaultJobsDBPath() (string, error) {
+	dir, err := syncdStateDir()
+	if err != nil {
+		return "", err
+	}
 	return filepath.Join(dir, "jobs.db"), nil
+}
+
+// hashJobDBPath returns the manifest db path for a single `--hash` sync job:
+// ~/.local/state/syncd/hash-<id>.db, where <id> is jobName run through
+// sanitizeJobDBName. jobName is either a named config job's Name or, for an
+// ad-hoc --left/--right --hash run, the adHocJobName(left, right) hash that
+// resolveSyncJobs already assigns as that job's Name - so this one path
+// derivation covers both cases uniformly.
+//
+// Each --hash job needs its own db because file_manifest (unlike job_state,
+// the fast path's table) has no job/name column, just a path primary key:
+// two --hash jobs sharing one db - as they did when every job reused
+// defaultJobsDBPath's jobs.db - would silently corrupt each other's
+// three-way baseline for any relative path their trees happen to share.
+func hashJobDBPath(jobName string) (string, error) {
+	dir, err := syncdStateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "hash-"+sanitizeJobDBName(jobName)+".db"), nil
+}
+
+// sanitizeJobDBName maps a job name - arbitrary user-supplied text from the
+// config file, or a "cli-<hex>" adHocJobName hash - to a safe filename
+// component: only ASCII letters, digits, '.', '_', and '-' survive; anything
+// else (including path separators) becomes '_'.
+func sanitizeJobDBName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "_"
+	}
+	return b.String()
 }
 
 // ptermConfirm is the interactive Confirm callback passed to app.SyncOnce:
