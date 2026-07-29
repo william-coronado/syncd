@@ -72,6 +72,24 @@ func init() {
 	rootCmd.AddCommand(watchCmd)
 }
 
+// validateWatchFlags rejects CLI-supplied watch flag values that would
+// otherwise reach lower layers unchecked: workers < 1, or a non-positive
+// --remote-poll/--deep-scan, which would panic time.NewTicker deep inside
+// watch.Run (that library also defends on its own - see loop.go - but the
+// CLI should give a clear error up front rather than let it fall through).
+func validateWatchFlags(workers int, remotePoll, deepScan time.Duration) error {
+	if workers < 1 {
+		return fmt.Errorf("--workers must be >= 1")
+	}
+	if remotePoll <= 0 {
+		return fmt.Errorf("--remote-poll must be > 0 (got %s)", remotePoll)
+	}
+	if deepScan <= 0 {
+		return fmt.Errorf("--deep-scan must be > 0 (got %s)", deepScan)
+	}
+	return nil
+}
+
 func runWatchCmd(cmd *cobra.Command, _ []string) error {
 	localAbs, err := filepath.Abs(watchLocal)
 	if err != nil {
@@ -81,8 +99,8 @@ func runWatchCmd(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve --remote: %w", err)
 	}
-	if watchWorkers < 1 {
-		return fmt.Errorf("--workers must be >= 1")
+	if err := validateWatchFlags(watchWorkers, watchRemotePoll, watchDeepScan); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
