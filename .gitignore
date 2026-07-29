@@ -1,0 +1,8 @@
+/dist/
+/syncd
+/drivesync
+*.db
+*.db-journal
+*.log
+*.log.old
+.DS_Store
