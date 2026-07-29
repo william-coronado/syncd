@@ -141,8 +141,23 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		return fmt.Errorf("scan: %w", err)
 	}
 
+	// Surface scan issues the same way the robust path does (RunRobustOnce):
+	// per-path detail at Info (log file only), one aggregated Warn summary
+	// per run - see logScanIssues' doc comment. The fast path has no
+	// standing logger of its own (SyncOptions carries no log path), so build
+	// a throwaway one scoped to this call, same pattern runRobustOnce below
+	// already uses for its own --hash bridge.
+	issueLogger, err := runtime.NewLogger(false, "")
+	if err != nil {
+		return fmt.Errorf("create logger: %w", err)
+	}
+	defer issueLogger.Close()
+	logScanIssues(issueLogger, "local", scans.Local.Issues)
+	logScanIssues(issueLogger, "remote", scans.Remote.Issues)
+
 	left := toJobFileStates(scans.Local.Files)
 	right := toJobFileStates(scans.Remote.Files)
+	skipped := mergeSkipSet(scans.Local, scans.Remote)
 
 	repo := db.NewJobStateRepo(sqlDB)
 	var prev map[string]db.JobFileState
@@ -153,7 +168,7 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		}
 	}
 
-	res := reconcile.FastCompare(opts.Mode, left, right, prev)
+	res := reconcile.FastCompare(opts.Mode, left, right, prev, skipped)
 
 	// --dry-run prints the same summary the interactive confirm would show
 	// and exits before anything is mutated - it must not require --yes (no
@@ -224,9 +239,10 @@ func scanRootOrEmpty(ctx context.Context, root string, manifest map[string]db.Ma
 	if _, err := os.Stat(root); err != nil {
 		if os.IsNotExist(err) {
 			return fs.ScanResult{
-				Files:   make(map[string]fs.FileEntry),
-				Skipped: make(map[string]struct{}),
-				Dirs:    make(map[string]struct{}),
+				Files:       make(map[string]fs.FileEntry),
+				Skipped:     make(map[string]struct{}),
+				SkippedDirs: make(map[string]struct{}),
+				Dirs:        make(map[string]struct{}),
 			}, nil
 		}
 		return fs.ScanResult{}, fmt.Errorf("stat %s: %w", root, err)
@@ -317,8 +333,12 @@ func appendSummaryGroup(b *strings.Builder, label string, paths []string) {
 // RunRobustOnce takes a *runtime.Logger, which SyncOptions has no
 // equivalent of; a non-silent logger (no log file) is constructed here,
 // which is fine for this ad-hoc case - non-silent Loggers route Printf to
-// stdout and drop structured Info/Error events, matching how app.Run itself
-// behaves outside --silent.
+// stdout, and Warn/Error always reach stderr regardless of --silent (Task 2)
+// and regardless of whether a log file is open at all; only Info-level
+// detail has nowhere to go when there's no log file, since Info is
+// deliberately never printed to stdout/stderr (see logScanIssues, which
+// relies on exactly that split: per-path detail at Info, one aggregated
+// summary at Warn).
 func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	repo := db.NewManifestRepo(sqlDB)
 
@@ -336,7 +356,7 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		if err != nil {
 			return fmt.Errorf("scan: %w", err)
 		}
-		skipped := copySkipped(scans.Local.Skipped, scans.Remote.Skipped)
+		skipped := mergeSkipSet(scans.Local, scans.Remote)
 		plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
 		execActions := make([]reconcile.Action, 0, len(plan.Actions))
 		for _, action := range plan.Actions {

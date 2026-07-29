@@ -134,6 +134,66 @@ func TestRunRobustOnce_EndToEndSyncLifecycle(t *testing.T) {
 	}
 }
 
+// TestRunRobustOnce_SkippedSubdirectoryDoesNotDeleteRemoteSubtree is a
+// regression test for Critical 2 on the robust (hash-based) path: a local
+// subdirectory becomes unreadable AFTER a prior successful sync (the
+// manifest already has hash rows for its descendants that match remote
+// exactly - the "healthy steady state, nothing changed" case called out in
+// the review evidence, which is the MORE likely trigger in practice since a
+// stale manifest instead takes the "preserving changed file" download
+// branch). Before this fix, BuildPlan's exact-match-only skipped set covered
+// only the directory's own relpath, so descendants read as "in manifest, not
+// in local, not changed on remote" -> ActionDeleteRemote, propagating a
+// delete that destroys real, unrelated remote files.
+func TestRunRobustOnce_SkippedSubdirectoryDoesNotDeleteRemoteSubtree(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
+
+	secretDir := filepath.Join(localRoot, "secret")
+	if err := os.MkdirAll(secretDir, 0o755); err != nil {
+		t.Fatalf("mkdir secret: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secretDir, "a.txt"), []byte("a-content"), 0o644); err != nil {
+		t.Fatalf("write secret/a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "keep.txt"), []byte("keep-content"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+
+	// Run 1: a normal sync establishes the manifest baseline and mirrors
+	// secret/a.txt and keep.txt to remote - the "healthy, already synced"
+	// steady state.
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 1 (establish baseline): %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "secret", "a.txt")); err != nil {
+		t.Fatalf("expected secret/a.txt mirrored to remote after run 1, stat err = %v", err)
+	}
+
+	// Now "secret" becomes unreadable locally (e.g. a permission change) -
+	// nothing has actually changed content-wise on either side.
+	if err := os.Chmod(secretDir, 0o000); err != nil {
+		t.Fatalf("chmod secret: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(secretDir, 0o755) })
+
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 2 (secret unreadable): %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(remoteRoot, "secret", "a.txt")); err != nil {
+		t.Errorf("expected remote secret/a.txt to survive an unreadable local subdirectory, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "keep.txt")); err != nil {
+		t.Errorf("expected unrelated keep.txt to be unaffected, stat err = %v", err)
+	}
+}
+
 func TestRunInit_BootstrapsDirsAndCanaryWithoutSyncing(t *testing.T) {
 	parent := t.TempDir()
 	// Local/remote roots deliberately don't exist yet - RunInit must create them.

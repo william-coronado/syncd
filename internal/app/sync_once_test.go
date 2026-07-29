@@ -79,6 +79,99 @@ func TestSyncOnceMirrorMissingSourceErrorsWithoutTouchingDest(t *testing.T) {
 	}
 }
 
+// TestSyncOnceMirror_SkippedSymlinkDoesNotDeleteRealCounterpart is a
+// regression test for Critical 1: left has a symlink at "link.txt" (skipped
+// during scan - syncd never follows symlinks), while right has a REAL
+// regular file at the same path. Before this fix, runFastOnce discarded
+// scans.Local.Skipped/scans.Remote.Skipped entirely, so FastCompare's mirror
+// mode saw "link.txt" as present nowhere in `left` and concluded it had been
+// deleted from the source, emitting (and, under --yes, executing) a DeleteR
+// that destroyed the real file on the right.
+func TestSyncOnceMirror_SkippedSymlinkDoesNotDeleteRealCounterpart(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "target.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write target.txt: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(left, "target.txt"), filepath.Join(left, "link.txt")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "link.txt"), []byte("precious real file"), 0o644); err != nil {
+		t.Fatalf("write right link.txt: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, Mode: reconcile.FastMirror,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err != nil {
+		t.Fatalf("SyncOnce: %v", err)
+	}
+
+	b, readErr := os.ReadFile(filepath.Join(right, "link.txt"))
+	if readErr != nil {
+		t.Fatalf("expected right's real link.txt to survive mirror, got stat/read error: %v", readErr)
+	}
+	if string(b) != "precious real file" {
+		t.Errorf("right's link.txt content = %q, want unchanged %q", b, "precious real file")
+	}
+}
+
+// TestSyncOnceMirror_SkippedSubdirectoryDoesNotDeleteRemoteSubtree is a
+// regression test for Critical 2: an unreadable local subdirectory
+// ("secret") means its descendants are never enumerated locally at all -
+// they appear in neither Files nor (before this fix) anywhere a reconciler
+// could see them as "known but unreadable" rather than "gone". Right already
+// has real files under "secret/" (the steady state after a prior successful
+// sync). Mirror must leave them alone, not mass-delete the subtree.
+func TestSyncOnceMirror_SkippedSubdirectoryDoesNotDeleteRemoteSubtree(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	left, right := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "keep.txt"), []byte("k"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	secretDir := filepath.Join(left, "secret")
+	if err := os.Mkdir(secretDir, 0o755); err != nil {
+		t.Fatalf("mkdir secret: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secretDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write secret/a.txt: %v", err)
+	}
+	if err := os.Chmod(secretDir, 0o000); err != nil {
+		t.Fatalf("chmod secret: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(secretDir, 0o755) })
+
+	if err := os.WriteFile(filepath.Join(right, "keep.txt"), []byte("k"), 0o644); err != nil {
+		t.Fatalf("write right keep.txt: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(right, "secret"), 0o755); err != nil {
+		t.Fatalf("mkdir right secret: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "secret", "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write right secret/a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "secret", "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write right secret/b.txt: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, Mode: reconcile.FastMirror,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err != nil {
+		t.Fatalf("SyncOnce: %v", err)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(right, "secret", "a.txt")); statErr != nil {
+		t.Errorf("expected right's secret/a.txt to survive mirror, stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(right, "secret", "b.txt")); statErr != nil {
+		t.Errorf("expected right's secret/b.txt to survive mirror, stat err = %v", statErr)
+	}
+}
+
 // TestSyncOnceHashFailedActionSurfacesAsError covers, for the --hash/robust
 // path, the same "a failed action must surface as a non-nil error" behavior
 // the old TestRun_FailedActionSurfacesAsError checked via the now-removed
