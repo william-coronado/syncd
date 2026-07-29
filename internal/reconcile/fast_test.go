@@ -98,6 +98,9 @@ func TestFastTwoWaySignatureCollisionFallsBackToCopyDelete(t *testing.T) {
 		"old1.txt": {Path: "old1.txt", Size: 5, Mtime: 100},
 		"old2.txt": {Path: "old2.txt", Size: 5, Mtime: 100},
 	}
+	wantState := map[string]db.JobFileState{
+		"new.txt": {Path: "new.txt", Size: 5, Mtime: 100},
+	}
 
 	for i := 0; i < 50; i++ {
 		res := FastCompare(FastTwoWay, left, right, prev, SkipSet{})
@@ -112,6 +115,51 @@ func TestFastTwoWaySignatureCollisionFallsBackToCopyDelete(t *testing.T) {
 		assertHasTask(t, res, FastTask{Type: CopyL2R, RelPath: "new.txt", Size: 5})
 		assertHasTask(t, res, FastTask{Type: DeleteR, RelPath: "old1.txt"})
 		assertHasTask(t, res, FastTask{Type: DeleteR, RelPath: "old2.txt"})
+		if !reflect.DeepEqual(res.NewState, wantState) {
+			t.Fatalf("run %d: NewState not deterministic/correct: got %+v, want %+v", i, res.NewState, wantState)
+		}
+	}
+}
+
+// TestFastTwoWaySignatureCollisionFallsBackToCopyDelete_RightMissingDirection
+// mirrors TestFastTwoWaySignatureCollisionFallsBackToCopyDelete on the other
+// side: two files vanished from RIGHT (not left) since prev, colliding on
+// signature. rightMissingSigs is keyed by signature alone exactly like
+// leftMissingSigs, so the same "a collision means no match" safety rule must
+// hold in this direction too - structurally identical to the left-missing
+// case but previously untested (docs/follow-ups.md #5).
+func TestFastTwoWaySignatureCollisionFallsBackToCopyDelete_RightMissingDirection(t *testing.T) {
+	prev := map[string]db.JobFileState{
+		"old1.txt": {Path: "old1.txt", Size: 5, Mtime: 100},
+		"old2.txt": {Path: "old2.txt", Size: 5, Mtime: 100},
+	}
+	left := map[string]db.JobFileState{
+		"old1.txt": {Path: "old1.txt", Size: 5, Mtime: 100},
+		"old2.txt": {Path: "old2.txt", Size: 5, Mtime: 100},
+	}
+	right := map[string]db.JobFileState{
+		"new.txt": {Path: "new.txt", Size: 5, Mtime: 100},
+	}
+	wantState := map[string]db.JobFileState{
+		"new.txt": {Path: "new.txt", Size: 5, Mtime: 100},
+	}
+
+	for i := 0; i < 50; i++ {
+		res := FastCompare(FastTwoWay, left, right, prev, SkipSet{})
+		for _, task := range res.Tasks {
+			if task.Type == MoveR || task.Type == MoveL {
+				t.Fatalf("run %d: expected no move for colliding signatures, got %+v in %+v", i, task, res.Tasks)
+			}
+		}
+		if len(res.Tasks) != 3 {
+			t.Fatalf("run %d: expected exactly 3 tasks (1 copy + 2 deletes), got %d: %+v", i, len(res.Tasks), res.Tasks)
+		}
+		assertHasTask(t, res, FastTask{Type: CopyR2L, RelPath: "new.txt", Size: 5})
+		assertHasTask(t, res, FastTask{Type: DeleteL, RelPath: "old1.txt"})
+		assertHasTask(t, res, FastTask{Type: DeleteL, RelPath: "old2.txt"})
+		if !reflect.DeepEqual(res.NewState, wantState) {
+			t.Fatalf("run %d: NewState not deterministic/correct: got %+v, want %+v", i, res.NewState, wantState)
+		}
 	}
 }
 
