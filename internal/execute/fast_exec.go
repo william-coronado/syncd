@@ -15,7 +15,14 @@ import (
 // by a pterm-backed sink in the cli layer and by a nop in tests. progress
 // may be nil, in which case no progress is reported.
 type ProgressSink interface {
-	AddBytes(n int64)
+	// Start is called once before any task runs, with the total number of
+	// tasks about to be processed. This gives the progress bar a real
+	// denominator instead of a placeholder.
+	Start(totalTasks int)
+	// Advance reports that one task completed, transferring bytes bytes
+	// (0 for deletes and moves). It is called once per task, so the bar
+	// ticks per file rather than by raw byte count.
+	Advance(bytes int64)
 	Done()
 }
 
@@ -24,6 +31,10 @@ type ProgressSink interface {
 func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []reconcile.FastTask, progress ProgressSink) error {
 	jobs := make(chan reconcile.FastTask)
 	errs := make(chan error, len(tasks))
+
+	if progress != nil {
+		progress.Start(len(tasks))
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -35,7 +46,11 @@ func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []
 					errs <- err
 					continue
 				}
-				errs <- applyFastTask(left, right, task, progress)
+				err := applyFastTask(left, right, task)
+				if err == nil && progress != nil {
+					progress.Advance(task.Size)
+				}
+				errs <- err
 			}
 		}()
 	}
@@ -77,28 +92,16 @@ func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []
 	return ctx.Err()
 }
 
-func applyFastTask(left, right string, task reconcile.FastTask, progress ProgressSink) error {
+func applyFastTask(left, right string, task reconcile.FastTask) error {
 	switch task.Type {
 	case reconcile.CopyL2R:
 		src := filepath.Join(left, filepath.FromSlash(task.RelPath))
 		dst := filepath.Join(right, filepath.FromSlash(task.RelPath))
-		if err := fs.AtomicCopyFile(src, dst); err != nil {
-			return err
-		}
-		if progress != nil {
-			progress.AddBytes(task.Size)
-		}
-		return nil
+		return fs.AtomicCopyFile(src, dst)
 	case reconcile.CopyR2L:
 		src := filepath.Join(right, filepath.FromSlash(task.RelPath))
 		dst := filepath.Join(left, filepath.FromSlash(task.RelPath))
-		if err := fs.AtomicCopyFile(src, dst); err != nil {
-			return err
-		}
-		if progress != nil {
-			progress.AddBytes(task.Size)
-		}
-		return nil
+		return fs.AtomicCopyFile(src, dst)
 	case reconcile.DeleteL:
 		return os.RemoveAll(filepath.Join(left, filepath.FromSlash(task.RelPath)))
 	case reconcile.DeleteR:

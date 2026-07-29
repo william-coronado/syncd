@@ -267,37 +267,54 @@ func ptermConfirm(summary string) bool {
 	return result
 }
 
-// ptermProgressSink is a pterm-backed execute.ProgressSink. AddBytes is
-// invoked from multiple RunFastTasks/RunActions worker goroutines
-// concurrently, so access to the underlying bar is guarded by mu.
+// ptermProgressSink is a pterm-backed execute.ProgressSink. Start/Advance are
+// invoked from multiple RunFastTasks worker goroutines concurrently, so access
+// to the underlying bar is guarded by mu. The bar is driven by TASK COUNT
+// (one tick per completed task, out of the total passed to Start), with the
+// cumulative bytes transferred shown in the title.
 type ptermProgressSink struct {
 	mu    sync.Mutex
 	bar   *pterm.ProgressbarPrinter
-	total int64
+	total int64 // cumulative bytes transferred
+	files int   // tasks completed so far
 }
 
-// newPtermProgressSink starts a pterm progress bar and returns it as an
-// execute.ProgressSink. It returns a true nil interface (not a typed nil)
-// if the bar fails to start (e.g. non-interactive output), so callers can
-// pass it straight through to app.SyncOnce's nil-safe Progress field.
+// newPtermProgressSink returns a sink whose bar is created lazily by Start,
+// once the real task count is known. Deferring creation means nothing
+// misleading (e.g. a "[000/100]" placeholder) is shown during the potentially
+// slow scan/confirm phase that precedes copying - the bar appears only when
+// tasks actually start running, already sized to the true total.
 func newPtermProgressSink() execute.ProgressSink {
-	bar, err := pterm.DefaultProgressbar.WithTitle("Syncing...").Start()
-	if err != nil {
-		return nil
-	}
-	return &ptermProgressSink{bar: bar}
+	return &ptermProgressSink{}
 }
 
-func (p *ptermProgressSink) AddBytes(n int64) {
+func (p *ptermProgressSink) Start(totalTasks int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	bar, err := pterm.DefaultProgressbar.WithTitle("Syncing...").WithTotal(totalTasks).Start()
+	if err != nil {
+		return // bar stays nil; Advance/Done become no-ops (e.g. non-interactive output)
+	}
+	p.bar = bar
+}
+
+func (p *ptermProgressSink) Advance(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.files++
 	p.total += n
-	p.bar.Add(int(n)) // Add grows bar.Total automatically if Current exceeds it
-	p.bar.UpdateTitle(fmt.Sprintf("Syncing... %s transferred", humanize.Bytes(uint64(p.total))))
+	if p.bar == nil {
+		return
+	}
+	p.bar.Add(1)
+	p.bar.UpdateTitle(fmt.Sprintf("Syncing... %d/%d files, %s transferred", p.files, p.bar.Total, humanize.Bytes(uint64(p.total))))
 }
 
 func (p *ptermProgressSink) Done() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.bar == nil {
+		return
+	}
 	_, _ = p.bar.Stop()
 }
