@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -306,7 +307,7 @@ func TestScanTree_RecomputesHashForSameSecondMtime_RacyMtimeGuard(t *testing.T) 
 	manifest := map[string]db.ManifestRow{
 		"file.txt": {
 			Path:  "file.txt",
-			Size:  info.Size(), // matches exactly
+			Size:  info.Size(),           // matches exactly
 			Mtime: info.ModTime().Unix(), // matches exactly, but is "now"
 			Hash:  "sentinel-hash-from-manifest",
 		},
@@ -324,5 +325,178 @@ func TestScanTree_RecomputesHashForSameSecondMtime_RacyMtimeGuard(t *testing.T) 
 	got := result.Files["file.txt"].Hash
 	if got != wantHash {
 		t.Fatalf("expected recomputed hash %q for same-second mtime, got %q (stale cache reused)", wantHash, got)
+	}
+}
+
+// --- Task 3a: one bad entry must not abort the whole scan ---
+
+func assertIssueRecorded(t *testing.T, result ScanResult, path, wantReason string) {
+	t.Helper()
+	if _, ok := result.Skipped[path]; !ok {
+		t.Errorf("expected %q to be recorded in Skipped, got %+v", path, result.Skipped)
+	}
+	for _, iss := range result.Issues {
+		if iss.Path == path {
+			if wantReason != "" && iss.Reason != wantReason {
+				t.Errorf("issue for %q reason = %q, want %q", path, iss.Reason, wantReason)
+			}
+			return
+		}
+	}
+	t.Errorf("expected an Issue recorded for %q, got %+v", path, result.Issues)
+}
+
+func TestScanTree_SkipsDirSymlinkAndRecordsIssue(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	targetDir := filepath.Join(root, "realdir")
+	if err := os.Mkdir(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(targetDir, "inside.txt"), "inside")
+	linkPath := filepath.Join(root, "dlink")
+	if err := os.Symlink(targetDir, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for a dir-symlink in the tree, want success: %v", err)
+	}
+	if _, ok := result.Files["good.txt"]; !ok {
+		t.Errorf("expected good.txt to be scanned, got %+v", result.Files)
+	}
+	if _, ok := result.Files["realdir/inside.txt"]; !ok {
+		t.Errorf("expected realdir/inside.txt to be scanned, got %+v", result.Files)
+	}
+	if _, ok := result.Files["dlink"]; ok {
+		t.Errorf("dir-symlink must not appear in Files, got %+v", result.Files)
+	}
+	assertIssueRecorded(t, result, "dlink", "symlink not supported")
+}
+
+func TestScanTree_SkipsBrokenSymlinkAndRecordsIssue(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	linkPath := filepath.Join(root, "blink")
+	if err := os.Symlink(filepath.Join(root, "does-not-exist"), linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for a broken symlink, want success: %v", err)
+	}
+	if _, ok := result.Files["good.txt"]; !ok {
+		t.Errorf("expected good.txt to be scanned, got %+v", result.Files)
+	}
+	if _, ok := result.Files["blink"]; ok {
+		t.Errorf("broken symlink must not appear in Files, got %+v", result.Files)
+	}
+	assertIssueRecorded(t, result, "blink", "symlink not supported")
+}
+
+func TestScanTree_SkipsUnreadableFileAndRecordsIssue(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission checks")
+	}
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	badPath := filepath.Join(root, "unreadable.txt")
+	writeFile(t, badPath, "secret")
+	if err := os.Chmod(badPath, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badPath, 0o644) })
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for an unreadable file, want success: %v", err)
+	}
+	if _, ok := result.Files["good.txt"]; !ok {
+		t.Errorf("expected good.txt to be scanned, got %+v", result.Files)
+	}
+	if _, ok := result.Files["unreadable.txt"]; ok {
+		t.Errorf("unreadable file must not appear in Files, got %+v", result.Files)
+	}
+	assertIssueRecorded(t, result, "unreadable.txt", "")
+}
+
+func TestScanTree_SkipsNonRegularFileAndRecordsIssue(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	fifoPath := filepath.Join(root, "fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for a FIFO in the tree, want success: %v", err)
+	}
+	if _, ok := result.Files["good.txt"]; !ok {
+		t.Errorf("expected good.txt to be scanned, got %+v", result.Files)
+	}
+	if _, ok := result.Files["fifo"]; ok {
+		t.Errorf("FIFO must not appear in Files, got %+v", result.Files)
+	}
+	assertIssueRecorded(t, result, "fifo", "")
+}
+
+func TestScanTree_SkipsUnreadableSubdirectoryAndRecordsIssue(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.txt"), "good")
+	badDir := filepath.Join(root, "locked")
+	if err := os.Mkdir(badDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(badDir, "hidden.txt"), "hidden")
+	if err := os.Chmod(badDir, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badDir, 0o755) })
+
+	result, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err != nil {
+		t.Fatalf("ScanTree returned error for an unreadable subdirectory, want success: %v", err)
+	}
+	if _, ok := result.Files["good.txt"]; !ok {
+		t.Errorf("expected good.txt to be scanned, got %+v", result.Files)
+	}
+	if _, ok := result.Files["locked/hidden.txt"]; ok {
+		t.Errorf("file inside an unreadable directory must not be scanned, got %+v", result.Files)
+	}
+	assertIssueRecorded(t, result, "locked", "")
+}
+
+// TestScanTree_RootWalkErrorAborts pins the other side of the abort/record
+// line: a failure on the root itself (not a per-entry problem somewhere
+// inside the tree) must still be a hard error, not a silently-empty
+// successful scan. Getting this backwards would hide a vanished SMB mount.
+func TestScanTree_RootWalkErrorAborts(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "does-not-exist")
+
+	_, err := ScanTree(context.Background(), root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err == nil {
+		t.Fatal("expected an error when the root itself cannot be walked, got nil")
+	}
+}
+
+// TestScanTree_ContextCancellationAborts pins the same line from the
+// cancellation side: ctx.Done() must still abort the whole scan with an
+// error, never be swallowed as a per-entry issue.
+func TestScanTree_ContextCancellationAborts(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "a")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ScanTree(ctx, root, nil, false, newTestMatcher(t, root), HashAlways, nil)
+	if err == nil {
+		t.Fatal("expected an error when the context is already cancelled, got nil")
 	}
 }

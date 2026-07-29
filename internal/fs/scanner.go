@@ -28,6 +28,12 @@ type FileEntry struct {
 	Hash    string
 }
 
+// ScanResult holds one tree scan's outcome. A per-entry problem — a symlink,
+// a non-regular file, an unreadable file or subdirectory, an SMB-forbidden
+// filename — never fails the scan as a whole: it's recorded in Issues and
+// Skipped, and the walk continues past it. Only a failure on the root itself
+// or ctx cancellation returns an error from ScanTree/ScanPaths (see their doc
+// comments).
 type ScanResult struct {
 	Files   map[string]FileEntry
 	Issues  []ScanIssue
@@ -126,6 +132,13 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 // from having hung) without spamming a line per file.
 const progressReportInterval = 3 * time.Second
 
+// ScanTree walks root and returns every file found, hashed per policy. A
+// problem with one entry — a symlink (never followed; see the ScanIssue
+// reason "symlink not supported"), a device/socket/FIFO, an unreadable file,
+// or an unreadable subdirectory — is recorded in the result's Issues and
+// Skipped and does not stop the walk: one bad file must never keep every
+// other file from syncing. Only a WalkDir error on root itself, or ctx
+// cancellation, aborts the whole scan and returns an error.
 func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy, progress ScanProgressFunc) (ScanResult, error) {
 	result := ScanResult{
 		Files:   make(map[string]FileEntry),
@@ -141,13 +154,31 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 	scanned := 0
 	lastReport := time.Now()
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+		if walkErr != nil {
+			// A failure on root itself (e.g. the root doesn't exist, or
+			// vanished mid-scan) is a whole-scan problem, not a per-entry
+			// one: it must abort, not be silently skipped, or a vanished SMB
+			// mount would look like an empty-but-successful scan.
+			if path == root {
+				return walkErr
+			}
+			relPath, relErr := NormalizeRelativePath(root, path)
+			if relErr != nil {
+				relPath = path
+			}
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: walkErr.Error()})
+			result.Skipped[relPath] = struct{}{}
+			if d != nil && d.IsDir() {
+				// Its contents couldn't be read (e.g. permission denied) -
+				// nothing more to walk under it.
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if path == root {
 			return nil
@@ -166,6 +197,24 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 		if matcher.Match(relPath, false) {
 			return nil
 		}
+		// Symlinks are never followed: syncd copies file contents, so
+		// following one would silently materialize a full copy at the
+		// destination (and could dereference outside the sync root), and a
+		// symlink recorded as a regular file would carry an lstat size that
+		// disagrees with its followed-content hash. d.Type() is already in
+		// hand from readdir, so this costs no extra stat.
+		if d.Type()&os.ModeSymlink != 0 {
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "symlink not supported"})
+			result.Skipped[relPath] = struct{}{}
+			return nil
+		}
+		// Devices, sockets, and FIFOs are skipped the same way - hashing a
+		// FIFO would block forever waiting for a writer.
+		if !d.Type().IsRegular() {
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "not a regular file"})
+			result.Skipped[relPath] = struct{}{}
+			return nil
+		}
 		if validateSMBName && hasSMBForbiddenChar(d.Name()) {
 			result.Issues = append(result.Issues, ScanIssue{
 				Path:   relPath,
@@ -177,7 +226,10 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 
 		info, err := d.Info()
 		if err != nil {
-			return fmt.Errorf("stat file %s: %w", path, err)
+			// Per-entry: e.g. the file vanished between readdir and stat.
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("stat file: %s", err)})
+			result.Skipped[relPath] = struct{}{}
+			return nil
 		}
 		size := info.Size()
 		mtime := info.ModTime().Unix()
@@ -187,18 +239,24 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 		case HashNever:
 			// leave hash empty; reconciler compares on size+mtime
 		case HashAlways:
-			hash, err = FileBLAKE3(path)
-			if err != nil {
-				return fmt.Errorf("hash file %s: %w", path, err)
+			h, hashErr := FileBLAKE3(path)
+			if hashErr != nil {
+				result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
+				result.Skipped[relPath] = struct{}{}
+				return nil
 			}
+			hash = h
 		default: // HashIfChanged
 			if row, ok := manifest[relPath]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
 				hash = row.Hash
 			} else {
-				hash, err = FileBLAKE3(path)
-				if err != nil {
-					return fmt.Errorf("hash file %s: %w", path, err)
+				h, hashErr := FileBLAKE3(path)
+				if hashErr != nil {
+					result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
+					result.Skipped[relPath] = struct{}{}
+					return nil
 				}
+				hash = h
 			}
 		}
 		result.Files[relPath] = FileEntry{
