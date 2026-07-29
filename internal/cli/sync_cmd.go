@@ -32,6 +32,7 @@ var (
 	syncCfgFile string
 	syncUseHash bool
 	syncAssume  bool
+	syncDryRun  bool
 )
 
 // syncCmd is the ad-hoc/fast path of the merged tool: `syncd sync`. It runs
@@ -58,6 +59,7 @@ func init() {
 	syncCmd.Flags().StringVar(&syncCfgFile, "config", "", "Config file (default $HOME/.syncd.yaml)")
 	syncCmd.Flags().BoolVar(&syncUseHash, "hash", false, "Use the robust hash-based engine instead of the fast size+mtime reconciler")
 	syncCmd.Flags().BoolVar(&syncAssume, "yes", false, "Skip the interactive confirmation prompt")
+	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Print the sync summary and exit without changing anything or persisting job state (does not require --yes)")
 
 	rootCmd.AddCommand(syncCmd)
 }
@@ -94,6 +96,7 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 	return runSyncJobs(ctx, jobs, syncRunOptions{
 		UseHash:    syncUseHash,
 		Assume:     syncAssume,
+		DryRun:     syncDryRun,
 		JobsDBPath: jobsDBPath,
 	})
 }
@@ -106,6 +109,7 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 type syncRunOptions struct {
 	UseHash bool
 	Assume  bool
+	DryRun  bool
 	// JobsDBPath is the shared jobs.db path for fast-mode jobs; ignored
 	// when UseHash is true, since each --hash job gets its own db from
 	// hashJobDBPath instead.
@@ -165,9 +169,10 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 	// execute.RunActions (the --hash/robust path) has no ProgressSink
 	// parameter, so a bar started here would never see AddBytes and would
 	// sit on screen forever without a Done() to stop it. Only build one for
-	// the fast path, which actually drives it.
+	// the fast path, which actually drives it - and never for --dry-run,
+	// which never executes anything for the bar to track.
 	var progress execute.ProgressSink
-	if !ropts.UseHash {
+	if !ropts.UseHash && !ropts.DryRun {
 		progress = newPtermProgressSink()
 	}
 
@@ -186,6 +191,7 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 		Mode:     mode,
 		UseHash:  ropts.UseHash,
 		Assume:   ropts.Assume,
+		DryRun:   ropts.DryRun,
 		Workers:  stdruntime.NumCPU(),
 		DBPath:   dbPath,
 		Confirm:  ptermConfirm,

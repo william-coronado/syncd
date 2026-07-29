@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"syncd/internal/db"
@@ -28,6 +29,7 @@ type SyncOptions struct {
 	Mode              reconcile.FastMode
 	UseHash           bool
 	Assume            bool // --yes: skip interactive confirm
+	DryRun            bool // --dry-run: print the summary and exit without mutating anything or persisting job state
 	Workers           int
 	DBPath            string
 	Confirm           func(summary string) bool // nil => auto-yes; cli passes a pterm confirm
@@ -127,6 +129,16 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 
 	res := reconcile.FastCompare(opts.Mode, left, right, prev)
 
+	// --dry-run prints the same summary the interactive confirm would show
+	// and exits before anything is mutated - it must not require --yes (no
+	// Confirm callback is ever invoked), and it must not execute the tasks
+	// or persist two-way's job state, or the next real run would compute
+	// its diff against a baseline that never actually happened.
+	if opts.DryRun {
+		fmt.Println(fastSummary(opts.Name, opts.Mode, res.Tasks))
+		return nil
+	}
+
 	if !opts.Assume {
 		if !confirmOrDefault(opts.Confirm)(fastSummary(opts.Name, opts.Mode, res.Tasks)) {
 			return ErrAborted
@@ -153,28 +165,60 @@ func toJobFileStates(files map[string]fs.FileEntry) map[string]db.JobFileState {
 	return out
 }
 
-// fastSummary builds the human-readable text shown to opts.Confirm before a
-// fast-mode run mutates anything.
+// summaryPathCap is the maximum number of paths listed per task/action type
+// in fastSummary/robustSummary before the rest are collapsed into a single
+// "... and N more" line - so a huge job's confirm prompt doesn't flood the
+// terminal.
+const summaryPathCap = 20
+
+// fastSummary builds the human-readable text shown to opts.Confirm (or
+// printed directly for --dry-run) before a fast-mode run mutates anything.
+// It lists the affected paths grouped by task type - not just counts - since
+// for a destructive mirror run this prompt is the only safety gate, and the
+// user needs to see WHICH files, not just how many. Destructive types
+// (DeleteL/DeleteR) are listed first, before the copies/moves.
 func fastSummary(name string, mode reconcile.FastMode, tasks []reconcile.FastTask) string {
 	if len(tasks) == 0 {
 		return fmt.Sprintf("sync %q (%s): no changes", name, mode)
 	}
-	counts := make(map[reconcile.FastTaskType]int)
+	byType := make(map[reconcile.FastTaskType][]string)
 	for _, t := range tasks {
-		counts[t.Type]++
+		byType[t.Type] = append(byType[t.Type], t.RelPath)
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "sync %q (%s): %d task(s)", name, mode, len(tasks))
 	for _, tt := range []reconcile.FastTaskType{
+		reconcile.DeleteL, reconcile.DeleteR, // destructive first
 		reconcile.CopyL2R, reconcile.CopyR2L,
-		reconcile.DeleteL, reconcile.DeleteR,
 		reconcile.MoveL, reconcile.MoveR,
 	} {
-		if n := counts[tt]; n > 0 {
-			fmt.Fprintf(&b, "\n  %s: %d", tt, n)
-		}
+		appendSummaryGroup(&b, string(tt), byType[tt])
 	}
 	return b.String()
+}
+
+// appendSummaryGroup writes one task/action-type section to b: a "Label: N"
+// header, then up to summaryPathCap of paths (sorted for deterministic
+// output), then a "... and N more" tail if there were more than that.
+// Writes nothing if paths is empty.
+func appendSummaryGroup(b *strings.Builder, label string, paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	sort.Strings(paths)
+	fmt.Fprintf(b, "\n  %s: %d", label, len(paths))
+	shown := paths
+	var more int
+	if len(paths) > summaryPathCap {
+		shown = paths[:summaryPathCap]
+		more = len(paths) - summaryPathCap
+	}
+	for _, p := range shown {
+		fmt.Fprintf(b, "\n    %s", p)
+	}
+	if more > 0 {
+		fmt.Fprintf(b, "\n    ... and %d more", more)
+	}
 }
 
 // runRobustOnce runs the robust, hash-based three-way engine for a single
@@ -201,7 +245,12 @@ func fastSummary(name string, mode reconcile.FastMode, tasks []reconcile.FastTas
 func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	repo := db.NewManifestRepo(sqlDB)
 
-	if !opts.Assume {
+	// A preview scan+plan is needed both to show the interactive confirm
+	// (!opts.Assume) and for --dry-run, which must print the same summary
+	// and exit before RunRobustOnce ever runs (no execution, no manifest
+	// persistence) - regardless of opts.Assume, since --dry-run must not
+	// require --yes either.
+	if opts.DryRun || !opts.Assume {
 		manifest, err := repo.LoadAll(ctx)
 		if err != nil {
 			return fmt.Errorf("load manifest: %w", err)
@@ -218,7 +267,13 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 				execActions = append(execActions, action)
 			}
 		}
-		if !confirmOrDefault(opts.Confirm)(robustSummary(opts.Name, execActions)) {
+
+		summary := robustSummary(opts.Name, execActions)
+		if opts.DryRun {
+			fmt.Println(summary)
+			return nil
+		}
+		if !confirmOrDefault(opts.Confirm)(summary) {
 			return ErrAborted
 		}
 	}
@@ -253,24 +308,24 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	return nil
 }
 
+// robustSummary is the --hash-path counterpart to fastSummary: see its doc
+// comment for the path-listing/cap/destructive-first rationale.
 func robustSummary(name string, actions []reconcile.Action) string {
 	if len(actions) == 0 {
 		return fmt.Sprintf("sync %q (hash): no changes", name)
 	}
-	counts := make(map[reconcile.ActionType]int)
+	byType := make(map[reconcile.ActionType][]string)
 	for _, a := range actions {
-		counts[a.Type]++
+		byType[a.Type] = append(byType[a.Type], a.Path)
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "sync %q (hash): %d action(s)", name, len(actions))
 	for _, at := range []reconcile.ActionType{
+		reconcile.ActionDeleteLocal, reconcile.ActionDeleteRemote, // destructive first
 		reconcile.ActionUpload, reconcile.ActionDownload,
-		reconcile.ActionDeleteLocal, reconcile.ActionDeleteRemote,
 		reconcile.ActionConflict,
 	} {
-		if n := counts[at]; n > 0 {
-			fmt.Fprintf(&b, "\n  %s: %d", at, n)
-		}
+		appendSummaryGroup(&b, string(at), byType[at])
 	}
 	return b.String()
 }

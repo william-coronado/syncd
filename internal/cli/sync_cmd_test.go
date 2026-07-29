@@ -138,6 +138,61 @@ func TestRunSyncJobs_HeldLockDoesNotAbortOtherJobs(t *testing.T) {
 	}
 }
 
+// TestRunSyncJobs_DryRunLeavesBothTreesByteForByteUntouched is the
+// CLI-level half of Task 5e's --dry-run requirement: driven the same way
+// runSyncCmd drives it (through runSyncJobs/syncRunOptions), a --dry-run
+// job must leave both the left and right trees completely untouched, even
+// with Assume: true (--dry-run must not require --yes, and conversely
+// --yes must not make a dry run mutate anything either).
+func TestRunSyncJobs_DryRunLeavesBothTreesByteForByteUntouched(t *testing.T) {
+	withTempHome(t)
+
+	left, right := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write left a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "stale.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatalf("write right stale.txt: %v", err)
+	}
+
+	job := SyncJob{Name: "dry-job", Left: left, Right: right, Mode: string(reconcile.FastMirror)}
+	jobsDBPath, err := defaultJobsDBPath()
+	if err != nil {
+		t.Fatalf("defaultJobsDBPath: %v", err)
+	}
+
+	err = runSyncJobs(context.Background(), []SyncJob{job}, syncRunOptions{
+		Assume:     true,
+		DryRun:     true,
+		JobsDBPath: jobsDBPath,
+	})
+	if err != nil {
+		t.Fatalf("runSyncJobs dry-run returned error: %v", err)
+	}
+
+	// Left tree: untouched (mirror only ever writes to the right).
+	leftContent, err := os.ReadFile(filepath.Join(left, "a.txt"))
+	if err != nil || string(leftContent) != "hi" {
+		t.Errorf("left a.txt changed: err=%v content=%q", err, leftContent)
+	}
+	if entries, _ := os.ReadDir(left); len(entries) != 1 {
+		t.Errorf("left tree gained/lost entries: %v", entries)
+	}
+
+	// Right tree: a real (non-dry) mirror would copy a.txt in and delete
+	// stale.txt. Neither must have happened.
+	if _, statErr := os.Stat(filepath.Join(right, "a.txt")); !os.IsNotExist(statErr) {
+		t.Error("dry-run copied a.txt to right - tree was mutated")
+	}
+	rightContent, err := os.ReadFile(filepath.Join(right, "stale.txt"))
+	if err != nil || string(rightContent) != "old" {
+		t.Errorf("dry-run deleted or modified stale.txt: err=%v content=%q", err, rightContent)
+	}
+	if entries, _ := os.ReadDir(right); len(entries) != 1 {
+		t.Errorf("right tree gained/lost entries: %v", entries)
+	}
+}
+
 func TestHashJobDBPath_DistinctPathsForDistinctJobs(t *testing.T) {
 	withTempHome(t)
 
