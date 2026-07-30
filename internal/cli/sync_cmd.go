@@ -59,7 +59,7 @@ func init() {
 	syncCmd.Flags().StringVar(&syncCfgFile, "config", "", "Config file (default $HOME/.syncd.yaml)")
 	syncCmd.Flags().BoolVar(&syncUseHash, "hash", false, "Use the robust hash-based engine instead of the fast size+mtime reconciler")
 	syncCmd.Flags().BoolVar(&syncAssume, "yes", false, "Skip the interactive confirmation prompt")
-	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Print the sync summary and exit without changing anything or persisting job state (does not require --yes). Still acquires the per-job lock and opens/creates the state database, since a dry run reads existing job state and that read should be serialized with real runs the same way a real run's read is.")
+	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Print the sync summary and exit without changing anything or persisting job state (does not require --yes). Still takes the per-job lock and opens the state database.")
 
 	rootCmd.AddCommand(syncCmd)
 }

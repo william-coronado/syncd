@@ -15,13 +15,13 @@ actually bite.
 
 ## Deliberate, revisit only if it bites
 
-### 1. Dry-run preview scans sequentially
+### 7. Dry-run preview scans sequentially
 
 `internal/app/sync_once.go` — the dry-run preview scans left and right in
 sequence rather than concurrently like `fs.ScanPair`. Intentional: the preview is
 not the hot path. Revisit only if previewing a large tree over SMB feels slow.
 
-### 2. Dry-run cannot distinguish "not created yet" from "mount vanished"
+### 8. Dry-run cannot distinguish "not created yet" from "mount vanished"
 
 `internal/app/sync_once.go` — the preview's "missing root → treat as empty"
 fallback can't tell a destination that was never created from an SMB mount that
@@ -29,7 +29,7 @@ disappeared. Preview-only and mutation-free, and real runs are unaffected
 (`ScanTree` still aborts on a missing root, which is how a vanished mount is
 detected). Would matter only if dry-run output were ever trusted for automation.
 
-### 3. Scan-issue logging is one `Warn` per side per cycle, forever
+### 9. Scan-issue logging is one `Warn` per side per cycle, forever
 
 `internal/app/sync_loop.go` — per-path detail goes to the log file at `Info`, and
 one aggregated `Warn` per side per cycle goes to stderr. For a tree with a
@@ -38,7 +38,7 @@ permanently unreadable path, that is one stderr line per side every
 but not silent. Full cross-cycle `(path, reason)` dedup was considered and not
 built.
 
-### 4. `ScanPaths` does not populate `SkippedDirs`
+### 10. `ScanPaths` does not populate `SkippedDirs`
 
 `internal/fs/scan_paths.go` — by design. `ScanPaths` only ever processes explicit
 paths from fsnotify events and never discovers descendants, so a file made
