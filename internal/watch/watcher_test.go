@@ -227,9 +227,17 @@ func TestHandleEvent_SymlinkToDirNotAddedToWatch(t *testing.T) {
 
 	watchedBefore := w.fsw.WatchList()
 
+	// fsnotify reports event paths rooted at the watcher's resolved root
+	// (NewWatcher resolves symlinks in root via filepath.EvalSymlinks), which
+	// may differ from the original root argument (e.g. on macOS, t.TempDir()
+	// lives under a symlinked /var/folders). Mirror that here so
+	// NormalizeRelativePath(w.root, ev.Name) computes "linked" the same way
+	// it would for a real event.
+	eventPath := filepath.Join(w.root, "linked")
+
 	pending := make(map[string]struct{})
 	w.handleEvent(fsnotify.Event{
-		Name: symlinkPath,
+		Name: eventPath,
 		Op:   fsnotify.Create,
 	}, pending)
 
