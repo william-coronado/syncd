@@ -131,7 +131,7 @@ func moveFastFile(root string, task reconcile.FastTask) error {
 	}
 
 	if err := renameFunc(src, dst); err != nil {
-		if err := fs.AtomicCopyFile(src, dst); err != nil {
+		if err := copyFunc(src, dst); err != nil {
 			return err
 		}
 		// os.Remove, not os.RemoveAll: FastCompare only queues a move for
@@ -151,3 +151,10 @@ func moveFastFile(root string, task reconcile.FastTask) error {
 // needing an actual cross-device filesystem setup. Same pattern as
 // conflict.go's timeNow and atomic_copy.go's tempSiblingPathFunc.
 var renameFunc = os.Rename
+
+// copyFunc is fs.AtomicCopyFile, indirected through a package-level variable
+// so tests can simulate the copy succeeding and then src being replaced by a
+// non-empty directory before the subsequent os.Remove(src) call - the TOCTOU
+// race that call guards against - without needing real concurrent
+// filesystem mutation.
+var copyFunc = fs.AtomicCopyFile
