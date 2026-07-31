@@ -46,10 +46,12 @@ type WatchLoopFunc func(ctx context.Context, p RobustParams, matcher *fs.IgnoreM
 // until ctx is cancelled.
 func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error {
 	paths, err := runtime.ResolvePaths(runtime.Config{
-		StateDir: cfg.StateDir,
-		DBPath:   cfg.DBPath,
-		LogPath:  cfg.LogPath,
-		LockPath: cfg.LockPath,
+		LocalRoot:  cfg.LocalRoot,
+		RemoteRoot: cfg.RemoteRoot,
+		StateDir:   cfg.StateDir,
+		DBPath:     cfg.DBPath,
+		LogPath:    cfg.LogPath,
+		LockPath:   cfg.LockPath,
 	})
 	if err != nil {
 		return err

@@ -148,7 +148,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 		case <-deepTicker.C:
 			guardedCycle(func() error {
 				deepParams := p
-				deepParams.Policy = fs.HashIfChanged
+				deepParams.Policy = fs.HashAlways
 				_, _, err := app.RunRobustOnce(ctx, deepParams)
 				return err
 			})

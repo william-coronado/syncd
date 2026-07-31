@@ -140,6 +140,87 @@ func TestRunClampsNonPositiveDurationsToDefaults_AssertsCadence(t *testing.T) {
 	}
 }
 
+// TestDeepScanCatchesSameSizeSameMtimeContentChange is a regression test for
+// review finding "High 5": the deep-scan ticker branch must use
+// fs.HashAlways (per RobustParams.Policy's own doc comment: "HashAlways for
+// deep verify"), not fs.HashIfChanged - otherwise a deep scan is byte-for-
+// byte identical to a remote poll and never catches a same-size, same-mtime
+// content change (the classic case HashIfChanged is documented to skip via
+// its cached-hash reuse in fs.ScanTree). RemotePoll is set to an hour so only
+// the deep-scan ticker can possibly be responsible for propagating the
+// change within the test's deadline.
+func TestDeepScanCatchesSameSizeSameMtimeContentChange(t *testing.T) {
+	local, remote := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(remote, ".synclock"), []byte("x"), 0o644)
+
+	const relPath = "a.txt"
+	localPath := filepath.Join(local, relPath)
+	remotePath := filepath.Join(remote, relPath)
+
+	if err := os.WriteFile(localPath, []byte("hello1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte("hello1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Force a stable, already-in-the-past mtime on both sides so ScanTree's
+	// racy-mtime guard (mtime < scanStart) never disqualifies the cached-hash
+	// reuse path - that path is exactly what this test needs HashAlways to
+	// bypass.
+	pastMtime := time.Now().Add(-1 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(localPath, pastMtime, pastMtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(remotePath, pastMtime, pastMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	hash1, err := fs.FileBLAKE3(localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dbh, _ := db.Open(filepath.Join(t.TempDir(), "m.db"))
+	defer dbh.Close()
+	repo := db.NewManifestRepo(dbh)
+	if err := repo.ApplyUpdates(context.Background(), []db.ManifestRow{
+		{Path: relPath, Size: 6, Mtime: pastMtime.Unix(), Hash: hash1, LastSynced: time.Now().Unix()},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now change the local file's CONTENT only - same size (6 bytes), same
+	// mtime as the manifest baseline. HashIfChanged would reuse the cached
+	// (now-stale) manifest hash and see no change at all.
+	if err := os.WriteFile(localPath, []byte("hello2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(localPath, pastMtime, pastMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	logger, _ := runtime.NewLogger(true, filepath.Join(t.TempDir(), "l.log"))
+	defer logger.Close()
+	m, _ := fs.LoadIgnoreMatcher(local)
+	p := app.RobustParams{LocalRoot: local, RemoteRoot: remote, Workers: 1, Repo: repo, DB: dbh, Logger: logger}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, p, m, LoopConfig{RemotePoll: time.Hour, DeepScan: 100 * time.Millisecond, Debounce: 50 * time.Millisecond})
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if b, _ := os.ReadFile(remotePath); string(b) == "hello2" {
+			return // success: the deep scan caught the same-size/same-mtime content change
+		}
+		select {
+		case <-deadline:
+			t.Fatal("deep scan did not propagate a same-size/same-mtime content change - it must use fs.HashAlways, not fs.HashIfChanged")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // TestRunLogsWatcherAddErrorsOnce checks that Run surfaces NewWatcher's
 // best-effort AddErrors (Task 5d): the Watcher itself has no logger (kept
 // as a known follow-up per CLAUDE.md), so Run - which does have p.Logger -

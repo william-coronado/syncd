@@ -13,6 +13,13 @@ import (
 	"syncd/internal/reconcile"
 )
 
+// timeNow is time.Now, indirected through a package-level variable so tests
+// can force two conflict resolutions onto the exact same timestamp -
+// deterministically reproducing conflictPath's 1-second collision window
+// without relying on both calls landing in the same wall-clock second by
+// chance. Same pattern as watch/loop.go's newTicker.
+var timeNow = time.Now
+
 func runConflict(state SyncState, action reconcile.Action) Result {
 	local, localOK := state.LocalFiles[action.Path]
 	remote, remoteOK := state.RemoteFiles[action.Path]
@@ -23,7 +30,7 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 	localCanonicalPath := filepath.Join(state.LocalRoot, filepath.FromSlash(action.Path))
 	remoteCanonicalPath := filepath.Join(state.RemoteRoot, filepath.FromSlash(action.Path))
 
-	conflictRel := conflictPath(action.Path, time.Now().UTC())
+	conflictRel := findAvailableConflictPath(state.LocalRoot, state.RemoteRoot, action.Path, timeNow().UTC())
 	localConflictPath := filepath.Join(state.LocalRoot, filepath.FromSlash(conflictRel))
 	remoteConflictPath := filepath.Join(state.RemoteRoot, filepath.FromSlash(conflictRel))
 
@@ -71,12 +78,48 @@ func renameFile(src, dst string) error {
 	return os.Rename(src, dst)
 }
 
+// findAvailableConflictPath returns conflictPath(relPath, ts), or - if that
+// name is already occupied on either side - a disambiguated variant that
+// exists on neither, by trying successive attempt numbers. conflictPath's
+// timestamp has only 1-second resolution, and renameFile is a bare
+// os.Rename, which silently REPLACES an existing destination on Unix - so
+// without this, two conflicts on the same relPath within the same
+// wall-clock second would have the second one clobber the first call's
+// already-renamed-aside conflict copy (review finding "Medium 6"). A single
+// process handles one RunActions batch (one action per path) at a time and
+// watch/loop.go serializes cycles through a mutex, so the check-then-rename
+// here has no concurrent-writer race to guard against in practice.
+func findAvailableConflictPath(localRoot, remoteRoot, relPath string, ts time.Time) string {
+	for attempt := 0; ; attempt++ {
+		candidate := conflictPathAttempt(relPath, ts, attempt)
+		localP := filepath.Join(localRoot, filepath.FromSlash(candidate))
+		remoteP := filepath.Join(remoteRoot, filepath.FromSlash(candidate))
+		if !pathExists(localP) && !pathExists(remoteP) {
+			return candidate
+		}
+	}
+}
+
+func pathExists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
 func conflictPath(relPath string, ts time.Time) string {
+	return conflictPathAttempt(relPath, ts, 0)
+}
+
+// conflictPathAttempt is conflictPath, plus a disambiguating "-N" appended
+// to the suffix when attempt > 0 (see findAvailableConflictPath).
+func conflictPathAttempt(relPath string, ts time.Time, attempt int) string {
 	dir := filepath.Dir(relPath)
 	base := filepath.Base(relPath)
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
 	suffix := "_conflict_" + ts.Format("20060102_150405")
+	if attempt > 0 {
+		suffix += fmt.Sprintf("-%d", attempt+1)
+	}
 	newName := name + suffix + ext
 	newName = trimComponentBytes(newName, 255, suffix, ext)
 	if dir == "." {

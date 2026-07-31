@@ -77,5 +77,13 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate job_state schema: %w", err)
 	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS dir_manifest (
+			path TEXT PRIMARY KEY
+		);
+	`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate dir_manifest schema: %w", err)
+	}
 	return db, nil
 }

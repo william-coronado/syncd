@@ -60,7 +60,11 @@ func TestRunSyncJob_HeldLockReturnsClearErrorNamingTheJob(t *testing.T) {
 	}
 	job := SyncJob{Name: "locked-job", Left: left, Right: right, Mode: string(reconcile.FastMirror)}
 
-	lockPath, err := syncLockPath(job.Name)
+	key, err := jobStateKey(job.Name, job.Left, job.Right)
+	if err != nil {
+		t.Fatalf("jobStateKey: %v", err)
+	}
+	lockPath, err := syncLockPath(key)
 	if err != nil {
 		t.Fatalf("syncLockPath: %v", err)
 	}
@@ -108,7 +112,11 @@ func TestRunSyncJobs_HeldLockDoesNotAbortOtherJobs(t *testing.T) {
 	lockedJob := SyncJob{Name: "locked-job", Left: leftA, Right: rightA, Mode: string(reconcile.FastMirror)}
 	freeJob := SyncJob{Name: "free-job", Left: leftB, Right: rightB, Mode: string(reconcile.FastMirror)}
 
-	lockPath, err := syncLockPath(lockedJob.Name)
+	lockedKey, err := jobStateKey(lockedJob.Name, lockedJob.Left, lockedJob.Right)
+	if err != nil {
+		t.Fatalf("jobStateKey: %v", err)
+	}
+	lockPath, err := syncLockPath(lockedKey)
 	if err != nil {
 		t.Fatalf("syncLockPath: %v", err)
 	}
@@ -247,8 +255,30 @@ func TestHashJobDBPath_SanitizesUnsafeCharacters(t *testing.T) {
 	if strings.ContainsAny(base, "/ :*") {
 		t.Errorf("expected unsafe characters stripped from db filename, got %q", base)
 	}
-	if base != "hash-weird_name_with_spaces_and_stuff.db" {
+	if base != "hash-weird%2Fname%20with%20spaces%3Aand%2Astuff.db" {
 		t.Errorf("unexpected sanitized filename: %q", base)
+	}
+}
+
+// TestSanitizeJobDBName_DistinctNamesNeverCollide is a regression test for a
+// review finding (GLM-5.2): the previous sanitizer mapped every unsafe
+// character to a shared literal '_', so "a/b" and "a_b" - two distinct job
+// names - both sanitized to "a_b" and ended up sharing one hash-<id>.db and
+// one sync-<id>.lock, silently cross-contaminating their baselines.
+// Percent-encoding (this fix) is injective: distinct inputs must never
+// collide on the same sanitized output.
+func TestSanitizeJobDBName_DistinctNamesNeverCollide(t *testing.T) {
+	pairs := [][2]string{
+		{"a/b", "a_b"},
+		{"a b", "a_b"},
+		{"a%2Fb", "a/b"}, // a literal '%' in the input must itself be escaped
+	}
+	for _, pair := range pairs {
+		got1 := sanitizeJobDBName(pair[0])
+		got2 := sanitizeJobDBName(pair[1])
+		if got1 == got2 {
+			t.Errorf("sanitizeJobDBName(%q) and sanitizeJobDBName(%q) collided on %q", pair[0], pair[1], got1)
+		}
 	}
 }
 
@@ -355,5 +385,72 @@ func TestHashSync_TwoJobsSharingARelPathDoNotCorruptEachOther(t *testing.T) {
 	}
 	if _, err := os.Stat(dbB); err != nil {
 		t.Errorf("expected job-b manifest db to exist at %s: %v", dbB, err)
+	}
+}
+
+// TestJobStateKey_DistinctForSameNameDifferentRoots is a regression test for
+// review finding P1 #1 (Codex): hashJobDBPath/syncLockPath, and job_state's
+// "job" column, used to be keyed on the bare display Name alone. Two config
+// jobs that happen to share a Name - or one job later repointed at a
+// different root pair - would then silently reuse each other's persisted
+// state (a --hash job's three-way manifest, or a fast two-way job's
+// job_state rows in the shared jobs.db), which can misclassify a brand-new
+// remote-only file as "unchanged, deleted locally" and delete it.
+// jobStateKey closes this by folding a hash of the canonicalized (Left,
+// Right) pair into the identity, so same-Name jobs with different roots -
+// or the same job repointed at a new pair - get separate state instead.
+func TestJobStateKey_DistinctForSameNameDifferentRoots(t *testing.T) {
+	leftA, rightA := t.TempDir(), t.TempDir()
+	leftB, rightB := t.TempDir(), t.TempDir()
+
+	keyA, err := jobStateKey("shared-name", leftA, rightA)
+	if err != nil {
+		t.Fatalf("jobStateKey A: %v", err)
+	}
+	keyB, err := jobStateKey("shared-name", leftB, rightB)
+	if err != nil {
+		t.Fatalf("jobStateKey B: %v", err)
+	}
+	if keyA == keyB {
+		t.Fatalf("expected distinct state keys for the same Name with different root pairs, both got %q", keyA)
+	}
+}
+
+// TestJobStateKey_StableForSameInputs checks the key is deterministic across
+// calls - callers (runSyncJob) recompute it, they don't persist it, so it
+// must be stable given the same (name, left, right) every time.
+func TestJobStateKey_StableForSameInputs(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+
+	first, err := jobStateKey("stable-job", left, right)
+	if err != nil {
+		t.Fatalf("jobStateKey: %v", err)
+	}
+	second, err := jobStateKey("stable-job", left, right)
+	if err != nil {
+		t.Fatalf("jobStateKey: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected jobStateKey to be deterministic, got %q then %q", first, second)
+	}
+}
+
+// TestJobStateKey_DistinctForDifferentNamesSameRoots ensures the Name
+// component still participates in the key: two differently-named jobs
+// pointed at the same root pair (an unusual but legal config) must not
+// collide either.
+func TestJobStateKey_DistinctForDifferentNamesSameRoots(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+
+	keyA, err := jobStateKey("job-a", left, right)
+	if err != nil {
+		t.Fatalf("jobStateKey A: %v", err)
+	}
+	keyB, err := jobStateKey("job-b", left, right)
+	if err != nil {
+		t.Fatalf("jobStateKey B: %v", err)
+	}
+	if keyA == keyB {
+		t.Fatalf("expected distinct state keys for different Names on the same root pair, both got %q", keyA)
 	}
 }

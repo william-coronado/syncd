@@ -80,6 +80,13 @@ func TestOpen_DegradesWhenWALUnavailable(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("seed create job_state: %v", err)
 	}
+	if _, err := seed.Exec(`
+		CREATE TABLE IF NOT EXISTS dir_manifest (
+			path TEXT PRIMARY KEY
+		);
+	`); err != nil {
+		t.Fatalf("seed create dir_manifest: %v", err)
+	}
 	if err := seed.Close(); err != nil {
 		t.Fatalf("seed Close: %v", err)
 	}

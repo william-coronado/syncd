@@ -51,6 +51,98 @@ func TestSyncOnceTwoWayPersistsState(t *testing.T) {
 	}
 }
 
+// TestSyncOnceTwoWay_SameNameDifferentStateKeyDoNotShareJobState is a
+// regression test for review finding P1 #1 (Codex): two-way's job_state
+// lives in one shared jobs.db keyed by the "job" column, which used to be
+// the bare Name. Two jobs that share a Name - e.g. two config entries, or
+// the same job later repointed at a different root pair - would silently
+// read and overwrite each other's job_state rows. cli.runSyncJob now always
+// sets StateKey from a hash of the canonicalized root pair; this proves
+// SyncOnce actually prefers StateKey over Name for job_state, not just that
+// cli computes one.
+func TestSyncOnceTwoWay_SameNameDifferentStateKeyDoNotShareJobState(t *testing.T) {
+	dbp := filepath.Join(t.TempDir(), "jobs.db")
+
+	leftA, rightA := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(leftA, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	optsA := SyncOptions{Name: "shared", StateKey: "shared-A", Left: leftA, Right: rightA, Mode: reconcile.FastTwoWay, Assume: true, Workers: 1, DBPath: dbp}
+	if err := SyncOnce(context.Background(), optsA); err != nil {
+		t.Fatalf("initial sync A: %v", err)
+	}
+
+	leftB, rightB := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(leftB, "b.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+	optsB := SyncOptions{Name: "shared", StateKey: "shared-B", Left: leftB, Right: rightB, Mode: reconcile.FastTwoWay, Assume: true, Workers: 1, DBPath: dbp}
+	if err := SyncOnce(context.Background(), optsB); err != nil {
+		t.Fatalf("initial sync B: %v", err)
+	}
+
+	// Delete a.txt on job A's left; a second run of job A must propagate the
+	// delete using ITS OWN persisted state, proving job B's Replace (same
+	// dbp, same Name) never touched job A's rows.
+	if err := os.Remove(filepath.Join(leftA, "a.txt")); err != nil {
+		t.Fatalf("remove a.txt: %v", err)
+	}
+	if err := SyncOnce(context.Background(), optsA); err != nil {
+		t.Fatalf("second sync A: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rightA, "a.txt")); !os.IsNotExist(err) {
+		t.Error("job A's delete not propagated using its own state - job_state may be shared with job B")
+	}
+
+	// Job B's tree must be completely unaffected by job A's second run.
+	if b, err := os.ReadFile(filepath.Join(rightB, "b.txt")); err != nil || string(b) != "hi" {
+		t.Errorf("job B's state or tree was corrupted by job A's run: err=%v content=%q", err, b)
+	}
+}
+
+// TestSyncOnceTwoWay_LostLeftRootWithPriorStateErrorsWithoutWipingRight is a
+// regression test for a review finding (GLM-5.2): two-way's validateRoots
+// exempts it from any "left must exist" check, reasoning that "a missing
+// side with no prior persisted state produces copies, not deletes" - but
+// that reasoning silently breaks once job_state DOES have prior rows for
+// this job. If left is lost entirely (wrong mount point, accidental
+// deletion, replaced disk - not just one file removed from within it, which
+// is the legitimate case TestSyncOnceTwoWayPersistsState covers above),
+// createRoots happily recreates it EMPTY, and FastCompare's
+// lDeleted && !rDeleted branch reads every previously-tracked path as
+// "deleted locally" and emits DeleteR for all of them - wiping right under
+// --yes. Once prior state exists, a vanished left must error, exactly like
+// mirror/update's existing source-must-exist guard, not silently wipe right.
+func TestSyncOnceTwoWay_LostLeftRootWithPriorStateErrorsWithoutWipingRight(t *testing.T) {
+	left := t.TempDir()
+	right := t.TempDir()
+	dbp := filepath.Join(t.TempDir(), "m.db")
+
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	opts := SyncOptions{Name: "j", Left: left, Right: right, Mode: reconcile.FastTwoWay, Assume: true, Workers: 1, DBPath: dbp}
+	if err := SyncOnce(context.Background(), opts); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(right, "a.txt")); err != nil {
+		t.Fatalf("expected a.txt on right after initial sync: %v", err)
+	}
+
+	// The entire left root vanishes (not just a file within it).
+	if err := os.RemoveAll(left); err != nil {
+		t.Fatalf("remove left root: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected SyncOnce to error when left has vanished but prior job_state exists, got nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(right, "a.txt")); statErr != nil {
+		t.Fatalf("right's a.txt must survive - it must not be wiped just because left vanished: stat err = %v", statErr)
+	}
+}
+
 // TestSyncOnceMirrorMissingSourceErrorsWithoutTouchingDest guards against a
 // data-loss footgun: if a mirror's --left (source) is mistyped or missing,
 // SyncOnce must refuse rather than silently treating a fabricated empty
@@ -76,6 +168,137 @@ func TestSyncOnceMirrorMissingSourceErrorsWithoutTouchingDest(t *testing.T) {
 	}
 	if _, statErr := os.Stat(missingLeft); !os.IsNotExist(statErr) {
 		t.Fatalf("expected source path to remain nonexistent (must not be auto-created), stat err = %v", statErr)
+	}
+}
+
+// TestSyncOnceMirrorNonDirectorySourceErrorsWithoutTouchingDest is a
+// regression test for review finding "Critical 1": validateRoots only
+// checked existence via os.Stat, not that the source is actually a
+// directory. filepath.WalkDir Lstats the root itself, so when --left points
+// at a regular file, ScanTree's callback fires exactly once with path==root
+// and returns immediately (the `if path == root { return nil }` special
+// case) - producing a silently EMPTY scan result instead of an error. Under
+// mirror mode that empty "source" makes every file already on the
+// destination look deleted-from-source, wiping the destination under --yes.
+func TestSyncOnceMirrorNonDirectorySourceErrorsWithoutTouchingDest(t *testing.T) {
+	right := t.TempDir()
+	if err := os.WriteFile(filepath.Join(right, "keep.txt"), []byte("precious"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	notADir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("i am a file, not a directory"), 0o644); err != nil {
+		t.Fatalf("write notADir: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: notADir, Right: right, Mode: reconcile.FastMirror,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err == nil {
+		t.Fatal("expected SyncOnce to error when the mirror source is not a directory, got nil")
+	}
+
+	if b, readErr := os.ReadFile(filepath.Join(right, "keep.txt")); readErr != nil || string(b) != "precious" {
+		t.Fatalf("destination file was touched: read err=%v content=%q", readErr, b)
+	}
+}
+
+// TestSyncOnceMirrorSymlinkSourceErrorsWithoutTouchingDest is the symlink
+// half of the same "Critical 1" finding: when --left is a symlink POINTING
+// AT a real directory full of files, os.Stat(opts.Left) (which follows
+// symlinks) sees a real directory and validateRoots is satisfied. But
+// filepath.WalkDir uses os.Lstat on the root itself, so the walk sees a
+// symlink there (not a directory) and its callback fires exactly once at
+// path==root, hitting ScanTree's `if path == root { return nil }` special
+// case before ever recording an Issue or descending into the target's
+// contents - a silent empty scan, not an error. Unlike the plain-regular-
+// file case, LoadIgnoreMatcher does not accidentally catch this: appending
+// ".syncdignore" to a symlink-to-a-real-directory resolves fine (ENOENT if
+// absent), so this path must be rejected by validateRoots itself.
+func TestSyncOnceMirrorSymlinkSourceErrorsWithoutTouchingDest(t *testing.T) {
+	right := t.TempDir()
+	if err := os.WriteFile(filepath.Join(right, "keep.txt"), []byte("precious"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	realSourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(realSourceDir, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	symlinkSource := filepath.Join(t.TempDir(), "source-link")
+	if err := os.Symlink(realSourceDir, symlinkSource); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: symlinkSource, Right: right, Mode: reconcile.FastMirror,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err == nil {
+		t.Fatal("expected SyncOnce to error when the mirror source is a symlink, got nil")
+	}
+
+	if b, readErr := os.ReadFile(filepath.Join(right, "keep.txt")); readErr != nil || string(b) != "precious" {
+		t.Fatalf("destination file was touched: read err=%v content=%q", readErr, b)
+	}
+}
+
+// TestSyncOnceMirrorNestedDestinationErrorsWithoutTouchingDest is a
+// regression test for review finding "Critical 2": nothing rejected a
+// destination nested inside the source (e.g. --left /data --right
+// /data/backup). Scanning left=/data keys nested files as "backup/foo" while
+// scanning right=/data/backup keys the SAME files as "foo" - those relative
+// paths never align, so mirror sees right's "foo" as extraneous (absent from
+// left's key space) and deletes it, destroying the very files nested inside
+// the source it was supposed to preserve.
+func TestSyncOnceMirrorNestedDestinationErrorsWithoutTouchingDest(t *testing.T) {
+	left := t.TempDir()
+	right := filepath.Join(left, "backup")
+	if err := os.MkdirAll(right, 0o755); err != nil {
+		t.Fatalf("mkdir right: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "keep.txt"), []byte("precious"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, Mode: reconcile.FastMirror,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err == nil {
+		t.Fatal("expected SyncOnce to error when the destination is nested inside the source, got nil")
+	}
+	if b, readErr := os.ReadFile(filepath.Join(right, "keep.txt")); readErr != nil || string(b) != "precious" {
+		t.Fatalf("nested destination file was touched: read err=%v content=%q", readErr, b)
+	}
+}
+
+// TestSyncOnceTwoWayNestedRootsErrorsWithoutTouchingEitherSide checks the
+// same "Critical 2" overlap rejection under two-way mode specifically -
+// two-way's validateRoots otherwise skips its other checks entirely (it has
+// no source-must-exist requirement), so the overlap check must not live
+// behind that early return.
+func TestSyncOnceTwoWayNestedRootsErrorsWithoutTouchingEitherSide(t *testing.T) {
+	left := t.TempDir()
+	right := filepath.Join(left, "backup")
+	if err := os.MkdirAll(right, 0o755); err != nil {
+		t.Fatalf("mkdir right: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "keep.txt"), []byte("precious"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+
+	err := SyncOnce(context.Background(), SyncOptions{
+		Name: "t", Left: left, Right: right, Mode: reconcile.FastTwoWay,
+		Assume: true, Workers: 2, DBPath: filepath.Join(t.TempDir(), "m.db"),
+	})
+	if err == nil {
+		t.Fatal("expected SyncOnce to error on nested two-way roots, got nil")
+	}
+	if b, readErr := os.ReadFile(filepath.Join(right, "keep.txt")); readErr != nil || string(b) != "precious" {
+		t.Fatalf("nested destination file was touched: read err=%v content=%q", readErr, b)
 	}
 }
 

@@ -145,18 +145,23 @@ func runSyncJobs(ctx context.Context, jobs []SyncJob, ropts syncRunOptions) erro
 }
 
 // runSyncJob runs a single job under a per-job lock: the lock file is
-// derived from the job name (via syncLockPath), so two different jobs can
-// still run concurrently - only two runs of the SAME job are serialized.
-// This guards against two concurrent runs racing on both jobs.db/the
-// per-job hash manifest db and the files themselves (`syncd sync` had no
-// lock at all before this).
+// derived from the job's state key (via syncLockPath), so two different jobs
+// can still run concurrently - only two runs of the SAME job (same name AND
+// same root pair) are serialized. This guards against two concurrent runs
+// racing on both jobs.db/the per-job hash manifest db and the files
+// themselves (`syncd sync` had no lock at all before this).
 func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 	mode, err := parseFastMode(job.Mode)
 	if err != nil {
 		return fmt.Errorf("job %q: %w", job.Name, err)
 	}
 
-	lockPath, err := syncLockPath(job.Name)
+	stateKey, err := jobStateKey(job.Name, job.Left, job.Right)
+	if err != nil {
+		return fmt.Errorf("job %q: resolve state key: %w", job.Name, err)
+	}
+
+	lockPath, err := syncLockPath(stateKey)
 	if err != nil {
 		return fmt.Errorf("job %q: resolve lock path: %w", job.Name, err)
 	}
@@ -178,7 +183,7 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 
 	dbPath := ropts.JobsDBPath
 	if ropts.UseHash {
-		dbPath, err = hashJobDBPath(job.Name)
+		dbPath, err = hashJobDBPath(stateKey)
 		if err != nil {
 			return fmt.Errorf("job %q: resolve hash manifest db: %w", job.Name, err)
 		}
@@ -186,6 +191,7 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 
 	opts := app.SyncOptions{
 		Name:     job.Name,
+		StateKey: stateKey,
 		Left:     job.Left,
 		Right:    job.Right,
 		Mode:     mode,
@@ -240,6 +246,36 @@ func resolveSyncJobs() ([]SyncJob, error) {
 func adHocJobName(left, right string) string {
 	sum := sha256.Sum256([]byte(left + "\x00" + right))
 	return "cli-" + hex.EncodeToString(sum[:6])
+}
+
+// jobStateKey derives a job's persisted-state identity from its display
+// Name plus a short hash of its canonicalized (Left, Right) root pair. It
+// feeds hashJobDBPath, syncLockPath, and app.SyncOptions.StateKey (the
+// job_state "job" column for fast two-way runs), so state is never silently
+// reused across two distinct root pairs - whether from two config jobs that
+// happen to share a Name, or one job later repointed at a different pair.
+// Without this, a stale job_state/hash-<id>.db row from the OLD pair can
+// make BuildPlan/FastCompare read a brand-new file that only exists on the
+// new remote as "unchanged since last sync, deleted locally" and delete it
+// (review finding P1 #1, Codex).
+//
+// Canonicalizing via filepath.Abs means a root reached by a relative path
+// this run and by its absolute equivalent last run still resolve to the
+// same identity; it does not resolve symlinks or case-fold, so a genuinely
+// different spelling of the same real path (a symlinked alias, or case
+// differences on a case-insensitive filesystem) is treated as a different
+// pair - erring toward a fresh baseline rather than a silently reused one.
+func jobStateKey(name, left, right string) (string, error) {
+	canonLeft, err := filepath.Abs(left)
+	if err != nil {
+		return "", fmt.Errorf("resolve left root %q: %w", left, err)
+	}
+	canonRight, err := filepath.Abs(right)
+	if err != nil {
+		return "", fmt.Errorf("resolve right root %q: %w", right, err)
+	}
+	sum := sha256.Sum256([]byte(canonLeft + "\x00" + canonRight))
+	return name + "-" + hex.EncodeToString(sum[:6]), nil
 }
 
 func parseFastMode(mode string) (reconcile.FastMode, error) {
@@ -317,16 +353,27 @@ func syncLockPath(jobName string) (string, error) {
 
 // sanitizeJobDBName maps a job name - arbitrary user-supplied text from the
 // config file, or a "cli-<hex>" adHocJobName hash - to a safe filename
-// component: only ASCII letters, digits, '.', '_', and '-' survive; anything
-// else (including path separators) becomes '_'.
+// component: only ASCII letters, digits, '.', '_', and '-' pass through
+// unchanged; every other byte (including path separators, and a literal '%'
+// in the input) is percent-encoded as %XX.
+//
+// This must be injective (distinct inputs never produce the same output) -
+// it previously collapsed every unsafe character onto a single shared '_',
+// so distinct job names like "a/b" and "a_b" both sanitized to "a_b" and
+// ended up sharing one hash-<id>.db and one sync-<id>.lock, silently
+// cross-contaminating their three-way baselines (review finding, GLM-5.2).
+// Percent-encoding operates byte-wise (not rune-wise), matching standard
+// percent-encoding of UTF-8 text (net/url's approach) - each byte of a
+// multi-byte rune is escaped individually, still losslessly reversible.
 func sanitizeJobDBName(name string) string {
 	var b strings.Builder
-	for _, r := range name {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
-			b.WriteRune(r)
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+			b.WriteByte(c)
 		default:
-			b.WriteRune('_')
+			fmt.Fprintf(&b, "%%%02X", c)
 		}
 	}
 	if b.Len() == 0 {

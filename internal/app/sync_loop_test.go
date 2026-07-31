@@ -134,6 +134,119 @@ func TestRunRobustOnce_EndToEndSyncLifecycle(t *testing.T) {
 	}
 }
 
+// TestRunRobustOnce_MatchingFilesEstablishManifestBaseline is a regression
+// test for review finding "High 4": BuildPlan emits ActionNoOp whenever
+// local and remote hashes already match (engine.go), but RunRobustOnce
+// filters ActionNoOp out before calling execute.RunActions, and manifest
+// upserts only ever come from executed action results - so a pair of
+// files that are identical from the very first scan (never went through an
+// Upload/Download/Conflict action) never gets a manifest row at all. A file
+// that never existed on either side previously is created identically on
+// both local and remote (simulating, e.g., a prior out-of-band copy), then
+// RunRobustOnce runs once: the fix must have that first NoOp cycle establish
+// a manifest baseline, not leave the path untracked.
+func TestRunRobustOnce_MatchingFilesEstablishManifestBaseline(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
+
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("same"), 0o644); err != nil {
+		t.Fatalf("write local a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteRoot, "a.txt"), []byte("same"), 0o644); err != nil {
+		t.Fatalf("write remote a.txt: %v", err)
+	}
+
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 1 (matching files, NoOp expected): %v", err)
+	}
+
+	manifest, err := p.Repo.LoadAll(ctx)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if _, ok := manifest["a.txt"]; !ok {
+		t.Fatal("expected a NoOp'd matching pair to establish a manifest baseline for a.txt, but no manifest row exists")
+	}
+}
+
+// TestRunRobustOnce_OneSidedDeleteAfterMatchPropagatesInsteadOfResurrecting
+// is the end-to-end consequence of the same "High 4" finding: without a
+// manifest baseline for a matching pair, a later one-sided delete falls into
+// BuildPlan's `!inManifest` branch and is classified as "new local file" -
+// re-uploading (resurrecting) the file the user just deleted on the remote,
+// instead of propagating the delete to local.
+func TestRunRobustOnce_OneSidedDeleteAfterMatchPropagatesInsteadOfResurrecting(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
+
+	localPath := filepath.Join(localRoot, "a.txt")
+	remotePath := filepath.Join(remoteRoot, "a.txt")
+	if err := os.WriteFile(localPath, []byte("same"), 0o644); err != nil {
+		t.Fatalf("write local a.txt: %v", err)
+	}
+	if err := os.WriteFile(remotePath, []byte("same"), 0o644); err != nil {
+		t.Fatalf("write remote a.txt: %v", err)
+	}
+
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 1 (matching files, NoOp expected): %v", err)
+	}
+
+	// User deletes the file on the remote.
+	if err := os.Remove(remotePath); err != nil {
+		t.Fatalf("remove remote a.txt: %v", err)
+	}
+
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 2 (delete propagation): %v", err)
+	}
+
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Fatalf("expected the remote delete to propagate to local (local file removed), but stat err = %v - the file was resurrected/re-uploaded instead", err)
+	}
+	if _, err := os.Stat(remotePath); !os.IsNotExist(err) {
+		t.Fatalf("expected remote a.txt to remain deleted, stat err = %v", err)
+	}
+}
+
+// TestCommitManifestUpdates_PersistsDespiteAlreadyCancelledContext is a
+// regression test for review finding "Medium 7": RunRobustOnce deliberately
+// keeps whatever execute.RunActions results DID complete even after ctx is
+// cancelled mid-batch (e.g. SIGINT) - the comment right above that call
+// site says so explicitly - but the manifest commit reused that same ctx,
+// so ApplyUpdates' BeginTx failed immediately against an already-cancelled
+// context, silently dropping real completed filesystem changes from the
+// manifest. commitManifestUpdates must still persist non-empty
+// upserts/deletes even when its ctx argument is already Done.
+func TestCommitManifestUpdates_PersistsDespiteAlreadyCancelledContext(t *testing.T) {
+	sqlDB, err := db.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer sqlDB.Close()
+	repo := db.NewManifestRepo(sqlDB)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already Done before commitManifestUpdates is ever called
+
+	upserts := []db.ManifestRow{{Path: "a.txt", Size: 4, Mtime: 1000, Hash: "deadbeef", LastSynced: 1000}}
+	if err := commitManifestUpdates(ctx, repo, upserts, nil); err != nil {
+		t.Fatalf("commitManifestUpdates with a cancelled ctx: %v", err)
+	}
+
+	manifest, err := repo.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if _, ok := manifest["a.txt"]; !ok {
+		t.Fatal("expected a.txt's completed update to be persisted despite the cancelled context, but no manifest row exists")
+	}
+}
+
 // TestRunRobustOnce_SkippedSubdirectoryDoesNotDeleteRemoteSubtree is a
 // regression test for Critical 2 on the robust (hash-based) path: a local
 // subdirectory becomes unreadable AFTER a prior successful sync (the
@@ -333,5 +446,42 @@ func TestRunRobustOnce_SyncsEmptyDirectoriesAndCleansUpAfterDelete(t *testing.T)
 	}
 	if info, err := os.Stat(filepath.Join(localRoot, "empty-folder")); err != nil || !info.IsDir() {
 		t.Fatalf("expected local empty-folder to remain untouched, stat err = %v", err)
+	}
+}
+
+// TestRunRobustOnce_DeletedEmptyDirectoryPropagatesAcrossCyclesInsteadOfResurrecting
+// is the end-to-end version of review finding "Medium 9": run 1 mirrors a
+// brand-new empty directory from local to remote and baselines it; the user
+// then deletes it locally; run 2 must propagate that deletion to remote,
+// not recreate it locally from remote's still-baselined copy.
+func TestRunRobustOnce_DeletedEmptyDirectoryPropagatesAcrossCyclesInsteadOfResurrecting(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	ctx := context.Background()
+	p := newTestRobustParams(t, localRoot, remoteRoot)
+
+	if err := os.MkdirAll(filepath.Join(localRoot, "empty-folder"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 1 (mirror new empty dir): %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(remoteRoot, "empty-folder")); err != nil || !info.IsDir() {
+		t.Fatalf("expected empty-folder mirrored to remote after run 1, stat err = %v", err)
+	}
+
+	// User deletes the now-baselined empty directory locally.
+	if err := os.Remove(filepath.Join(localRoot, "empty-folder")); err != nil {
+		t.Fatalf("remove local empty-folder: %v", err)
+	}
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("run 2 (delete propagation): %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(localRoot, "empty-folder")); !os.IsNotExist(err) {
+		t.Fatalf("expected local empty-folder to remain deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "empty-folder")); !os.IsNotExist(err) {
+		t.Fatalf("expected the delete to propagate to remote (not resurrected on local instead), stat err = %v", err)
 	}
 }

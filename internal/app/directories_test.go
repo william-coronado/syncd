@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"syncd/internal/reconcile"
 	"syncd/internal/runtime"
 )
 
@@ -18,7 +19,15 @@ func newTestLogger(t *testing.T) *runtime.Logger {
 	return logger
 }
 
-func TestCreateMissingEmptyDirs_CreatesOnBothSidesAsNeeded(t *testing.T) {
+// emptyDirSet is a convenience nil-map-avoiding empty baseline for tests
+// that don't care about prior baseline state.
+func emptyDirSet() map[string]struct{} { return map[string]struct{}{} }
+
+// noSkips is a convenience zero-value SkipSet for tests where nothing was
+// skipped during scanning.
+func noSkips() reconcile.SkipSet { return reconcile.SkipSet{} }
+
+func TestReconcileDirectories_NewDirNotInBaselineCreatesOnMissingSide(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
 	logger := newTestLogger(t)
@@ -26,9 +35,12 @@ func TestCreateMissingEmptyDirs_CreatesOnBothSidesAsNeeded(t *testing.T) {
 	localDirs := map[string]struct{}{"only-local": {}, "shared": {}}
 	remoteDirs := map[string]struct{}{"only-remote": {}, "shared": {}}
 
-	failures := createMissingEmptyDirs(logger, localRoot, remoteRoot, localDirs, remoteDirs)
+	toAdd, toRemove, failures := reconcileDirectories(logger, localRoot, remoteRoot, localDirs, remoteDirs, emptyDirSet(), noSkips())
 	if failures != 0 {
 		t.Fatalf("expected 0 failures, got %d", failures)
+	}
+	if len(toRemove) != 0 {
+		t.Fatalf("expected no baseline removals, got %v", toRemove)
 	}
 
 	if info, err := os.Stat(filepath.Join(remoteRoot, "only-local")); err != nil || !info.IsDir() {
@@ -45,18 +57,32 @@ func TestCreateMissingEmptyDirs_CreatesOnBothSidesAsNeeded(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(remoteRoot, "shared")); !os.IsNotExist(err) {
 		t.Fatalf("did not expect 'shared' to be created on remote (present in both sides' maps already), err = %v", err)
 	}
+
+	wantAdds := map[string]bool{"only-local": true, "only-remote": true, "shared": true}
+	if len(toAdd) != len(wantAdds) {
+		t.Fatalf("expected all 3 new-to-baseline dirs added, got %v", toAdd)
+	}
+	for _, d := range toAdd {
+		if !wantAdds[d] {
+			t.Errorf("unexpected baseline addition %q", d)
+		}
+	}
 }
 
-func TestCreateMissingEmptyDirs_NoOpWhenAllShared(t *testing.T) {
+func TestReconcileDirectories_NoOpWhenAllShared(t *testing.T) {
 	localRoot := t.TempDir()
 	remoteRoot := t.TempDir()
 	logger := newTestLogger(t)
 
 	dirs := map[string]struct{}{"a": {}, "a/b": {}}
+	baseline := map[string]struct{}{"a": {}, "a/b": {}}
 
-	failures := createMissingEmptyDirs(logger, localRoot, remoteRoot, dirs, dirs)
+	toAdd, toRemove, failures := reconcileDirectories(logger, localRoot, remoteRoot, dirs, dirs, baseline, noSkips())
 	if failures != 0 {
 		t.Fatalf("expected 0 failures, got %d", failures)
+	}
+	if len(toAdd) != 0 || len(toRemove) != 0 {
+		t.Fatalf("expected no baseline changes when already baselined on both sides, got toAdd=%v toRemove=%v", toAdd, toRemove)
 	}
 	entries, err := os.ReadDir(localRoot)
 	if err != nil {
@@ -64,6 +90,167 @@ func TestCreateMissingEmptyDirs_NoOpWhenAllShared(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected no directories created locally, got %v", entries)
+	}
+}
+
+// TestReconcileDirectories_DeletedFromOneSidePropagatesRatherThanResurrecting
+// is a regression test for review finding "Medium 9": before this fix,
+// createMissingEmptyDirs unconditionally recreated any directory missing on
+// one side, with no baseline to distinguish "the user just deleted this
+// empty directory on remote" from "this is a brand-new empty directory the
+// user is organizing ahead of time on local". A directory already recorded
+// in the baseline (present on both sides as of the last cycle) that is now
+// missing from remote must have its local copy removed (delete propagated),
+// not recreated on remote.
+func TestReconcileDirectories_DeletedFromOneSidePropagatesRatherThanResurrecting(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	logger := newTestLogger(t)
+
+	if err := os.MkdirAll(filepath.Join(localRoot, "empty-dir"), 0o755); err != nil {
+		t.Fatalf("mkdir local empty-dir: %v", err)
+	}
+	// remote's "empty-dir" was deliberately deleted by the user - absent from
+	// remoteDirs and from disk.
+
+	localDirs := map[string]struct{}{"empty-dir": {}}
+	remoteDirs := map[string]struct{}{}
+	baseline := map[string]struct{}{"empty-dir": {}} // present on both sides as of the last cycle
+
+	toAdd, toRemove, failures := reconcileDirectories(logger, localRoot, remoteRoot, localDirs, remoteDirs, baseline, noSkips())
+	if failures != 0 {
+		t.Fatalf("expected 0 failures, got %d", failures)
+	}
+
+	if _, err := os.Stat(filepath.Join(remoteRoot, "empty-dir")); !os.IsNotExist(err) {
+		t.Fatalf("expected remote's deleted empty-dir to stay deleted (not resurrected), stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, "empty-dir")); !os.IsNotExist(err) {
+		t.Fatalf("expected local's empty-dir to be removed (delete propagated), stat err = %v", err)
+	}
+	if len(toAdd) != 0 {
+		t.Fatalf("expected no baseline additions, got %v", toAdd)
+	}
+	if len(toRemove) != 1 || toRemove[0] != "empty-dir" {
+		t.Fatalf("expected empty-dir removed from the baseline, got %v", toRemove)
+	}
+}
+
+// TestReconcileDirectories_SkippedLocalDirIsLeftAlone is a regression test
+// for review finding P1 #2 (Codex): fs.ScanTree omits an unreadable
+// directory from ScanResult.Dirs entirely (it can't enumerate what's inside,
+// so it never gets to record the directory itself as present) - it only
+// records the directory in Skipped/SkippedDirs. Before this fix,
+// reconcileDirectories only ever consulted Dirs, so a directory that exists
+// on disk but became unreadable (e.g. a permission change) looked identical
+// to "deleted locally": present in the baseline, absent from localDirs. That
+// misread the remote counterpart as needing its delete propagated - and the
+// baseline row for the perfectly-intact local directory got dropped, wiping
+// data that was never actually deleted anywhere. A skipped directory must be
+// left completely alone: no create, no delete, baseline unchanged.
+func TestReconcileDirectories_SkippedLocalDirIsLeftAlone(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	logger := newTestLogger(t)
+
+	// "unreadable-dir" still exists locally (unlike the genuine-delete case),
+	// but scanning couldn't read it, so it's absent from localDirs and
+	// present in the skip set instead - unlike remoteDirs, which the scan of
+	// the OTHER side had no trouble with.
+	if err := os.MkdirAll(filepath.Join(localRoot, "unreadable-dir"), 0o755); err != nil {
+		t.Fatalf("mkdir local unreadable-dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(remoteRoot, "unreadable-dir"), 0o755); err != nil {
+		t.Fatalf("mkdir remote unreadable-dir: %v", err)
+	}
+
+	localDirs := map[string]struct{}{}
+	remoteDirs := map[string]struct{}{"unreadable-dir": {}}
+	baseline := map[string]struct{}{"unreadable-dir": {}} // present on both sides as of the last cycle
+	skipped := reconcile.NewSkipSet(
+		map[string]struct{}{"unreadable-dir": {}},
+		map[string]struct{}{"unreadable-dir": {}},
+	)
+
+	toAdd, toRemove, failures := reconcileDirectories(logger, localRoot, remoteRoot, localDirs, remoteDirs, baseline, skipped)
+	if failures != 0 {
+		t.Fatalf("expected 0 failures, got %d", failures)
+	}
+	if len(toAdd) != 0 || len(toRemove) != 0 {
+		t.Fatalf("expected no baseline changes for a skipped directory, got toAdd=%v toRemove=%v", toAdd, toRemove)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "unreadable-dir")); err != nil {
+		t.Fatalf("remote's unreadable-dir must not be removed just because local couldn't be scanned: stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, "unreadable-dir")); err != nil {
+		t.Fatalf("local's unreadable-dir must still exist (only its listing failed): stat err = %v", err)
+	}
+}
+
+// TestReconcileDirectories_NestedDeletionRemovesDeepestFirst is a regression
+// test for review finding P2 #3 (Codex): allDirs used to be ranged directly
+// as a plain map, whose iteration order Go deliberately randomizes. When
+// both "parent" and "parent/child" are slated for local removal in the same
+// cycle, os.Remove (non-recursive) fails with ENOTEMPTY if "parent" happens
+// to be visited before its still-present child - a spurious failure that
+// only self-heals on the NEXT cycle, and wrongly reports a failure for a
+// case that isn't really one. Removal must proceed deepest-first so both
+// come out clean in a single cycle regardless of map iteration order.
+func TestReconcileDirectories_NestedDeletionRemovesDeepestFirst(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	logger := newTestLogger(t)
+
+	if err := os.MkdirAll(filepath.Join(localRoot, "parent", "child"), 0o755); err != nil {
+		t.Fatalf("mkdir local parent/child: %v", err)
+	}
+	// remote's "parent" (and "parent/child") were deliberately deleted by the
+	// user - absent from remoteDirs and from disk.
+
+	localDirs := map[string]struct{}{"parent": {}, "parent/child": {}}
+	remoteDirs := map[string]struct{}{}
+	baseline := map[string]struct{}{"parent": {}, "parent/child": {}}
+
+	toAdd, toRemove, failures := reconcileDirectories(logger, localRoot, remoteRoot, localDirs, remoteDirs, baseline, noSkips())
+	if failures != 0 {
+		t.Fatalf("expected 0 failures (deepest-first removal must avoid ENOTEMPTY), got %d", failures)
+	}
+	if len(toAdd) != 0 {
+		t.Fatalf("expected no baseline additions, got %v", toAdd)
+	}
+	wantRemoved := map[string]bool{"parent": true, "parent/child": true}
+	if len(toRemove) != len(wantRemoved) {
+		t.Fatalf("expected both parent and parent/child removed from the baseline in one cycle, got %v", toRemove)
+	}
+	for _, d := range toRemove {
+		if !wantRemoved[d] {
+			t.Errorf("unexpected baseline removal %q", d)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, "parent")); !os.IsNotExist(err) {
+		t.Fatalf("expected local parent (and child) fully removed, stat err = %v", err)
+	}
+}
+
+// TestReconcileDirectories_StaleBaselineEntryGoneFromBothSidesIsCleanedUp
+// checks that a baseline row for a directory now absent from BOTH sides
+// (e.g. deleted on both independently, or cleaned up by cleanupEmptiedDirs
+// on both sides in an earlier cycle) is swept from the baseline rather than
+// lingering forever.
+func TestReconcileDirectories_StaleBaselineEntryGoneFromBothSidesIsCleanedUp(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	logger := newTestLogger(t)
+
+	toAdd, toRemove, failures := reconcileDirectories(logger, localRoot, remoteRoot, emptyDirSet(), emptyDirSet(), map[string]struct{}{"long-gone": {}}, noSkips())
+	if failures != 0 {
+		t.Fatalf("expected 0 failures, got %d", failures)
+	}
+	if len(toAdd) != 0 {
+		t.Fatalf("expected no additions, got %v", toAdd)
+	}
+	if len(toRemove) != 1 || toRemove[0] != "long-gone" {
+		t.Fatalf("expected stale baseline entry 'long-gone' removed, got %v", toRemove)
 	}
 }
 

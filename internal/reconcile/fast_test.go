@@ -345,6 +345,50 @@ func TestFastTwoWayConflict(t *testing.T) {
 	}
 }
 
+// TestFastTwoWayEqualMtimeConflictDoesNotFabricateBaseline is a regression
+// test for review finding "Medium 8": when both sides changed since prev but
+// their mtimes tie, neither the `>` nor the `<` branch fires, so no copy is
+// queued - but the code then unconditionally set newState[p] = lState,
+// asserting the pair as "identical" even though their sizes (and, in
+// reality, their content) differ. A later run would then diff against that
+// fabricated baseline: left's real, distinct content is now the recorded
+// "last known" state, so right (genuinely unchanged since this run) reads as
+// "changed" and gets force-copied over left - silently discarding left's own
+// real edit.
+func TestFastTwoWayEqualMtimeConflictDoesNotFabricateBaseline(t *testing.T) {
+	const now int64 = 1_000_000
+
+	prev := map[string]db.JobFileState{
+		"fileA.txt": {Path: "fileA.txt", Size: 100, Mtime: now - 3600},
+	}
+	left := map[string]db.JobFileState{
+		"fileA.txt": {Path: "fileA.txt", Size: 150, Mtime: now}, // changed since prev
+	}
+	right := map[string]db.JobFileState{
+		"fileA.txt": {Path: "fileA.txt", Size: 200, Mtime: now}, // changed since prev, same mtime as left
+	}
+
+	res := FastCompare(FastTwoWay, left, right, prev, SkipSet{})
+
+	if len(res.Tasks) != 0 {
+		t.Fatalf("expected no task for an unresolvable equal-mtime conflict, got %+v", res.Tasks)
+	}
+	if got, ok := res.NewState["fileA.txt"]; ok {
+		t.Fatalf("expected no fabricated baseline for the unresolved conflict, got %+v", got)
+	}
+
+	// Run again using this run's NewState as the next run's prev (exactly
+	// what the caller persists - see sync_once.go's repo.Replace). Nothing
+	// genuinely changed on either side between the two runs. This must
+	// re-detect the same ambiguous conflict (and still queue no task) rather
+	// than reading right as newly-changed-since-baseline and force-copying
+	// it over left's real, distinct content.
+	res2 := FastCompare(FastTwoWay, left, right, res.NewState, SkipSet{})
+	if len(res2.Tasks) != 0 {
+		t.Fatalf("expected the unresolved conflict to persist across runs without a fabricated baseline, got %+v", res2.Tasks)
+	}
+}
+
 // Ported from TestCompareMirror: new file, updated file, and a file only on
 // the right (to be deleted).
 func TestFastMirror(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"syncd/internal/db"
 	"syncd/internal/execute"
@@ -62,6 +63,12 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 		return reconcile.Plan{}, 0, &robustHardError{stage: "load manifest", err: err}
 	}
 
+	dirRepo := db.NewDirRepo(p.DB)
+	dirBaseline, err := dirRepo.LoadAll(ctx)
+	if err != nil {
+		return reconcile.Plan{}, 0, &robustHardError{stage: "load dir manifest", err: err}
+	}
+
 	scans, err := fs.ScanPair(ctx, p.LocalRoot, p.RemoteRoot, manifest, p.Policy, scanProgressLogger(p.Logger))
 	if err != nil {
 		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
@@ -93,16 +100,82 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 
-	failures += createMissingEmptyDirs(p.Logger, p.LocalRoot, p.RemoteRoot, scans.Local.Dirs, scans.Remote.Dirs)
+	dirsToAdd, dirsToRemove, dirFailures := reconcileDirectories(p.Logger, p.LocalRoot, p.RemoteRoot, scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped)
+	failures += dirFailures
 	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
 
-	if len(upserts) > 0 || len(deletes) > 0 {
-		if err := p.Repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
-			return plan, failures, &robustHardError{stage: "apply manifest updates", err: err}
-		}
+	noopUpserts, noopDeletes := noopManifestUpdates(plan, localFiles, remoteFiles, manifest)
+	upserts = append(upserts, noopUpserts...)
+	deletes = append(deletes, noopDeletes...)
+
+	if err := commitManifestUpdates(ctx, p.Repo, upserts, deletes); err != nil {
+		return plan, failures, &robustHardError{stage: "apply manifest updates", err: err}
+	}
+	// Detached context for the same reason as commitManifestUpdates: a run
+	// cancelled mid-execute.RunActions must not lose directory baseline
+	// updates that already-completed create/removes imply.
+	if err := dirRepo.ApplyUpdates(context.WithoutCancel(ctx), dirsToAdd, dirsToRemove); err != nil {
+		return plan, failures, &robustHardError{stage: "apply dir manifest updates", err: err}
 	}
 
 	return plan, failures, runErr
+}
+
+// commitManifestUpdates persists this cycle's manifest upserts/deletes,
+// using a context detached from cancellation (context.WithoutCancel), not
+// ctx itself. execute.RunActions' runErr (e.g. ctx cancelled mid-batch by
+// SIGINT) is deliberately not checked before this is called - whatever
+// actions DID complete should still be recorded - but ctx may already be
+// Done by the time we get here, and ApplyUpdates' BeginTx fails immediately
+// against a cancelled context, which would silently drop real,
+// already-applied filesystem changes from the manifest (review finding
+// "Medium 7"). It is a no-op (no transaction opened) when there is nothing
+// to commit.
+func commitManifestUpdates(ctx context.Context, repo *db.ManifestRepo, upserts []db.ManifestRow, deletes []string) error {
+	if len(upserts) == 0 && len(deletes) == 0 {
+		return nil
+	}
+	return repo.ApplyUpdates(context.WithoutCancel(ctx), upserts, deletes)
+}
+
+// noopManifestUpdates derives the manifest upserts/deletes that
+// ActionNoOp plan entries require on their own, since they are excluded from
+// execActions and never reach execute.RunActions (there is nothing to copy -
+// the point of NoOp is that both sides already agree), and so would
+// otherwise never touch the manifest at all:
+//
+//   - a live matching pair (present, hash-equal, on both sides) that isn't
+//     already correctly baselined gets a manifest upsert. Without this, a
+//     pair that has been identical since its very first scan - never having
+//     gone through an Upload/Download/Conflict action - stays untracked
+//     forever, so a later one-sided delete falls into BuildPlan's
+//     `!inManifest` branch and gets re-uploaded ("resurrected") instead of
+//     propagated as a delete (review finding "High 4").
+//   - a stale manifest row for a path now absent from both sides (BuildPlan's
+//     "already deleted on both sides" NoOp) is removed, so it doesn't linger
+//     in the manifest indefinitely.
+func noopManifestUpdates(plan reconcile.Plan, localFiles, remoteFiles map[string]fs.FileEntry, manifest map[string]db.ManifestRow) (upserts []db.ManifestRow, deletes []string) {
+	now := time.Now().Unix()
+	for _, action := range plan.Actions {
+		if action.Type != reconcile.ActionNoOp {
+			continue
+		}
+		path := action.Path
+		l, inLocal := localFiles[path]
+		_, inRemote := remoteFiles[path]
+		if inLocal && inRemote {
+			if row, ok := manifest[path]; !ok || row.Hash != l.Hash || row.Size != l.Size || row.Mtime != l.Mtime {
+				upserts = append(upserts, db.ManifestRow{Path: path, Size: l.Size, Mtime: l.Mtime, Hash: l.Hash, LastSynced: now})
+			}
+			continue
+		}
+		if !inLocal && !inRemote {
+			if _, ok := manifest[path]; ok {
+				deletes = append(deletes, path)
+			}
+		}
+	}
+	return upserts, deletes
 }
 
 // collectManifestUpdates dedups a batch of execute.Result into the final set
@@ -192,10 +265,13 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
-	if len(upserts) > 0 || len(deletes) > 0 {
-		if err := p.Repo.ApplyUpdates(ctx, upserts, deletes); err != nil {
-			return plan, failures, err
-		}
+
+	noopUpserts, noopDeletes := noopManifestUpdates(plan, localScan.Files, remoteScan.Files, scopedManifest)
+	upserts = append(upserts, noopUpserts...)
+	deletes = append(deletes, noopDeletes...)
+
+	if err := commitManifestUpdates(ctx, p.Repo, upserts, deletes); err != nil {
+		return plan, failures, err
 	}
 	return plan, failures, runErr
 }

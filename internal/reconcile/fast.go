@@ -266,9 +266,25 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, sk
 				} else if rState.Mtime > lState.Mtime {
 					tasks = append(tasks, FastTask{Type: CopyR2L, RelPath: p, Size: rState.Size})
 					newState[p] = rState
-				} else {
-					newState[p] = lState // identical
+				} else if lState.Size == rState.Size {
+					// Equal mtime AND equal size: the fast reconciler never
+					// reads content, so this is the closest it can get to
+					// "actually identical" - safe to baseline.
+					newState[p] = lState
 				}
+				// Equal mtime, different size: both sides genuinely changed
+				// and there is no size+mtime-only signal to break the tie -
+				// this reconciler never hashes content (that's --hash's
+				// job). Deliberately queue no task AND do not assign
+				// newState[p]: fabricating either side as the new baseline
+				// would let a later run diff the OTHER (truly unchanged
+				// since now) side against that fabricated state, read it as
+				// "changed", and silently overwrite the real edit it's
+				// missing from (review finding "Medium 8"). Leaving p out of
+				// newState means next run's prev has no entry for it either,
+				// so this same ambiguous conflict re-surfaces (still as no
+				// task) every run until the user resolves it manually,
+				// rather than ever being silently resolved wrong.
 			} else if lChanged {
 				tasks = append(tasks, FastTask{Type: CopyL2R, RelPath: p, Size: lState.Size})
 				newState[p] = lState

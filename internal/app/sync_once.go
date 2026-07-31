@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -26,7 +27,15 @@ var ErrAborted = errors.New("sync: aborted by user")
 // run by SyncOnce.
 type SyncOptions struct {
 	Name, Left, Right string
-	Mode              reconcile.FastMode
+	// StateKey identifies this job's persisted state (job_state rows for
+	// fast two-way, via stateKey below) independently of its display Name -
+	// cli.runSyncJob derives it from Name plus a hash of the canonicalized
+	// root pair, so two jobs sharing a Name (or one job repointed at a new
+	// pair) never reuse each other's state. Falls back to Name when unset,
+	// so callers that don't need the distinction (tests, direct API use)
+	// can leave it empty.
+	StateKey string
+	Mode     reconcile.FastMode
 	UseHash           bool
 	Assume            bool // --yes: skip interactive confirm
 	DryRun            bool // --dry-run: print the summary and exit without mutating anything or persisting job state. Still acquires the per-job lock (cli.runSyncJob) and opens/creates the state db (SyncOnce below) - deliberate, since this is a read of shared job state, not a mutation; see docs/follow-ups.md #3.
@@ -45,20 +54,57 @@ func SyncOnce(ctx context.Context, opts SyncOptions) error {
 		opts.Workers = 1
 	}
 
-	if err := prepareRoots(opts); err != nil {
-		return err
-	}
-
+	// Opened before prepareRoots (rather than after, as before) so
+	// validateRoots can check for prior two-way job_state - see its own doc
+	// comment and hasPriorTwoWayState for why that ordering matters.
 	sqlDB, err := db.Open(opts.DBPath)
 	if err != nil {
 		return fmt.Errorf("open state db: %w", err)
 	}
 	defer sqlDB.Close()
 
+	hasPriorState, err := hasPriorTwoWayState(ctx, sqlDB, opts)
+	if err != nil {
+		return fmt.Errorf("check prior job state: %w", err)
+	}
+
+	if err := prepareRoots(opts, hasPriorState); err != nil {
+		return err
+	}
+
 	if opts.UseHash {
 		return runRobustOnce(ctx, sqlDB, opts)
 	}
 	return runFastOnce(ctx, sqlDB, opts)
+}
+
+// hasPriorTwoWayState reports whether persisted job_state rows already exist
+// for opts' state key. Only meaningful for fast two-way (mirror/update/--hash
+// already require their source to exist unconditionally, regardless of
+// prior state - see validateRoots), where it decides whether an
+// auto-created empty root is safe.
+func hasPriorTwoWayState(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) (bool, error) {
+	if opts.UseHash || opts.Mode != reconcile.FastTwoWay {
+		return false, nil
+	}
+	prev, err := db.NewJobStateRepo(sqlDB).Load(ctx, stateKey(opts))
+	if err != nil {
+		return false, err
+	}
+	return len(prev) > 0, nil
+}
+
+// stateKey returns opts.StateKey if the caller set one, else opts.Name -
+// SyncOnce itself doesn't require a canonical StateKey (existing tests and
+// any direct caller can keep using bare Name), but cli.runSyncJob always
+// sets it, deriving it from the job's canonicalized root pair so two jobs
+// sharing a Name never collide on persisted job_state (review finding P1
+// #1, Codex).
+func stateKey(opts SyncOptions) string {
+	if opts.StateKey != "" {
+		return opts.StateKey
+	}
+	return opts.Name
 }
 
 // prepareRoots ensures both sync roots exist before scanning (ad-hoc jobs
@@ -67,8 +113,8 @@ func SyncOnce(ctx context.Context, opts SyncOptions) error {
 // first and so can assume both roots are already there) - except for
 // --dry-run, which must not create anything on disk at all (see
 // validateRoots/createRoots below for why the two are split).
-func prepareRoots(opts SyncOptions) error {
-	if err := validateRoots(opts); err != nil {
+func prepareRoots(opts SyncOptions, hasPriorState bool) error {
+	if err := validateRoots(opts, hasPriorState); err != nil {
 		return err
 	}
 	if opts.DryRun {
@@ -87,20 +133,117 @@ func prepareRoots(opts SyncOptions) error {
 // mirror branch (or BuildPlan) would see "everything on the destination is
 // gone from the source" and emit deletes for the destination's entire
 // contents, silently wiping it under --yes. For those modes the source
-// (opts.Left) must already exist. two-way (fast) is symmetric and safe - a
-// missing side with no prior persisted state produces copies, not deletes -
-// so it has no source-must-exist requirement at all.
-func validateRoots(opts SyncOptions) error {
-	if !opts.UseHash && opts.Mode == reconcile.FastTwoWay {
-		return nil
+// (opts.Left) must already exist.
+//
+// two-way (fast) is symmetric and safe to auto-create ONLY when
+// hasPriorState is false - "a missing side with no prior persisted state
+// produces copies, not deletes" is true precisely because there is nothing
+// in job_state for FastCompare to read as "this path used to exist here".
+// Once job_state DOES have rows for this job (a prior successful sync), that
+// reasoning breaks: a left root that has vanished entirely (wrong mount
+// point, accidental deletion, replaced disk - not just one file removed
+// from within it) would otherwise be silently recreated empty, and
+// FastCompare's lDeleted branch would read every previously-tracked path as
+// "deleted locally", emitting a DeleteR for each and wiping right under
+// --yes (review finding, GLM-5.2). So once hasPriorState is true, two-way
+// gets the exact same must-already-exist guard as mirror/update, for BOTH
+// sides.
+func validateRoots(opts SyncOptions, hasPriorState bool) error {
+	overlap, err := rootsOverlap(opts.Left, opts.Right)
+	if err != nil {
+		return fmt.Errorf("resolve sync roots: %w", err)
 	}
-	if _, err := os.Stat(opts.Left); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("source directory does not exist: %s", opts.Left)
+	if overlap {
+		return fmt.Errorf("left and right sync roots must not be the same directory or nested inside one another: %s, %s", opts.Left, opts.Right)
+	}
+	if !opts.UseHash && opts.Mode == reconcile.FastTwoWay {
+		if !hasPriorState {
+			return nil
 		}
-		return fmt.Errorf("stat source directory %s: %w", opts.Left, err)
+		if err := requireExistingDir(opts.Left, "left"); err != nil {
+			return err
+		}
+		return requireExistingDir(opts.Right, "right")
+	}
+	return requireExistingDir(opts.Left, "source")
+}
+
+// requireExistingDir errors unless path exists and is a real directory.
+// os.Lstat, not os.Stat: filepath.WalkDir (fs.ScanTree) Lstats the root
+// itself, so a symlink there is never followed and never recurses into -
+// its callback fires once at path==root and returns immediately, producing
+// a silently EMPTY scan rather than an error. Using Stat here (which
+// follows symlinks) would let a symlink-to-a-real-directory root pass
+// validation while still scanning as empty, so mirror/two-way would delete
+// every file already on the other side.
+func requireExistingDir(path, label string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s directory does not exist: %s", label, path)
+		}
+		return fmt.Errorf("stat %s directory %s: %w", label, path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory: %s", label, path)
 	}
 	return nil
+}
+
+// rootsOverlap reports whether a and b denote the same directory, or one is
+// nested inside the other - checked unconditionally for every mode
+// (including two-way, which has no source-must-exist requirement of its
+// own), since scanning a destination that lives inside its own source scans
+// the same files twice under different relative-path keys (e.g. --left
+// /data --right /data/backup: a file under backup/ is keyed "backup/foo"
+// from the left scan but "foo" from the right scan), so a reconciler sees no
+// correspondence between them and treats one side's real files as
+// extraneous on the other - mirror would then delete them.
+//
+// Symlinks are resolved via filepath.EvalSymlinks so a and b that merely
+// alias the same directory through a symlink are also caught; a path that
+// doesn't exist yet (legitimate for two-way's auto-created roots) is
+// compared on its cleaned absolute form only, since there is nothing to
+// resolve.
+func rootsOverlap(a, b string) (bool, error) {
+	absA, err := filepath.Abs(a)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s: %w", a, err)
+	}
+	absB, err := filepath.Abs(b)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s: %w", b, err)
+	}
+	resolvedA := resolveIfExists(absA)
+	resolvedB := resolveIfExists(absB)
+	return pathContainsOrEquals(resolvedA, resolvedB) || pathContainsOrEquals(resolvedB, resolvedA), nil
+}
+
+// resolveIfExists returns p with symlinks resolved via filepath.EvalSymlinks
+// when p exists, or p unchanged (already filepath.Abs'd by the caller) when
+// it doesn't - a path that isn't there yet has nothing to resolve, and that
+// is not an error condition here (two-way legitimately auto-creates roots).
+func resolveIfExists(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
+}
+
+// pathContainsOrEquals reports whether child is parent itself, or a
+// descendant of it, after both have already been made absolute (and
+// symlink-resolved where possible) by the caller.
+func pathContainsOrEquals(parent, child string) bool {
+	parent = filepath.Clean(parent)
+	child = filepath.Clean(child)
+	if parent == child {
+		return true
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // createRoots creates whichever roots don't exist yet, and is skipped
@@ -162,7 +305,7 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	repo := db.NewJobStateRepo(sqlDB)
 	var prev map[string]db.JobFileState
 	if opts.Mode == reconcile.FastTwoWay {
-		prev, err = repo.Load(ctx, opts.Name)
+		prev, err = repo.Load(ctx, stateKey(opts))
 		if err != nil {
 			return fmt.Errorf("load job state: %w", err)
 		}
@@ -191,7 +334,7 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	}
 
 	if opts.Mode == reconcile.FastTwoWay {
-		if err := repo.Replace(ctx, opts.Name, res.NewState); err != nil {
+		if err := repo.Replace(ctx, stateKey(opts), res.NewState); err != nil {
 			return fmt.Errorf("persist job state: %w", err)
 		}
 	}
