@@ -130,11 +130,24 @@ func moveFastFile(root string, task reconcile.FastTask) error {
 		return err
 	}
 
-	if err := os.Rename(src, dst); err != nil {
+	if err := renameFunc(src, dst); err != nil {
 		if err := fs.AtomicCopyFile(src, dst); err != nil {
 			return err
 		}
-		return os.RemoveAll(src)
+		// os.Remove, not os.RemoveAll: FastCompare only queues a move for
+		// paths it saw as FILES during scanning. If src was replaced by a
+		// non-empty directory between scan and now (a TOCTOU race), os.Remove
+		// fails safely with ENOTEMPTY rather than silently wiping the whole
+		// subtree - the same safety convention used by DeleteL/DeleteR tasks
+		// (see TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory).
+		return os.Remove(src)
 	}
 	return nil
 }
+
+// renameFunc is os.Rename, indirected through a package-level variable so
+// tests can force the copy+remove fallback path in moveFastFile
+// deterministically (simulating a cross-device rename failure) without
+// needing an actual cross-device filesystem setup. Same pattern as
+// conflict.go's timeNow and atomic_copy.go's tempSiblingPathFunc.
+var renameFunc = os.Rename

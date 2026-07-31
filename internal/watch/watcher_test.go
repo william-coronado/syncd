@@ -199,6 +199,56 @@ func TestNewWatcher_SymlinkedRootDoesNotPanic(t *testing.T) {
 	defer w.Close()
 }
 
+// TestHandleEvent_SymlinkToDirNotAddedToWatch is a regression test for the
+// os.Stat → os.Lstat fix in handleEvent. os.Stat follows symlinks, so a
+// Create event for a symlink-to-directory was incorrectly identified as a
+// directory (info.IsDir() == true) and handed to w.fsw.Add, which follows
+// the symlink on Linux/macOS - potentially watching a directory OUTSIDE the
+// sync root. os.Lstat reports the symlink's own type (not the target's), so
+// isDir is false and w.fsw.Add is never called. The symlink's rel-path is
+// still added to pending so the scoped reconciler (ScanPaths) can process it
+// and reject it correctly as "symlink not supported".
+func TestHandleEvent_SymlinkToDirNotAddedToWatch(t *testing.T) {
+	root := t.TempDir()
+	external := t.TempDir() // directory outside the sync root
+
+	// Create symlink inside root pointing to the external directory.
+	symlinkPath := filepath.Join(root, "linked")
+	if err := os.Symlink(external, symlinkPath); err != nil {
+		t.Skipf("symlinks not supported on this OS/filesystem: %v", err)
+	}
+
+	m, _ := fs.LoadIgnoreMatcher(root)
+	w, err := NewWatcher(root, m, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	watchedBefore := w.fsw.WatchList()
+
+	pending := make(map[string]struct{})
+	w.handleEvent(fsnotify.Event{
+		Name: symlinkPath,
+		Op:   fsnotify.Create,
+	}, pending)
+
+	// The symlink's rel-path must be in pending: the event itself is valid
+	// (the scoped reconciler will later see it as a symlink and skip it).
+	if _, ok := pending["linked"]; !ok {
+		t.Error("symlink rel-path missing from pending; expected it to be queued for the scoped reconciler")
+	}
+
+	// The watch list must not grow: fsw.Add must not have been called for the
+	// symlink (or its target outside the root).
+	watchedAfter := w.fsw.WatchList()
+	if len(watchedAfter) != len(watchedBefore) {
+		t.Errorf("fsnotify watch list grew by %d after a symlink-to-dir Create event; "+
+			"symlinks must not be auto-added to the watch (would watch %s outside the root)",
+			len(watchedAfter)-len(watchedBefore), external)
+	}
+}
+
 // TestWatcherSkipsIgnoredDirSubtree is a light check that a pre-existing
 // ignored directory (matched as dirOnly, e.g. "node_modules/") is never
 // added to the underlying fsnotify watcher: NewWatcher must not error on

@@ -2,6 +2,7 @@ package execute
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -57,6 +58,57 @@ func TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory(t *
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "unexpected.txt")); statErr != nil {
 		t.Fatalf("expected unexpected.txt to survive - the whole subtree must not be wiped: stat err = %v", statErr)
+	}
+}
+
+// TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirectory
+// is a regression test for the os.RemoveAll → os.Remove fix in moveFastFile.
+// The copy+remove fallback (used when os.Rename fails across devices) must
+// use os.Remove, not os.RemoveAll - the same safety convention enforced for
+// DeleteL/DeleteR tasks (see TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory).
+//
+// We exercise the fallback via renameFunc, a package-level indirection added
+// so tests can force the Rename→fallback branch deterministically without
+// cross-device filesystem setup. The source starts as a non-empty directory
+// (TOCTOU: it was a regular file when FastCompare ran, then replaced by a
+// directory before the move executor ran). AtomicCopyFile rejects directories
+// (it stats the source and returns an error), so the executor returns an
+// error before ever reaching Remove - but crucially, with os.RemoveAll the
+// subtree would be silently wiped if the copy somehow succeeded; with
+// os.Remove it cannot. This test verifies the source survives intact when
+// the fallback copy fails.
+func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+
+	// Source is a non-empty directory - simulates the TOCTOU race where a
+	// file FastCompare saw as "old/f.txt" was replaced by a directory before
+	// the executor ran.
+	src := filepath.Join(root, "old")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "precious.txt"), []byte("must survive"), 0o644); err != nil {
+		t.Fatalf("write precious.txt: %v", err)
+	}
+
+	// Force the Rename→fallback path by making the rename always fail.
+	orig := renameFunc
+	renameFunc = func(_, _ string) error {
+		return fmt.Errorf("simulated cross-device rename failure")
+	}
+	defer func() { renameFunc = orig }()
+
+	err := applyFastTask(root, root, reconcile.FastTask{
+		Type: reconcile.MoveR, RelPath: "new/moved", OldRelPath: "old",
+	})
+	if err == nil {
+		t.Fatal("expected an error moving a directory source in the copy+remove fallback, got nil")
+	}
+
+	// The source contents must be intact - os.RemoveAll would wipe the whole
+	// subtree; os.Remove refuses (ENOTEMPTY) instead.
+	if _, statErr := os.Stat(filepath.Join(src, "precious.txt")); statErr != nil {
+		t.Fatalf("source directory contents were wiped on failed move fallback: stat err = %v", statErr)
 	}
 }
 
