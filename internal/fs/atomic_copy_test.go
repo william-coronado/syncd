@@ -134,3 +134,36 @@ func TestAtomicCopyFile_LeavesNoTempFilesBehind(t *testing.T) {
 		t.Fatalf("expected only dest.txt in dest dir, got %v", entries)
 	}
 }
+
+// TestAtomicCopyFile_CopiesFileWithNearMaxLengthName is a regression test
+// for a review finding (GPT-5.6 Sol): tempSiblingPath builds its staging
+// name by prepending "." and appending tempFileInfix+nanos+"-"+rand (~31
+// bytes worst case) to the FULL destination basename. Most filesystems
+// (ext4, APFS, NTFS/SMB) cap a single path component at 255 bytes. A
+// perfectly valid destination filename sitting near that limit therefore
+// produces a staging name that exceeds it, and AtomicCopyFile fails with
+// ENAMETOOLONG even though the destination name itself is completely legal.
+// 251 'a's + ".txt" = exactly 255 bytes - valid on its own, but the old
+// staging-name scheme could never create a temp file for it.
+func TestAtomicCopyFile_CopiesFileWithNearMaxLengthName(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+
+	longName := strings.Repeat("a", 251) + ".txt"
+	if len(longName) != 255 {
+		t.Fatalf("test fixture name is %d bytes, want exactly 255", len(longName))
+	}
+
+	srcPath := filepath.Join(srcDir, longName)
+	writeFile(t, srcPath, "content near the name length limit")
+	dstPath := filepath.Join(dstDir, longName)
+
+	if err := AtomicCopyFile(srcPath, dstPath); err != nil {
+		t.Fatalf("AtomicCopyFile returned error for a valid near-max-length filename: %v", err)
+	}
+
+	got, err := os.ReadFile(dstPath)
+	if err != nil || string(got) != "content near the name length limit" {
+		t.Fatalf("dest content = %q, err = %v", got, err)
+	}
+}

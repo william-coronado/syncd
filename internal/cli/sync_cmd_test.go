@@ -60,9 +60,9 @@ func TestRunSyncJob_HeldLockReturnsClearErrorNamingTheJob(t *testing.T) {
 	}
 	job := SyncJob{Name: "locked-job", Left: left, Right: right, Mode: string(reconcile.FastMirror)}
 
-	key, err := jobStateKey(job.Name, job.Left, job.Right)
+	key, err := rootPairKey(job.Left, job.Right)
 	if err != nil {
-		t.Fatalf("jobStateKey: %v", err)
+		t.Fatalf("rootPairKey: %v", err)
 	}
 	lockPath, err := syncLockPath(key)
 	if err != nil {
@@ -112,9 +112,9 @@ func TestRunSyncJobs_HeldLockDoesNotAbortOtherJobs(t *testing.T) {
 	lockedJob := SyncJob{Name: "locked-job", Left: leftA, Right: rightA, Mode: string(reconcile.FastMirror)}
 	freeJob := SyncJob{Name: "free-job", Left: leftB, Right: rightB, Mode: string(reconcile.FastMirror)}
 
-	lockedKey, err := jobStateKey(lockedJob.Name, lockedJob.Left, lockedJob.Right)
+	lockedKey, err := rootPairKey(lockedJob.Left, lockedJob.Right)
 	if err != nil {
-		t.Fatalf("jobStateKey: %v", err)
+		t.Fatalf("rootPairKey: %v", err)
 	}
 	lockPath, err := syncLockPath(lockedKey)
 	if err != nil {
@@ -452,5 +452,119 @@ func TestJobStateKey_DistinctForDifferentNamesSameRoots(t *testing.T) {
 	}
 	if keyA == keyB {
 		t.Fatalf("expected distinct state keys for different Names on the same root pair, both got %q", keyA)
+	}
+}
+
+// TestRootPairKey_SameForDifferentJobNamesSameRoots is a regression test for
+// a review finding (GPT-5.6 Sol): the lock path used to be derived from
+// jobStateKey, which folds in the job's display Name. Two differently-named
+// jobs pointed at the exact same (Left, Right) directories therefore got
+// different lock files and could run - and mutate the same files - at the
+// same time. State identity legitimately needs the Name (job_state and the
+// per-job hash manifest are namespaced per job on purpose - see
+// jobStateKey's doc comment), but filesystem exclusion must not: it has to
+// key on the physical root pair alone, independent of whatever either job
+// happens to be called.
+func TestRootPairKey_SameForDifferentJobNamesSameRoots(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+
+	keyA, err := rootPairKey(left, right)
+	if err != nil {
+		t.Fatalf("rootPairKey A: %v", err)
+	}
+	keyB, err := rootPairKey(left, right)
+	if err != nil {
+		t.Fatalf("rootPairKey B: %v", err)
+	}
+	if keyA != keyB {
+		t.Fatalf("expected the same lock key for the same root pair regardless of job name, got %q and %q", keyA, keyB)
+	}
+}
+
+// TestRootPairKey_SameForReversedRootOrder covers the other half of the same
+// finding: two jobs specifying the same two directories with Left/Right
+// swapped are still touching the same physical trees and must serialize
+// against each other too.
+func TestRootPairKey_SameForReversedRootOrder(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+
+	forward, err := rootPairKey(a, b)
+	if err != nil {
+		t.Fatalf("rootPairKey(a, b): %v", err)
+	}
+	reversed, err := rootPairKey(b, a)
+	if err != nil {
+		t.Fatalf("rootPairKey(b, a): %v", err)
+	}
+	if forward != reversed {
+		t.Fatalf("expected the same lock key regardless of root order, got %q and %q", forward, reversed)
+	}
+}
+
+// TestRootPairKey_DistinctForDifferentRootPairs is the sanity check: unlike
+// jobStateKey (which two differently-named jobs must NOT share even on the
+// same roots), rootPairKey must still distinguish genuinely different root
+// pairs, or every job in a batch would serialize against every other job.
+func TestRootPairKey_DistinctForDifferentRootPairs(t *testing.T) {
+	leftA, rightA := t.TempDir(), t.TempDir()
+	leftB, rightB := t.TempDir(), t.TempDir()
+
+	keyA, err := rootPairKey(leftA, rightA)
+	if err != nil {
+		t.Fatalf("rootPairKey A: %v", err)
+	}
+	keyB, err := rootPairKey(leftB, rightB)
+	if err != nil {
+		t.Fatalf("rootPairKey B: %v", err)
+	}
+	if keyA == keyB {
+		t.Fatalf("expected distinct lock keys for distinct root pairs, both got %q", keyA)
+	}
+}
+
+// TestRunSyncJob_LockIsSharedAcrossDifferentlyNamedJobsOnTheSameRoots is the
+// end-to-end half of the same finding: two SyncJobs with different Names but
+// identical Left/Right must not both be able to run at once. This drives
+// runSyncJob itself (not just rootPairKey in isolation) to prove the fix is
+// actually wired in, following the same held-lock pattern as
+// TestRunSyncJob_HeldLockReturnsClearErrorNamingTheJob.
+func TestRunSyncJob_LockIsSharedAcrossDifferentlyNamedJobsOnTheSameRoots(t *testing.T) {
+	withTempHome(t)
+
+	left, right := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(left, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+
+	// Simulates another job (different Name, same physical roots) already
+	// running: acquire the lock the way runSyncJob itself now must, via
+	// rootPairKey rather than jobStateKey.
+	key, err := rootPairKey(left, right)
+	if err != nil {
+		t.Fatalf("rootPairKey: %v", err)
+	}
+	lockPath, err := syncLockPath(key)
+	if err != nil {
+		t.Fatalf("syncLockPath: %v", err)
+	}
+	heldLock, err := runtime.AcquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	defer heldLock.Release()
+
+	jobsDBPath, err := defaultJobsDBPath()
+	if err != nil {
+		t.Fatalf("defaultJobsDBPath: %v", err)
+	}
+
+	job := SyncJob{Name: "a-different-name", Left: left, Right: right, Mode: string(reconcile.FastMirror)}
+	err = runSyncJob(context.Background(), job, syncRunOptions{Assume: true, JobsDBPath: jobsDBPath})
+	if err == nil {
+		t.Fatal("expected an error: a differently-named job on the same roots should be blocked by the held lock")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(right, "a.txt")); !os.IsNotExist(statErr) {
+		t.Error("job ran despite the same root pair's lock being held under a different job name")
 	}
 }

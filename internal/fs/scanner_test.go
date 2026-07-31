@@ -600,3 +600,80 @@ func TestScanTree_ContextCancellationAborts(t *testing.T) {
 		t.Fatal("expected an error when the context is already cancelled, got nil")
 	}
 }
+
+// TestRecordScannedFile_SecondEntryAtSameRelPathIsSkippedNotOverwritten is a
+// regression test for a review finding (GPT-5.6 Sol): NormalizeRelativePath
+// always folds to NFC, but Linux (and an SMB share backed by Linux/Samba)
+// stores filenames as literal byte sequences with no normalization - unlike
+// HFS+/APFS, which has traditionally forced NFD on write. Two physically
+// different on-disk names that are Unicode-equivalent under different
+// normalization forms (one NFC, one NFD) therefore both normalize to the
+// same relPath. The old code's bare `result.Files[relPath] = entry` let
+// whichever one the walk visited last silently overwrite the first,
+// permanently and silently disappearing that file from reconciliation - not
+// synced, not deleted, just gone. recordScannedFile must treat a second
+// entry at an already-occupied relPath as a collision: skip BOTH (there is
+// no way to tell which was "right"), not silently pick one.
+//
+// This is deliberately a unit test of recordScannedFile in isolation rather
+// than an end-to-end ScanTree test against two real files on disk: on this
+// dev machine's filesystem (APFS), writing an NFD-spelled name after an
+// NFC-spelled one at the same visual path collapses onto the SAME directory
+// entry (verified empirically - the second write overwrites the first
+// in-place, no duplicate entry is created), so the on-disk collision this
+// guards against cannot actually be reproduced here. Linux/ext4 and Samba
+// have no such collapsing behavior. Testing the collision-handling logic
+// directly is the reliable, platform-independent way to pin it.
+func TestRecordScannedFile_SecondEntryAtSameRelPathIsSkippedNotOverwritten(t *testing.T) {
+	result := ScanResult{
+		Files:   make(map[string]FileEntry),
+		Skipped: make(map[string]struct{}),
+	}
+
+	first := FileEntry{Path: "cafe.txt", AbsPath: "/root/cafe-nfc.txt", Size: 1}
+	second := FileEntry{Path: "cafe.txt", AbsPath: "/root/cafe-nfd.txt", Size: 2}
+
+	recordScannedFile(&result, "cafe.txt", first)
+	recordScannedFile(&result, "cafe.txt", second)
+
+	if _, exists := result.Files["cafe.txt"]; exists {
+		t.Fatalf("expected the colliding relPath to be excluded from Files entirely, got %+v", result.Files["cafe.txt"])
+	}
+	if _, skipped := result.Skipped["cafe.txt"]; !skipped {
+		t.Fatal("expected the colliding relPath to be recorded in Skipped")
+	}
+	found := false
+	for _, issue := range result.Issues {
+		if issue.Path == "cafe.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected an Issue recorded for the colliding relPath")
+	}
+}
+
+// TestRecordScannedFile_ThirdEntryAfterCollisionStaysSkipped guards the
+// off-by-one a naive "if already in Files, skip" implementation would get
+// wrong: once relPath has been deleted from Files after the SECOND colliding
+// entry, a THIRD entry at the same relPath would find Files empty again and
+// silently get written back in - un-skipping a collision that's still a
+// collision. The check must be against Skipped (which is never cleared),
+// not just Files.
+func TestRecordScannedFile_ThirdEntryAfterCollisionStaysSkipped(t *testing.T) {
+	result := ScanResult{
+		Files:   make(map[string]FileEntry),
+		Skipped: make(map[string]struct{}),
+	}
+
+	recordScannedFile(&result, "cafe.txt", FileEntry{Path: "cafe.txt", AbsPath: "/root/one"})
+	recordScannedFile(&result, "cafe.txt", FileEntry{Path: "cafe.txt", AbsPath: "/root/two"})
+	recordScannedFile(&result, "cafe.txt", FileEntry{Path: "cafe.txt", AbsPath: "/root/three"})
+
+	if _, exists := result.Files["cafe.txt"]; exists {
+		t.Fatalf("expected a third colliding entry to stay excluded from Files, got %+v", result.Files["cafe.txt"])
+	}
+	if _, skipped := result.Skipped["cafe.txt"]; !skipped {
+		t.Fatal("expected the colliding relPath to remain in Skipped")
+	}
+}

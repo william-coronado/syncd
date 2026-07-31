@@ -144,12 +144,17 @@ func runSyncJobs(ctx context.Context, jobs []SyncJob, ropts syncRunOptions) erro
 	return nil
 }
 
-// runSyncJob runs a single job under a per-job lock: the lock file is
-// derived from the job's state key (via syncLockPath), so two different jobs
-// can still run concurrently - only two runs of the SAME job (same name AND
-// same root pair) are serialized. This guards against two concurrent runs
-// racing on both jobs.db/the per-job hash manifest db and the files
-// themselves (`syncd sync` had no lock at all before this).
+// runSyncJob runs a single job under a per-root-pair lock: the lock file is
+// derived from rootPairKey (the physical Left/Right directories, independent
+// of the job's Name and insensitive to which side is "left"), so two truly
+// unrelated jobs (different root pairs) can still run concurrently, but any
+// two jobs that touch the same trees - whether they're literally the same
+// job run twice, differently-named jobs pointed at the same directories, or
+// the same two directories with Left/Right swapped - are serialized. This
+// guards against concurrent runs racing on the files themselves (`syncd
+// sync` had no lock at all before this; jobStateKey-derived locking still
+// let same-tree jobs under different names race - review finding, GPT-5.6
+// Sol).
 func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 	mode, err := parseFastMode(job.Mode)
 	if err != nil {
@@ -161,7 +166,11 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 		return fmt.Errorf("job %q: resolve state key: %w", job.Name, err)
 	}
 
-	lockPath, err := syncLockPath(stateKey)
+	lockKey, err := rootPairKey(job.Left, job.Right)
+	if err != nil {
+		return fmt.Errorf("job %q: resolve lock key: %w", job.Name, err)
+	}
+	lockPath, err := syncLockPath(lockKey)
 	if err != nil {
 		return fmt.Errorf("job %q: resolve lock path: %w", job.Name, err)
 	}
@@ -276,6 +285,34 @@ func jobStateKey(name, left, right string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(canonLeft + "\x00" + canonRight))
 	return name + "-" + hex.EncodeToString(sum[:6]), nil
+}
+
+// rootPairKey derives the filesystem-exclusion identity for a root pair:
+// canonicalized via filepath.Abs like jobStateKey, but deliberately NOT the
+// same value. jobStateKey folds in the job's display Name and is
+// order-sensitive (Left then Right) - correct for persisted state, since a
+// fast two-way job's job_state row and a --hash job's manifest baseline
+// legitimately depend on which side is "left". But two DIFFERENTLY-named
+// jobs pointed at the identical directories, or the same two directories
+// with Left/Right swapped, are still one physical pair of trees - locking on
+// jobStateKey let them acquire two different lock files and mutate the same
+// files concurrently (review finding, GPT-5.6 Sol). rootPairKey drops the
+// Name and sorts the canonicalized pair before hashing, so {A,B} and {B,A}
+// - under any job name - always produce the same key.
+func rootPairKey(left, right string) (string, error) {
+	canonLeft, err := filepath.Abs(left)
+	if err != nil {
+		return "", fmt.Errorf("resolve left root %q: %w", left, err)
+	}
+	canonRight, err := filepath.Abs(right)
+	if err != nil {
+		return "", fmt.Errorf("resolve right root %q: %w", right, err)
+	}
+	if canonLeft > canonRight {
+		canonLeft, canonRight = canonRight, canonLeft
+	}
+	sum := sha256.Sum256([]byte(canonLeft + "\x00" + canonRight))
+	return "roots-" + hex.EncodeToString(sum[:6]), nil
 }
 
 func parseFastMode(mode string) (reconcile.FastMode, error) {

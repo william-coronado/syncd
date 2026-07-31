@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"unicode/utf8"
 )
 
 func AtomicCopyFile(srcPath, dstPath string) error {
@@ -66,10 +67,39 @@ func AtomicCopyFile(srcPath, dstPath string) error {
 // "*.tmp" and this naming scheme once did.
 const tempFileInfix = ".tmp-"
 
+// tempSiblingMaxBase caps how much of dstPath's basename is embedded in the
+// staging filename. tempSiblingPath prepends "." (1 byte) and appends
+// tempFileInfix+nanos+"-"+rand (at most 5+19+1+5 = 30 bytes) to base; most
+// filesystems (ext4, APFS, NTFS/SMB) cap a single path component at 255
+// bytes. Without a cap here, a destination basename that is itself valid and
+// merely close to that limit produces a staging name that exceeds it, and
+// AtomicCopyFile fails with ENAMETOOLONG on a perfectly legal filename
+// (review finding, GPT-5.6 Sol). The staging name is transient - deleted or
+// renamed away before AtomicCopyFile returns - so truncating it costs
+// nothing: 160 leaves 1+160+30 = 191 bytes, comfortably under 255.
+const tempSiblingMaxBase = 160
+
 func tempSiblingPath(dstPath string) string {
 	dir := filepath.Dir(dstPath)
-	base := filepath.Base(dstPath)
+	base := truncateBytesAtRuneBoundary(filepath.Base(dstPath), tempSiblingMaxBase)
 	return filepath.Join(dir, fmt.Sprintf(".%s%s%d-%d", base, tempFileInfix, time.Now().UnixNano(), rand.Intn(100000)))
+}
+
+// truncateBytesAtRuneBoundary returns the longest prefix of s that is at
+// most maxBytes bytes long and ends on a valid UTF-8 rune boundary, so
+// truncating a multi-byte filename never produces invalid UTF-8.
+func truncateBytesAtRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	for len(s) > maxBytes {
+		_, size := utf8.DecodeLastRuneInString(s)
+		if size <= 0 {
+			break
+		}
+		s = s[:len(s)-size]
+	}
+	return s
 }
 
 // tempSiblingPathFunc is tempSiblingPath, indirected through a package-level

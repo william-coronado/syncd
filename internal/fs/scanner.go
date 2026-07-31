@@ -282,13 +282,13 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 				hash = h
 			}
 		}
-		result.Files[relPath] = FileEntry{
+		recordScannedFile(&result, relPath, FileEntry{
 			Path:    relPath,
 			AbsPath: path,
 			Size:    size,
 			Mtime:   mtime,
 			Hash:    hash,
-		}
+		})
 		scanned++
 		if progress != nil && time.Since(lastReport) >= progressReportInterval {
 			progress(scanned, false)
@@ -303,6 +303,42 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 		progress(scanned, true)
 	}
 	return result, nil
+}
+
+// recordScannedFile adds entry to result.Files at relPath, unless relPath is
+// already occupied (by a previous entry, or already flagged in
+// result.Skipped) - which can only happen when two physically different
+// on-disk names normalize (via NormalizeRelativePath) to the same relPath:
+// an NFC vs. NFD spelling of visually-identical text. Linux and Samba store
+// filenames as literal byte sequences with no normalization (unlike
+// HFS+/APFS, which has traditionally forced NFD on write), so both spellings
+// can genuinely coexist as distinct directory entries there. Silently
+// letting whichever the walk visits last win would make the other
+// permanently and silently invisible to reconciliation - never synced,
+// never deleted, just gone (review finding, GPT-5.6 Sol). Neither can be
+// distinguished by relPath alone (that's the whole problem), so both are
+// excluded via Issues/Skipped instead, the same as any other per-entry scan
+// problem.
+//
+// The check is against result.Skipped, not just result.Files: the first
+// collision deletes the earlier entry from Files, so a naive
+// "already in Files" check would miss a THIRD entry at the same relPath and
+// silently write it back in, un-skipping a collision that's still a
+// collision.
+func recordScannedFile(result *ScanResult, relPath string, entry FileEntry) {
+	if _, alreadySkipped := result.Skipped[relPath]; alreadySkipped {
+		return
+	}
+	if _, collided := result.Files[relPath]; collided {
+		delete(result.Files, relPath)
+		result.Issues = append(result.Issues, ScanIssue{
+			Path:   relPath,
+			Reason: "duplicate path after Unicode normalization (NFC/NFD collision)",
+		})
+		result.Skipped[relPath] = struct{}{}
+		return
+	}
+	result.Files[relPath] = entry
 }
 
 func hasSMBForbiddenChar(name string) bool {

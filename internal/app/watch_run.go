@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"syncd/internal/db"
@@ -38,17 +40,30 @@ type WatchConfig struct {
 // fsnotify watcher.
 type WatchLoopFunc func(ctx context.Context, p RobustParams, matcher *fs.IgnoreMatcher, cfg WatchConfig) error
 
-// RunWatch bootstraps and runs the always-on watch daemon: it rejects
-// overlapping roots (same rootsOverlap check SyncOnce uses - a destination
-// nested inside its own source, or vice versa, double-keys files across the
-// two scans and corrupts reconciliation, notably on the first deep scan;
-// review finding), resolves runtime paths, builds the logger, acquires the
-// daemon lock (held for the whole process lifetime - only one watcher may
-// run per local root at a time), verifies the remote canary once up front
-// (the loop re-checks it on every cycle thereafter), opens the manifest db,
-// loads the ignore matcher, and then hands off to runLoop (watch.Run in
-// production), which blocks until ctx is cancelled.
+// RunWatch bootstraps and runs the always-on watch daemon: it resolves both
+// roots' symlinks once up front and uses the resolved paths for everything
+// downstream (see resolveWatchRoot - review finding), rejects overlapping
+// roots (same rootsOverlap check SyncOnce uses - a destination nested inside
+// its own source, or vice versa, double-keys files across the two scans and
+// corrupts reconciliation, notably on the first deep scan; review finding),
+// resolves runtime paths, builds the logger, acquires the daemon lock (held
+// for the whole process lifetime - only one watcher may run per local root
+// at a time), verifies the remote canary once up front (the loop re-checks
+// it on every cycle thereafter), opens the manifest db, loads the ignore
+// matcher, and then hands off to runLoop (watch.Run in production), which
+// blocks until ctx is cancelled.
 func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error {
+	resolvedLocal, err := resolveWatchRoot("local", cfg.LocalRoot)
+	if err != nil {
+		return err
+	}
+	resolvedRemote, err := resolveWatchRoot("remote", cfg.RemoteRoot)
+	if err != nil {
+		return err
+	}
+	cfg.LocalRoot = resolvedLocal
+	cfg.RemoteRoot = resolvedRemote
+
 	overlap, err := rootsOverlap(cfg.LocalRoot, cfg.RemoteRoot)
 	if err != nil {
 		return fmt.Errorf("resolve watch roots: %w", err)
@@ -107,4 +122,33 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 	}
 
 	return runLoop(ctx, p, matcher, cfg)
+}
+
+// resolveWatchRoot resolves root's symlinks (filepath.Abs, used to resolve
+// --local/--remote before RunWatch is ever called, does not resolve
+// symlinks) and confirms the result is a directory. NewWatcher
+// (internal/watch/watcher.go) already does this same resolution for its own
+// fsnotify tree, since filepath.WalkDir lstats its root argument and never
+// follows a symlink there - a walk over an unresolved symlinked root visits
+// nothing. That resolution was local to NewWatcher alone: RobustParams (and
+// every ScanTree-driven poll/deep-scan cycle built from it) still carried
+// the raw root, so a full scan over an unresolved symlinked root also saw
+// that side as completely empty - and once a manifest baseline existed,
+// BuildPlan read every already-synced file on the OTHER side as deleted and
+// removed it (review finding, GPT-5.6 Sol). Resolving once here, before
+// RobustParams is ever built, means every downstream consumer (the ignore
+// matcher, the scanner, the watcher) agrees on the same canonical path.
+func resolveWatchRoot(label, root string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s watch root %s: %w", label, root, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat %s watch root %s: %w", label, root, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s watch root is not a directory: %s", label, root)
+	}
+	return resolved, nil
 }
