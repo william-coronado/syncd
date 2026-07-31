@@ -57,6 +57,9 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 		return Result{Action: action, Error: fmt.Errorf("upload conflict copy to remote: %w", err)}
 	}
 
+	// Capture once so both manifest updates share the same LastSynced
+	// timestamp - they represent one logical operation.
+	now := time.Now().Unix()
 	return Result{
 		Action: action,
 		Updates: []ManifestUpdate{
@@ -67,7 +70,7 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 					Size:       remote.Size,
 					Mtime:      remote.Mtime,
 					Hash:       remote.Hash,
-					LastSynced: time.Now().Unix(),
+					LastSynced: now,
 				},
 			},
 			{
@@ -77,7 +80,7 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 					Size:       local.Size,
 					Mtime:      local.Mtime,
 					Hash:       local.Hash,
-					LastSynced: time.Now().Unix(),
+					LastSynced: now,
 				},
 			},
 		},

@@ -248,11 +248,18 @@ func (w *Watcher) handleEvent(ev fsnotify.Event, pending map[string]struct{}) {
 	}
 
 	isDir := false
-	info, statErr := os.Stat(ev.Name)
+	info, statErr := os.Lstat(ev.Name)
 	if statErr == nil {
 		isDir = info.IsDir()
 	}
-	// A removed path can't be stat'd; best-effort treat as non-dir.
+	// A removed path can't be lstat'd; best-effort treat as non-dir.
+	// Lstat (not Stat) is deliberate: a symlink-to-directory must not be
+	// treated as a real directory. os.Stat follows symlinks and would make
+	// isDir=true for a symlink-to-dir, causing fsw.Add to watch the symlink
+	// target (potentially outside the sync root) and the ignore-matcher to
+	// receive isDir=true, both of which are incorrect for a symlink.
+	// The scanner (ScanTree/ScanPaths) also uses Lstat and rejects symlinks
+	// explicitly, so this keeps the two consistent.
 
 	if w.matcher.Match(rel, isDir) {
 		return

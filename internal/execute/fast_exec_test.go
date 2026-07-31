@@ -2,6 +2,7 @@ package execute
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -57,6 +58,75 @@ func TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory(t *
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "unexpected.txt")); statErr != nil {
 		t.Fatalf("expected unexpected.txt to survive - the whole subtree must not be wiped: stat err = %v", statErr)
+	}
+}
+
+// TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirectory
+// is a regression test for the os.RemoveAll → os.Remove fix in moveFastFile.
+// The copy+remove fallback (used when os.Rename fails across devices) must
+// use os.Remove, not os.RemoveAll - the same safety convention enforced for
+// DeleteL/DeleteR tasks (see TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory).
+//
+// The real race this guards against: src is a regular file when FastCompare
+// scans it, but gets replaced by a non-empty directory in the window between
+// the fallback's copy succeeding and moveFastFile's os.Remove(src) call. A
+// src that is already a directory at the top of moveFastFile can't reach
+// Remove at all - AtomicCopyFile's own directory guard rejects it first - so
+// this test uses copyFunc, a package-level indirection, to simulate the copy
+// succeeding and *then* src being swapped for a directory, landing exactly in
+// the window os.Remove (not os.RemoveAll) protects.
+func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+
+	// Source starts as the regular file FastCompare actually saw.
+	src := filepath.Join(root, "old")
+	if err := os.WriteFile(src, []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	// Force the Rename→fallback path by making the rename always fail.
+	origRename := renameFunc
+	renameFunc = func(_, _ string) error {
+		return fmt.Errorf("simulated cross-device rename failure")
+	}
+	defer func() { renameFunc = origRename }()
+
+	// Simulate the copy succeeding, then the TOCTOU race replacing src with a
+	// non-empty directory before moveFastFile's os.Remove(src) runs.
+	origCopy := copyFunc
+	copyFunc = func(srcPath, dstPath string) error {
+		if err := os.WriteFile(dstPath, []byte("hi"), 0o644); err != nil {
+			return err
+		}
+		if err := os.Remove(srcPath); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(srcPath, 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(srcPath, "precious.txt"), []byte("must survive"), 0o644)
+	}
+	defer func() { copyFunc = origCopy }()
+
+	err := applyFastTask(root, root, reconcile.FastTask{
+		Type: reconcile.MoveR, RelPath: "new/moved", OldRelPath: "old",
+	})
+	if err == nil {
+		t.Fatal("expected an error removing the non-empty directory left behind by the TOCTOU race, got nil")
+	}
+
+	// The replaced source directory's contents must be intact - os.RemoveAll
+	// would wipe the whole subtree; os.Remove refuses (ENOTEMPTY) instead.
+	if _, statErr := os.Stat(filepath.Join(src, "precious.txt")); statErr != nil {
+		t.Fatalf("source directory contents were wiped on failed move fallback: stat err = %v", statErr)
+	}
+
+	// The destination should hold the content the (simulated) copy step
+	// wrote before the race window - a duplicate, not data loss, which is
+	// the expected outcome once the copy itself has already succeeded.
+	dst := filepath.Join(root, "new", "moved")
+	if b, readErr := os.ReadFile(dst); readErr != nil || string(b) != "hi" {
+		t.Fatalf("destination should contain the copied content: content=%q err=%v", b, readErr)
 	}
 }
 
