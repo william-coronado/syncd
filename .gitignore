@@ -6,3 +6,4 @@
 *.log
 *.log.old
 .DS_Store
+.mcp.json
