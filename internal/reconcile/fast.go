@@ -215,19 +215,33 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, sk
 
 			if lOk && !rOk {
 				if oldPath, ok := leftMissingSigs[fastGetSig(lState)]; ok {
-					tasks = append(tasks, FastTask{Type: MoveR, RelPath: p, OldRelPath: oldPath})
-					newState[p] = lState
-					delete(leftMissingSigs, fastGetSig(lState))
-					processedMoves[oldPath] = true
-					processedMoves[p] = true
+					// MoveR renames right's oldPath to p, so oldPath must
+					// still actually be there to rename. If right has
+					// independently deleted or renamed it elsewhere since
+					// prev, oldPath is gone and the rename can only fail -
+					// don't mark this as a move at all; let p fall through
+					// to pass 2 and copy in as a new file instead (review
+					// finding: a guaranteed-failing MoveR aborted the whole
+					// RunFastTasks batch, including unrelated tasks).
+					if _, oldExistsOnRight := right[oldPath]; oldExistsOnRight {
+						tasks = append(tasks, FastTask{Type: MoveR, RelPath: p, OldRelPath: oldPath})
+						newState[p] = lState
+						delete(leftMissingSigs, fastGetSig(lState))
+						processedMoves[oldPath] = true
+						processedMoves[p] = true
+					}
 				}
 			} else if rOk && !lOk {
 				if oldPath, ok := rightMissingSigs[fastGetSig(rState)]; ok {
-					tasks = append(tasks, FastTask{Type: MoveL, RelPath: p, OldRelPath: oldPath})
-					newState[p] = rState
-					delete(rightMissingSigs, fastGetSig(rState))
-					processedMoves[oldPath] = true
-					processedMoves[p] = true
+					// Symmetric guard for MoveL: oldPath must still exist on
+					// left to rename from.
+					if _, oldExistsOnLeft := left[oldPath]; oldExistsOnLeft {
+						tasks = append(tasks, FastTask{Type: MoveL, RelPath: p, OldRelPath: oldPath})
+						newState[p] = rState
+						delete(rightMissingSigs, fastGetSig(rState))
+						processedMoves[oldPath] = true
+						processedMoves[p] = true
+					}
 				}
 			}
 		}

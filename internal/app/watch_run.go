@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"syncd/internal/db"
@@ -37,14 +38,25 @@ type WatchConfig struct {
 // fsnotify watcher.
 type WatchLoopFunc func(ctx context.Context, p RobustParams, matcher *fs.IgnoreMatcher, cfg WatchConfig) error
 
-// RunWatch bootstraps and runs the always-on watch daemon: it resolves
-// runtime paths, builds the logger, acquires the daemon lock (held for the
-// whole process lifetime - only one watcher may run per local root at a
-// time), verifies the remote canary once up front (the loop re-checks it on
-// every cycle thereafter), opens the manifest db, loads the ignore matcher,
-// and then hands off to runLoop (watch.Run in production), which blocks
-// until ctx is cancelled.
+// RunWatch bootstraps and runs the always-on watch daemon: it rejects
+// overlapping roots (same rootsOverlap check SyncOnce uses - a destination
+// nested inside its own source, or vice versa, double-keys files across the
+// two scans and corrupts reconciliation, notably on the first deep scan;
+// review finding), resolves runtime paths, builds the logger, acquires the
+// daemon lock (held for the whole process lifetime - only one watcher may
+// run per local root at a time), verifies the remote canary once up front
+// (the loop re-checks it on every cycle thereafter), opens the manifest db,
+// loads the ignore matcher, and then hands off to runLoop (watch.Run in
+// production), which blocks until ctx is cancelled.
 func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error {
+	overlap, err := rootsOverlap(cfg.LocalRoot, cfg.RemoteRoot)
+	if err != nil {
+		return fmt.Errorf("resolve watch roots: %w", err)
+	}
+	if overlap {
+		return fmt.Errorf("local and remote watch roots must not be the same directory or nested inside one another: %s, %s", cfg.LocalRoot, cfg.RemoteRoot)
+	}
+
 	paths, err := runtime.ResolvePaths(runtime.Config{
 		LocalRoot:  cfg.LocalRoot,
 		RemoteRoot: cfg.RemoteRoot,

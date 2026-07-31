@@ -317,6 +317,72 @@ func TestFastTwoWayMoves(t *testing.T) {
 	assertHasTask(t, res, FastTask{Type: MoveR, RelPath: "fileC.txt", OldRelPath: "fileA.txt"})
 }
 
+// assertNoTaskReferencesOldPath fails if any task in res.Tasks (move or
+// otherwise) has an OldRelPath equal to oldPath - i.e. no task depends on
+// oldPath still existing wherever it's about to be renamed from.
+func assertNoTaskReferencesOldPath(t *testing.T, res FastResult, oldPath string) {
+	t.Helper()
+	for _, got := range res.Tasks {
+		if got.OldRelPath == oldPath {
+			t.Errorf("expected no task referencing OldRelPath %q, got %+v", oldPath, got)
+		}
+	}
+}
+
+// TestFastTwoWayMoveVsDelete_FallsBackToCopyInsteadOfUnexecutableMove is a
+// regression test for a review finding: prev has "f" on both sides. Left
+// renames f->g; right independently deletes f. The old code matched g's
+// signature against leftMissingSigs["f"] with no check that right still HAS
+// f, and emitted MoveR(g, oldPath=f) unconditionally. moveFastFile then tries
+// os.Rename(right/f, right/g), which fails - right already deleted f - and
+// RunFastTasks aborts the ENTIRE batch on that single error, so unrelated
+// tasks in the same run never execute either.
+//
+// Once right has genuinely lost f (not renamed, actually gone), there is
+// nothing on the right side to rename - the only executable outcome is
+// copying left's g to right as a new file, same as any other lChanged path
+// with no counterpart. No move task should be emitted here at all.
+func TestFastTwoWayMoveVsDelete_FallsBackToCopyInsteadOfUnexecutableMove(t *testing.T) {
+	prev := map[string]db.JobFileState{
+		"f": {Path: "f", Size: 10, Mtime: 5},
+	}
+	left := map[string]db.JobFileState{
+		"g": {Path: "g", Size: 10, Mtime: 5}, // left renamed f -> g
+	}
+	right := map[string]db.JobFileState{} // right deleted f
+
+	res := FastCompare(FastTwoWay, left, right, prev, SkipSet{})
+
+	assertNoTaskReferencesOldPath(t, res, "f")
+	assertHasTask(t, res, FastTask{Type: CopyL2R, RelPath: "g", Size: 10})
+}
+
+// TestFastTwoWayMoveVsMove_FallsBackToCopyInsteadOfUnexecutableMoves is a
+// regression test for the same class of bug: prev has "f" on both sides.
+// Left renames f->g; right independently renames f->h (a different name).
+// The old code emitted BOTH MoveR(g, oldPath=f) - which fails because right
+// no longer has f, it has h - AND MoveL(h, oldPath=f) - which fails because
+// left no longer has f, it has g. Two guaranteed-failing tasks, aborting the
+// whole batch. The only executable outcome is copying each side's new name
+// to the other side.
+func TestFastTwoWayMoveVsMove_FallsBackToCopyInsteadOfUnexecutableMoves(t *testing.T) {
+	prev := map[string]db.JobFileState{
+		"f": {Path: "f", Size: 10, Mtime: 5},
+	}
+	left := map[string]db.JobFileState{
+		"g": {Path: "g", Size: 10, Mtime: 5}, // left renamed f -> g
+	}
+	right := map[string]db.JobFileState{
+		"h": {Path: "h", Size: 10, Mtime: 5}, // right renamed f -> h
+	}
+
+	res := FastCompare(FastTwoWay, left, right, prev, SkipSet{})
+
+	assertNoTaskReferencesOldPath(t, res, "f")
+	assertHasTask(t, res, FastTask{Type: CopyL2R, RelPath: "g", Size: 10})
+	assertHasTask(t, res, FastTask{Type: CopyR2L, RelPath: "h", Size: 10})
+}
+
 // Ported from TestCompareTwoWayConflict: both sides modified fileA.txt;
 // left is newer -> expect a single CopyL2R task, newer wins.
 func TestFastTwoWayConflict(t *testing.T) {

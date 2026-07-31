@@ -46,3 +46,152 @@ unreachable by a newly-unreadable ancestor fails its own `Lstat` and gets an
 exact `Skipped` entry directly. The unreadable-directory case is caught by the
 next full `RunRobustOnce` cycle. Worth a comment if anyone ever gives `ScanPaths`
 directory-recursion.
+
+Items #11-#23 below are from a second full-codebase review pass (2026-07-31,
+Codex + Gemini 3.6, consolidated together). #1 and #2 from that pass (the
+`watch` command's missing root-overlap check, and `FastCompare` emitting
+move tasks that fail when the "from" side no longer has the file) were real
+correctness bugs and were fixed directly rather than deferred — see git
+history around that date. What follows are the remaining items, judged safe
+to defer.
+
+### 11. `runConflict` leaves an orphaned local conflict file when the final remote-side upload fails
+
+`internal/execute/conflict.go` — the local canonical is renamed aside, the
+remote version is downloaded into the canonical slot, and *that* download
+failure already rolls back (see the comment at the call site — a prior review
+fix). But the final step, uploading the preserved local copy to
+`remoteConflictPath`, has no equivalent rollback: on failure this returns an
+error with no `Updates`, leaving `localConflictPath` (the preserved local
+original) present but with no manifest row recording it as a conflict copy.
+The next scan reads it as a brand-new local file and uploads it as a regular
+action — the outcome is eventually correct, just via an unintended path
+rather than the deliberate conflict-copy path. Deferred because it
+self-heals and the eventual on-disk state is the same either way; revisit if
+a user ever reports a `_conflict_` marker file "reappearing" as a plain
+upload.
+
+### 12. Watcher drops the in-flight `pending` batch on `Close()`
+
+`internal/watch/watcher.go` — `Close()` makes `run()` take the `case
+<-w.done` branch and return immediately, before the debounce timer would
+have flushed `pending`. Any paths accumulated since the last flush (up to one
+`debounce` window, 500ms by default) are silently dropped on graceful
+shutdown. Not a correctness bug: the next deep scan or remote poll always
+catches whatever was missed. Worth fixing only if fast-and-clean shutdown
+(SIGTERM immediately followed by expecting the change to be synced) ever
+becomes a real workflow.
+
+### 13. Unbuffered `w.batches` can block the watcher's event-reader goroutine
+
+`internal/watch/watcher.go` + `internal/watch/loop.go` — `w.batches` is
+unbuffered, and `watch.Run`'s single-consumer `select` holds a mutex across a
+full reconcile cycle before it goes back to receiving. A long reconcile (many
+seconds over SMB) means the next `w.batches <-` send blocks `run()`, so
+fsnotify events stop being read for that whole window and the OS event queue
+can overflow. The deep scan is the backstop for anything dropped this way.
+Deferred: bounding this needs either a buffered channel with an explicit
+overflow policy or a separate drain goroutine, and it's only been a
+theoretical gap so far — revisit if inotify/kqueue overflow ever shows up in
+the logs (see the existing fsnotify-errors-dropped gotcha above, which is the
+same class of "we'd only find out from the logs" problem).
+
+### 14. `AtomicCopyFile` does not fsync the destination directory after rename
+
+`internal/fs/atomic_copy.go` — the temp file's data is fsync'd before
+`os.Rename`, which is correct for file content, but the parent directory
+entry itself is never fsync'd after the rename. On a crash immediately after
+`AtomicCopyFile` returns, the rename may not be durable even though the
+file's bytes are (the classic fsync-rename gap, notably on ext4). Deferred:
+the real target here is SMB (see "Running/verifying against SMB" above),
+where the server-side filesystem's durability semantics are out of syncd's
+control anyway, and a crash in that exact window is a narrow target. Revisit
+if syncd ever writes to a local ext4 destination where this matters more.
+
+### 15. Debounce timer has no max-latency cap
+
+`internal/watch/watcher.go` — each event resets the debounce timer, so a
+continuously-active tree (e.g. a build loop) can keep resetting it
+indefinitely and never flush a batch. `--remote-poll`/`--deep-scan` still
+catch everything eventually; the only cost is losing the "near-instant"
+latency benefit of the fsnotify path during sustained activity. Would need a
+force-flush deadline (e.g. "batch every N events or T seconds, whichever
+first") to bound it.
+
+### 16. `RunActions` reports `ctx.Err()` as failure even when every action succeeded
+
+`internal/execute/worker_pool.go` — `RunActions` returns `ctx.Err()` when
+`firstErr` is nil. A SIGINT landing in the window between the last action
+finishing and `RunActions` returning makes a fully-successful run get logged
+as "did not complete" / "reconcile cycle failed". Cosmetic (the sync itself
+completed correctly; only the log line is wrong) but worth fixing if it ever
+confuses on-call triage of Ctrl-C'd runs.
+
+### 17. Negating a directory under an ignored tree doesn't re-include its contents
+
+`internal/fs/ignore.go` — a `dirOnly` negation rule is skipped for file
+paths, so `build/` + `!build/keep/` still ignores `build/keep/x.txt` (gitignore
+would re-include it). Deferred: no current `.syncdignore` in the wild
+requires this pattern, and matching full gitignore precedence semantics for
+directory re-inclusion is nontrivially more code for a case nobody's hit yet.
+
+### 18. `cobra.CheckErr` exits directly from `initSyncConfig`
+
+`internal/cli/config.go` — calls `os.Exit(1)` via `cobra.CheckErr` from a
+function with an `error` return, instead of returning the error like
+everywhere else in the CLI layer. Only reachable if `$HOME` can't be
+resolved, which is already fatal for the process either way — so the
+externally-visible behavior is the same, just via a different code path than
+the rest of the codebase's convention. Low priority; fix opportunistically
+next time this function is touched.
+
+### 19. `findAvailableConflictPath` is an unbounded loop
+
+`internal/execute/conflict.go` — no upper bound on `attempt`, unlike the
+bounded retry in `fs.createTempSibling` (`maxTempSiblingAttempts`). Would only
+loop indefinitely given a pathological pile of pre-existing
+`*_conflict_<ts>-N` files for one path within one wall-clock second — not
+reachable through normal use. Bound it to match `createTempSibling`'s pattern
+if it's ever touched for another reason.
+
+### 20. `ScanPaths` / `FileBLAKE3` ignore context cancellation mid-read
+
+`internal/fs/scan_paths.go` (no `ctx` parameter at all) and
+`internal/fs/hash.go` (`io.Copy` inside `FileBLAKE3` takes no `ctx`) — hashing
+a large file can't be interrupted by cancelling the sync cycle; a cancelled
+scoped reconcile can stall for the full read time of a multi-GB file already
+in flight. Bounded by the file's read speed, not unbounded, and reconciles
+are scoped (fsnotify-triggered) or already run to completion by design
+elsewhere — revisit if large-file cancellation latency ever becomes a
+complaint.
+
+### 21. `Logger.Close()` isn't mutex-protected and doesn't nil out `l.file`
+
+`internal/runtime/logging.go` — `Close()` closes `l.file` without taking
+`l.mu` or clearing the field. Not currently reachable: it's always called
+via `defer` in the one goroutine that owns the logger, after all workers have
+joined, so there's no concurrent `write()` to race with today, and it's only
+ever called once. Latent, not live — fix if `Logger` ever gets a second
+caller of `Close`.
+
+### 22. Confirm-prompt summaries enumerate a fixed list of task types
+
+`internal/app/sync_once.go` (`fastSummary`/`robustSummary`) — both iterate a
+hardcoded slice of task types rather than the actual keys present. A new
+action type added to either reconciler would execute without ever appearing
+in the safety-gate summary the user approves before `--yes` is skipped.
+Currently exhaustive (matches every type both reconcilers emit today); would
+need to be revisited the next time a new task/action type is added, not
+before.
+
+### 23. `ResolvePaths`' default db/lock naming doesn't canonicalize roots
+
+`internal/runtime/paths.go` — `defaultManifestDBName`/`defaultLockName` hash
+`localRoot + "\x00" + remoteRoot` as given, without `filepath.Clean`. The CLI
+always passes `filepath.Abs`-resolved roots first, so this isn't reachable
+through `syncd sync`/`syncd watch` today, but a direct library caller passing
+a trailing slash or relative form would silently get a different db/lock
+path for what is really the same root pair. `jobStateKey`
+(`internal/cli/sync_cmd.go`) already does the `filepath.Abs` canonicalization
+this needs — same fix, if the library contract ever gets a caller other than
+the CLI.
