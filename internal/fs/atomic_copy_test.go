@@ -63,6 +63,52 @@ func TestAtomicCopyFile_MissingSourceLeavesDestUntouched(t *testing.T) {
 	}
 }
 
+// TestAtomicCopyFile_RetriesOnTempFileNameCollision is a regression test for
+// a review finding (Gemini 3.6): the temp staging file was opened with
+// O_CREATE|O_TRUNC, so if the generated name happened to already exist (a
+// stale temp file left behind by a crashed prior run, or - vanishingly
+// rarely - a genuine timestamp/PRNG coincidence with a concurrent copy),
+// the old code would silently truncate and overwrite it instead of picking
+// a different name. tempSiblingPathFunc is overridden here (mirroring
+// conflict.go's timeNow seam) to force a deterministic collision on the
+// first attempt.
+func TestAtomicCopyFile_RetriesOnTempFileNameCollision(t *testing.T) {
+	srcDir, dstDir := t.TempDir(), t.TempDir()
+	srcPath := filepath.Join(srcDir, "source.txt")
+	writeFile(t, srcPath, "new content")
+	dstPath := filepath.Join(dstDir, "dest.txt")
+
+	collidingPath := filepath.Join(dstDir, ".dest.txt.tmp-collide")
+	writeFile(t, collidingPath, "unrelated stale content - must survive")
+
+	orig := tempSiblingPathFunc
+	calls := 0
+	tempSiblingPathFunc = func(dst string) string {
+		calls++
+		if calls == 1 {
+			return collidingPath
+		}
+		return orig(dst)
+	}
+	defer func() { tempSiblingPathFunc = orig }()
+
+	if err := AtomicCopyFile(srcPath, dstPath); err != nil {
+		t.Fatalf("AtomicCopyFile returned error: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("expected AtomicCopyFile to retry with a new name after a collision, got %d attempt(s)", calls)
+	}
+
+	got, err := os.ReadFile(dstPath)
+	if err != nil || string(got) != "new content" {
+		t.Fatalf("dest content = %q, err = %v, want %q", got, err, "new content")
+	}
+	staleContent, err := os.ReadFile(collidingPath)
+	if err != nil || string(staleContent) != "unrelated stale content - must survive" {
+		t.Fatalf("pre-existing colliding temp file was clobbered: err=%v content=%q", err, staleContent)
+	}
+}
+
 func TestAtomicCopyFile_LeavesNoTempFilesBehind(t *testing.T) {
 	srcDir := t.TempDir()
 	dstDir := t.TempDir()

@@ -27,8 +27,7 @@ func AtomicCopyFile(srcPath, dstPath string) error {
 	}
 	defer src.Close()
 
-	tmpPath := tempSiblingPath(dstPath)
-	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, srcInfo.Mode().Perm())
+	tmp, tmpPath, err := createTempSibling(dstPath, srcInfo.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
@@ -71,4 +70,39 @@ func tempSiblingPath(dstPath string) string {
 	dir := filepath.Dir(dstPath)
 	base := filepath.Base(dstPath)
 	return filepath.Join(dir, fmt.Sprintf(".%s%s%d-%d", base, tempFileInfix, time.Now().UnixNano(), rand.Intn(100000)))
+}
+
+// tempSiblingPathFunc is tempSiblingPath, indirected through a package-level
+// variable so tests can force two attempts to collide on the same name
+// deterministically (same pattern as execute/conflict.go's timeNow seam),
+// without depending on an actual nanosecond-timestamp/PRNG coincidence.
+var tempSiblingPathFunc = tempSiblingPath
+
+// maxTempSiblingAttempts bounds createTempSibling's retry loop. A genuine
+// collision is astronomically unlikely (the name embeds a nanosecond
+// timestamp and a random draw) - this exists only so a persistently broken
+// destination directory (e.g. read-only) fails with a clear error instead
+// of retrying forever.
+const maxTempSiblingAttempts = 5
+
+// createTempSibling opens a fresh temp staging file next to dstPath,
+// retrying with a new generated name if the chosen one already exists
+// (os.ErrExist) rather than silently truncating whatever is already there -
+// O_TRUNC alone would clobber a stale leftover temp file from a crashed
+// prior run, or the vanishingly rare genuine name collision, instead of
+// failing or picking a different name (review finding, Gemini 3.6).
+func createTempSibling(dstPath string, perm os.FileMode) (*os.File, string, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxTempSiblingAttempts; attempt++ {
+		tmpPath := tempSiblingPathFunc(dstPath)
+		tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+		if err == nil {
+			return tmp, tmpPath, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+		lastErr = err
+	}
+	return nil, "", fmt.Errorf("no available temp filename after %d attempts: %w", maxTempSiblingAttempts, lastErr)
 }

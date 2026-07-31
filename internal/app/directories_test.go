@@ -296,3 +296,66 @@ func TestCleanupEmptiedDirs_RemovesOnlyDirsEmptiedByDeletes(t *testing.T) {
 		t.Fatalf("expected untouched pre-existing empty dir to be left alone, stat err = %v", err)
 	}
 }
+
+// TestCleanupEmptiedDirs_CascadesUpMultipleAncestorLevels is a regression
+// test for a review finding (Gemini 3.6): cleanupEmptiedDirs only ever
+// computed path.Dir(relPath) - the deleted file's IMMEDIATE parent - and
+// never re-examined that parent's own ancestors. Deleting
+// "sub/nested/emptied/gone.txt" correctly removes "sub/nested/emptied", but
+// that leaves "sub/nested" (now itself empty) and "sub" behind forever:
+// reconcileDirectories only ever compares live scans against the baseline,
+// and both are already present-on-both-sides-and-baselined, so neither
+// orphan is ever revisited. Every ancestor up to (not including) the sync
+// root must be considered, deepest first, so the emptiness cascades all the
+// way up in one pass.
+func TestCleanupEmptiedDirs_CascadesUpMultipleAncestorLevels(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(localRoot, "sub", "nested", "emptied"), 0o755); err != nil {
+		t.Fatalf("mkdir local sub/nested/emptied: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(remoteRoot, "sub", "nested", "emptied"), 0o755); err != nil {
+		t.Fatalf("mkdir remote sub/nested/emptied: %v", err)
+	}
+
+	deleted := []string{"sub/nested/emptied/gone.txt"}
+	cleanupEmptiedDirs(localRoot, remoteRoot, deleted)
+
+	for _, root := range []string{localRoot, remoteRoot} {
+		if _, err := os.Stat(filepath.Join(root, "sub")); !os.IsNotExist(err) {
+			t.Errorf("expected %q's 'sub' ancestor chain fully cleaned up, stat err = %v", root, err)
+		}
+	}
+}
+
+// TestCleanupEmptiedDirs_StopsAtFirstNonEmptyAncestor ensures the cascade
+// isn't unconditional: an ancestor that still holds an unrelated sibling
+// must stop the walk right there, leaving everything above it (which was
+// never actually emptied) untouched.
+func TestCleanupEmptiedDirs_StopsAtFirstNonEmptyAncestor(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(localRoot, "sub", "nested", "emptied"), 0o755); err != nil {
+		t.Fatalf("mkdir local sub/nested/emptied: %v", err)
+	}
+	// "sub" has an unrelated sibling directory untouched by this run's
+	// deletes - the cascade must stop before removing "sub" itself.
+	if err := os.MkdirAll(filepath.Join(localRoot, "sub", "sibling"), 0o755); err != nil {
+		t.Fatalf("mkdir local sub/sibling: %v", err)
+	}
+
+	deleted := []string{"sub/nested/emptied/gone.txt"}
+	cleanupEmptiedDirs(localRoot, remoteRoot, deleted)
+
+	if _, err := os.Stat(filepath.Join(localRoot, "sub", "nested")); !os.IsNotExist(err) {
+		t.Errorf("expected 'sub/nested' removed (it was genuinely emptied), stat err = %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(localRoot, "sub")); err != nil || !info.IsDir() {
+		t.Errorf("expected 'sub' to survive - it still holds 'sibling', stat err = %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(localRoot, "sub", "sibling")); err != nil || !info.IsDir() {
+		t.Errorf("expected 'sub/sibling' untouched, stat err = %v", err)
+	}
+}

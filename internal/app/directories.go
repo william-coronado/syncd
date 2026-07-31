@@ -123,20 +123,34 @@ func removeEmptyDir(dir string) error {
 }
 
 // cleanupEmptiedDirs removes directories, on both local and remote, that
-// held one of this run's deleted files and are now empty on that side. A
-// directory that was already empty before this run - and that this run
-// didn't touch - is never considered, so pre-existing empty directories the
-// user keeps intentionally are left alone.
+// held one of this run's deleted files (or held a directory this run
+// emptied out) and are now empty on that side. A directory that was already
+// empty before this run - and that this run didn't touch - is never
+// considered, so pre-existing empty directories the user keeps
+// intentionally are left alone.
+//
+// Every ancestor of each deleted path is a candidate, not just its immediate
+// parent: removing "sub/nested/emptied" (itself emptied by a delete) can in
+// turn empty "sub/nested", and so on up the tree. Candidates are visited
+// deepest-first (same reasoning as reconcileDirectories' nested-deletion
+// ordering) so a now-empty parent is reconsidered only after its child is
+// actually gone; removeIfEmpty's own os.ReadDir check stops the cascade the
+// moment it hits an ancestor that still holds something else (review
+// finding, Gemini 3.6).
 func cleanupEmptiedDirs(localRoot, remoteRoot string, deletedRelPaths []string) {
 	touched := make(map[string]struct{})
 	for _, relPath := range deletedRelPaths {
-		dir := path.Dir(relPath)
-		if dir == "." {
-			continue // never remove the sync root itself
+		for dir := path.Dir(relPath); dir != "."; dir = path.Dir(dir) {
+			touched[dir] = struct{}{}
 		}
-		touched[dir] = struct{}{}
 	}
-	for relDir := range touched {
+	dirs := make([]string, 0, len(touched))
+	for d := range touched {
+		dirs = append(dirs, d)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+
+	for _, relDir := range dirs {
 		removeIfEmpty(filepath.Join(localRoot, filepath.FromSlash(relDir)))
 		removeIfEmpty(filepath.Join(remoteRoot, filepath.FromSlash(relDir)))
 	}

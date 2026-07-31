@@ -138,6 +138,79 @@ func TestRunConflict_SecondConflictWithinSameSecondDoesNotOverwriteFirst(t *test
 	}
 }
 
+// TestTrimComponentBytes_NeverExceedsMaxBytesEvenWhenExtAloneIsHuge is a
+// regression test for a review finding (Gemini 3.6): when len(suffix) +
+// len(ext) alone already exceeds maxBytes, the old implementation clamped
+// `allowed` to a floor of 1 (rather than letting it reach 0) and always
+// appended the full, oversized ext regardless - so the returned string
+// could still exceed maxBytes (255) even after trimming base down to a
+// single rune, silently violating the function's whole reason to exist. The
+// conflict suffix (the part that makes the file identifiable as a conflict
+// copy at all) must be preserved in full; an abnormally long "extension" is
+// the part that gives way.
+func TestTrimComponentBytes_NeverExceedsMaxBytesEvenWhenExtAloneIsHuge(t *testing.T) {
+	suffix := "_conflict_20260102_030405"
+	ext := "." + strings.Repeat("x", 300) // a pathologically long "extension"
+	component := "name" + suffix + ext
+
+	got := trimComponentBytes(component, 255, suffix, ext)
+
+	if len(got) > 255 {
+		t.Fatalf("trimComponentBytes result exceeds maxBytes 255: got %d bytes (%q)", len(got), got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("trimComponentBytes truncated mid-rune, producing invalid UTF-8: %q", got)
+	}
+	if !strings.Contains(got, suffix) {
+		t.Fatalf("expected the conflict suffix to survive truncation (prioritized over the oversized ext), got %q", got)
+	}
+}
+
+// TestRunConflict_RollsBackLocalRenameWhenDownloadFails is a regression
+// test for a review finding (Gemini 3.6): runConflict renames the local
+// canonical file aside BEFORE downloading remote's version into its place.
+// If that download fails (network error, permission error, remote file
+// vanished, disk space...), the old code just returned the error, leaving
+// localCanonicalPath missing on disk until some LATER cycle's scan/plan
+// happens to notice and re-download it - a real (if self-healing) window
+// where the file looks deleted for no reason a user caused. A failed
+// download must roll the rename back immediately so this cycle's failure
+// doesn't leave the canonical path missing at all.
+func TestRunConflict_RollsBackLocalRenameWhenDownloadFails(t *testing.T) {
+	localRoot, remoteRoot := t.TempDir(), t.TempDir()
+	action := reconcile.Action{Type: reconcile.ActionConflict, Path: "a.txt"}
+
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("local-content"), 0o644); err != nil {
+		t.Fatalf("write local a.txt: %v", err)
+	}
+	// remote's "a.txt" is missing from disk even though the reconciler's
+	// state claims it exists (e.g. a transient SMB read error, or it
+	// vanished between scan and execute) - the download step must fail.
+
+	state := SyncState{
+		LocalRoot: localRoot, RemoteRoot: remoteRoot,
+		LocalFiles:  map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: int64(len("local-content"))}},
+		RemoteFiles: map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: 5}},
+	}
+
+	res := runConflict(state, action)
+	if res.Error == nil {
+		t.Fatal("expected an error since remote's a.txt is missing from disk")
+	}
+
+	content, err := os.ReadFile(filepath.Join(localRoot, "a.txt"))
+	if err != nil || string(content) != "local-content" {
+		t.Fatalf("expected the local canonical file rolled back after the failed download: err=%v content=%q", err, content)
+	}
+	entries, err := os.ReadDir(localRoot)
+	if err != nil {
+		t.Fatalf("read local root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected only the rolled-back a.txt in local root (no leftover conflict-renamed copy), got %v", entries)
+	}
+}
+
 func TestConflictPath_ShortNameUnaffectedByTruncation(t *testing.T) {
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 

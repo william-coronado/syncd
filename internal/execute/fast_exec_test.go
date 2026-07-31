@@ -30,6 +30,36 @@ func TestRunFastTasksCopyAndDelete(t *testing.T) {
 	}
 }
 
+// TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory is
+// a regression test for a review finding (Gemini 3.6): DeleteL/DeleteR used
+// os.RemoveAll, whereas the robust engine's worker_pool.go uses a bare
+// os.Remove (via removeIfExists) for the identical delete case. FastTask
+// deletions are only ever queued for paths FastCompare saw as FILES during
+// its scan - if that path was replaced by a directory before this task
+// executes (a TOCTOU race: scan, then something else repopulates the path
+// as a directory before the executor gets to it), os.RemoveAll would
+// recursively wipe the entire subtree instead of failing safely. os.Remove
+// refuses (ENOTEMPTY) instead, matching the project's existing safety
+// convention.
+func TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory(t *testing.T) {
+	left := t.TempDir()
+	dir := filepath.Join(left, "was-a-file")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "unexpected.txt"), []byte("do not delete me"), 0o644); err != nil {
+		t.Fatalf("write unexpected.txt: %v", err)
+	}
+
+	err := applyFastTask(left, "", reconcile.FastTask{Type: reconcile.DeleteL, RelPath: "was-a-file"})
+	if err == nil {
+		t.Fatal("expected an error deleting a non-empty directory where a file was expected, got nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "unexpected.txt")); statErr != nil {
+		t.Fatalf("expected unexpected.txt to survive - the whole subtree must not be wiped: stat err = %v", statErr)
+	}
+}
+
 // TestRunFastTasksWorkersClampedToMinimumOne is a regression test mirroring
 // TestRunActions_WorkersClampedToMinimumOne in worker_pool_test.go: with
 // workers == 0, no worker goroutines start, so RunFastTasks must clamp to a

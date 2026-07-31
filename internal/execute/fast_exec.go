@@ -107,9 +107,9 @@ func applyFastTask(left, right string, task reconcile.FastTask) error {
 		dst := filepath.Join(left, filepath.FromSlash(task.RelPath))
 		return fs.AtomicCopyFile(src, dst)
 	case reconcile.DeleteL:
-		return os.RemoveAll(filepath.Join(left, filepath.FromSlash(task.RelPath)))
+		return removeIfExists(filepath.Join(left, filepath.FromSlash(task.RelPath)))
 	case reconcile.DeleteR:
-		return os.RemoveAll(filepath.Join(right, filepath.FromSlash(task.RelPath)))
+		return removeIfExists(filepath.Join(right, filepath.FromSlash(task.RelPath)))
 	case reconcile.MoveL:
 		return moveFastFile(left, task)
 	case reconcile.MoveR:

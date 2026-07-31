@@ -41,6 +41,16 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 		return Result{Action: action, Error: fmt.Errorf("rename local conflict file: %w", err)}
 	}
 	if err := fs.AtomicCopyFile(remoteCanonicalPath, localCanonicalPath); err != nil {
+		// Best-effort rollback: put the local original back so this failed
+		// cycle doesn't leave localCanonicalPath looking deleted - without
+		// this, that only gets fixed by a LATER cycle's scan/plan noticing
+		// "local deleted, remote changed vs. manifest" and re-downloading
+		// (review finding, Gemini 3.6). If the rollback itself fails too,
+		// surface both errors - the caller needs to know the file is
+		// genuinely missing, not just that the download failed.
+		if rerr := renameFile(localConflictPath, localCanonicalPath); rerr != nil {
+			return Result{Action: action, Error: fmt.Errorf("download remote canonical after conflict rename: %w (rollback also failed, local file may be missing: %v)", err, rerr)}
+		}
 		return Result{Action: action, Error: fmt.Errorf("download remote canonical after conflict rename: %w", err)}
 	}
 	if err := fs.AtomicCopyFile(localConflictPath, remoteConflictPath); err != nil {
@@ -128,22 +138,50 @@ func conflictPathAttempt(relPath string, ts time.Time, attempt int) string {
 	return filepath.ToSlash(filepath.Join(dir, newName))
 }
 
+// trimComponentBytes shrinks component to at most maxBytes, giving up base
+// first, then ext, then (only in the pathological case suffix alone doesn't
+// fit) suffix itself - in that priority order, since suffix is the conflict
+// marker that has to survive for the file to be identifiable as a conflict
+// copy at all, ext is a nicety, and base (the original name) is the most
+// expendable. Every trim happens at a UTF-8 rune boundary. Unlike the
+// earlier version, this never floors the base budget at 1 byte and always
+// appends the full ext regardless of size - that could let the result
+// exceed maxBytes when suffix+ext alone were already over budget (review
+// finding, Gemini 3.6); this version guarantees len(result) <= maxBytes
+// whenever maxBytes >= 0.
 func trimComponentBytes(component string, maxBytes int, suffix, ext string) string {
 	if len(component) <= maxBytes {
 		return component
 	}
 	base := strings.TrimSuffix(component, ext)
 	base = strings.TrimSuffix(base, suffix)
-	allowed := maxBytes - len(suffix) - len(ext)
-	if allowed < 1 {
-		allowed = 1
+
+	if len(suffix) > maxBytes {
+		return trimToRuneBoundary(suffix, maxBytes)
 	}
-	for len(base) > allowed {
-		_, size := utf8.DecodeLastRuneInString(base)
+	if len(suffix)+len(ext) > maxBytes {
+		ext = trimToRuneBoundary(ext, maxBytes-len(suffix))
+	}
+	allowed := maxBytes - len(suffix) - len(ext)
+	if allowed < 0 {
+		allowed = 0
+	}
+	base = trimToRuneBoundary(base, allowed)
+	return base + suffix + ext
+}
+
+// trimToRuneBoundary returns the longest prefix of s that is at most
+// maxBytes bytes long and ends on a valid UTF-8 rune boundary.
+func trimToRuneBoundary(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	for len(s) > maxBytes {
+		_, size := utf8.DecodeLastRuneInString(s)
 		if size <= 0 {
 			break
 		}
-		base = base[:len(base)-size]
+		s = s[:len(s)-size]
 	}
-	return base + suffix + ext
+	return s
 }
