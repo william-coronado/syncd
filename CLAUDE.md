@@ -74,7 +74,18 @@ all cycles (no overlap). Local fsnotify batches → **scoped** `RunRobustScoped`
 (stat/hash only the changed paths — no full-tree walk, the SMB speedup).
 `--remote-poll` and `--deep-scan` tickers → full `RunRobustOnce`. Each cycle
 re-checks the canary and skips (does not exit) if the mount vanished. Clean
-shutdown on ctx cancel / SIGINT / SIGTERM.
+shutdown on ctx cancel / SIGINT / SIGTERM. Batches are debounced but capped
+at 10× the debounce window so sustained activity still flushes.
+
+**Executor pre-checks** (`internal/execute/worker_pool.go`): every robust
+upload/download/delete re-stats its destination and defers
+(`ErrDestinationChanged`, no manifest update) unless it is exactly what the
+scan saw. Keep this — it is what stops a slow SMB cycle from clobbering an
+edit made mid-cycle.
+
+**Manifest remote stat**: `file_manifest.remote_size/remote_mtime` (NULL =
+same as local) key the remote side's `HashIfChanged` cache; scanners get the
+remote view via `db.RemoteStatView`.
 
 ## Invariants & conventions (do not break)
 
@@ -106,10 +117,9 @@ without checking the source path first (see the data-loss guard).
 
 ## Gotchas / known follow-ups
 
-- **fsnotify `Errors` are silently dropped** (`internal/watch/watcher.go`) — the
-  watcher takes no logger, so inotify overflow / fd exhaustion is invisible. The
-  hourly deep scan backstops it. Follow-up: thread a logger in (keep the
-  constructor's current signature working for existing tests).
+- **fsnotify errors** are forwarded on `Watcher.Errors()` (best-effort, small
+  buffer) and logged by `watch.Run`; `fsnotify.ErrEventOverflow` triggers an
+  immediate full `RunRobustOnce` rescan, since the kernel dropped events.
 - **SMB xattr writes are rejected** on the test NAS (a mount permission quirk).
   syncd doesn't copy extended attributes, so it's unaffected — but plain `cp`
   will hit `Permission denied` on xattrs there.

@@ -47,6 +47,12 @@ exact `Skipped` entry directly. The unreadable-directory case is caught by the
 next full `RunRobustOnce` cycle. Worth a comment if anyone ever gives `ScanPaths`
 directory-recursion.
 
+Items #15, #16, #18, #19 and #21 from the second pass (debounce max-latency
+cap, `RunActions` ctx error on a completed batch, `cobra.CheckErr` in
+`initSyncConfig`, the unbounded conflict-name loop, `Logger.Close` locking)
+were resolved on 2026-11-13 alongside the third review pass's fixes - see
+the git history for that date.
+
 Items #11-#23 below are from a second full-codebase review pass (2026-07-31,
 Codex + Gemini 3.6, consolidated together). #1 and #2 from that pass (the
 `watch` command's missing root-overlap check, and `FastCompare` emitting
@@ -94,7 +100,10 @@ Deferred: bounding this needs either a buffered channel with an explicit
 overflow policy or a separate drain goroutine, and it's only been a
 theoretical gap so far — revisit if inotify/kqueue overflow ever shows up in
 the logs (see the existing fsnotify-errors-dropped gotcha above, which is the
-same class of "we'd only find out from the logs" problem).
+same class of "we'd only find out from the logs" problem). As of 2026-11-13
+fsnotify errors are logged and an `ErrEventOverflow` triggers an immediate
+full rescan (`watch.Run`), so an overflow caused by this is now both visible
+and self-correcting.
 
 ### 14. `AtomicCopyFile` does not fsync the destination directory after rename
 
@@ -108,25 +117,6 @@ where the server-side filesystem's durability semantics are out of syncd's
 control anyway, and a crash in that exact window is a narrow target. Revisit
 if syncd ever writes to a local ext4 destination where this matters more.
 
-### 15. Debounce timer has no max-latency cap
-
-`internal/watch/watcher.go` — each event resets the debounce timer, so a
-continuously-active tree (e.g. a build loop) can keep resetting it
-indefinitely and never flush a batch. `--remote-poll`/`--deep-scan` still
-catch everything eventually; the only cost is losing the "near-instant"
-latency benefit of the fsnotify path during sustained activity. Would need a
-force-flush deadline (e.g. "batch every N events or T seconds, whichever
-first") to bound it.
-
-### 16. `RunActions` reports `ctx.Err()` as failure even when every action succeeded
-
-`internal/execute/worker_pool.go` — `RunActions` returns `ctx.Err()` when
-`firstErr` is nil. A SIGINT landing in the window between the last action
-finishing and `RunActions` returning makes a fully-successful run get logged
-as "did not complete" / "reconcile cycle failed". Cosmetic (the sync itself
-completed correctly; only the log line is wrong) but worth fixing if it ever
-confuses on-call triage of Ctrl-C'd runs.
-
 ### 17. Negating a directory under an ignored tree doesn't re-include its contents
 
 `internal/fs/ignore.go` — a `dirOnly` negation rule is skipped for file
@@ -134,25 +124,6 @@ paths, so `build/` + `!build/keep/` still ignores `build/keep/x.txt` (gitignore
 would re-include it). Deferred: no current `.syncdignore` in the wild
 requires this pattern, and matching full gitignore precedence semantics for
 directory re-inclusion is nontrivially more code for a case nobody's hit yet.
-
-### 18. `cobra.CheckErr` exits directly from `initSyncConfig`
-
-`internal/cli/config.go` — calls `os.Exit(1)` via `cobra.CheckErr` from a
-function with an `error` return, instead of returning the error like
-everywhere else in the CLI layer. Only reachable if `$HOME` can't be
-resolved, which is already fatal for the process either way — so the
-externally-visible behavior is the same, just via a different code path than
-the rest of the codebase's convention. Low priority; fix opportunistically
-next time this function is touched.
-
-### 19. `findAvailableConflictPath` is an unbounded loop
-
-`internal/execute/conflict.go` — no upper bound on `attempt`, unlike the
-bounded retry in `fs.createTempSibling` (`maxTempSiblingAttempts`). Would only
-loop indefinitely given a pathological pile of pre-existing
-`*_conflict_<ts>-N` files for one path within one wall-clock second — not
-reachable through normal use. Bound it to match `createTempSibling`'s pattern
-if it's ever touched for another reason.
 
 ### 20. `ScanPaths` / `FileBLAKE3` ignore context cancellation mid-read
 
@@ -164,15 +135,6 @@ in flight. Bounded by the file's read speed, not unbounded, and reconciles
 are scoped (fsnotify-triggered) or already run to completion by design
 elsewhere — revisit if large-file cancellation latency ever becomes a
 complaint.
-
-### 21. `Logger.Close()` isn't mutex-protected and doesn't nil out `l.file`
-
-`internal/runtime/logging.go` — `Close()` closes `l.file` without taking
-`l.mu` or clearing the field. Not currently reachable: it's always called
-via `defer` in the one goroutine that owns the logger, after all workers have
-joined, so there's no concurrent `write()` to race with today, and it's only
-ever called once. Latent, not live — fix if `Logger` ever gets a second
-caller of `Close`.
 
 ### 22. Confirm-prompt summaries enumerate a fixed list of task types
 
@@ -195,3 +157,73 @@ path for what is really the same root pair. `jobStateKey`
 (`internal/cli/sync_cmd.go`) already does the `filepath.Abs` canonicalization
 this needs — same fix, if the library contract ever gets a caller other than
 the CLI.
+
+Items #24-#29 are from a third review pass (2026-11-13). That pass's real
+defects were fixed directly (see git history for that date): the robust
+executor overwriting/deleting destinations changed since the scan, the
+remote-side hash cache never hitting for identical pairs with differing
+mtimes, `sync --hash` executing a different plan than the one confirmed,
+duplicate CLI error output with a usage dump, the scoped scan ignoring
+directory-only ignore rules on ancestors, and fsnotify errors being dropped.
+What follows was judged worth recording but not changing unilaterally.
+
+### 24. Fast `update` mode overwrites a newer destination when sizes differ
+
+`internal/reconcile/fast.go` — `update` copies L→R when
+`lState.Size != rState.Size || lState.Mtime > rState.Mtime`, so a destination
+file that is *newer* than the source but a different size is overwritten.
+rsync's `--update` skips any destination newer than the source regardless
+of size. This is a straight port of file_sync_util's behavior, so changing
+it is a semantics decision for the owner, not a bug fix: decide whether
+"update" means "never clobber a newer destination" and, if so, drop the
+size clause for the `rState.Mtime > lState.Mtime` case.
+
+### 25. Fast two-way "newer wins" conflicts keep no copy of the losing edit
+
+`internal/reconcile/fast.go` — when both sides changed since the last
+two-way run, the newer mtime wins and the other side's edit is overwritten
+with no conflict copy (unlike the robust engine, which preserves both).
+Documented file_sync_util behavior; the robust engine (`--hash`) is the
+answer when that matters. Revisit if users mix fast two-way with real
+concurrent editing.
+
+### 26. Scoped cycle doesn't expand a deleted/renamed local directory
+
+`internal/app/sync_loop.go` (`RunRobustScoped`) — fsnotify reports only the
+top-level path of a recursive delete or a directory rename, and
+`ScanPaths` skips directories, so the children wait for the next
+`--remote-poll` (30s default). Expanding an absent-locally directory path to
+its manifest children would propagate the delete immediately, but for a
+rename the new side's files still need a subtree walk, so doing only the
+delete half would briefly leave the remote with neither copy. Worth doing
+both halves together (a scoped subtree `ScanTree`) if poll latency for
+directory moves ever matters.
+
+### 27. Concurrent `watch` instances share the default `sync.log`
+
+`internal/runtime/paths.go` — the default db and lock are per root pair,
+but the default log is a fixed `sync.log`, so two watch daemons for
+different pairs interleave in one file, and one's in-place rotation renames
+the file out from under the other (whose writes then land in `.old` until
+it rotates itself). Fix by deriving the default log name from the root pair
+like `defaultLockName`; deferred because it changes where operators look for
+logs.
+
+### 28. The watcher's ignore matcher is fixed at startup
+
+`internal/app/watch_run.go` / `internal/watch/watcher.go` — scans reload
+`.syncdignore` every cycle, but the fsnotify watcher keeps the matcher it
+started with: a directory un-ignored mid-run is never added to the watch
+set (its changes arrive only via polls), and a newly ignored one keeps
+generating events (harmless: the scoped scan reloads the matcher and drops
+them). Restart the daemon after editing `.syncdignore`, or rebuild the
+watcher when the file changes.
+
+### 29. The `--hash` confirm summary doesn't list directory operations
+
+`internal/app/sync_once.go` (`robustSummary`) — the approved summary lists
+file actions only; `reconcileDirectories` may also create empty
+directories, or remove empty directories whose deletion it is propagating,
+in the same cycle. Only ever empty directories (`os.Remove` is
+non-recursive), so no file data is at risk, but the prompt is not a
+complete list of what will change.
