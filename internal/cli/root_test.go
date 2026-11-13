@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -52,5 +53,21 @@ func TestRootCmd_FlagErrorStillPrintsUsage(t *testing.T) {
 	}
 	if !strings.Contains(out, "Usage:") {
 		t.Fatalf("flag error should print usage, got:\n%s", out)
+	}
+}
+
+// Paths are only colored on an interactive terminal: under `go test` (and
+// in a script redirecting to a file) stdout is not a TTY, and NO_COLOR
+// always wins.
+func TestSummaryPathHighlighter_PlainWhenNotATerminal(t *testing.T) {
+	if isTerminal(os.Stdout) {
+		t.Skip("stdout is a terminal in this run")
+	}
+	if summaryPathHighlighter() != nil {
+		t.Fatal("highlighter must be nil when stdout is not a terminal")
+	}
+	t.Setenv("NO_COLOR", "1")
+	if summaryPathHighlighter() != nil {
+		t.Fatal("highlighter must be nil when NO_COLOR is set")
 	}
 }

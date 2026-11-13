@@ -64,7 +64,7 @@ func TestSyncOnceTwoWay_ConflictKeepsBothEditsAndConverges(t *testing.T) {
 }
 
 func TestFastSummary_ShowsMoveSourceAndConflicts(t *testing.T) {
-	got := fastSummary("j", reconcile.FastTwoWay, []reconcile.FastTask{
+	got := fastSummary(SyncOptions{Name: "j", Mode: reconcile.FastTwoWay}, []reconcile.FastTask{
 		{Type: reconcile.MoveR, RelPath: "new/name.txt", OldRelPath: "old/name.txt"},
 		{Type: reconcile.ConflictL2R, RelPath: "doc.txt"},
 	})
@@ -79,11 +79,11 @@ func TestFastSummary_ShowsMoveSourceAndConflicts(t *testing.T) {
 // A task type absent from the fixed display order must still appear in the
 // summary the user approves (docs/follow-ups.md #22).
 func TestSummaries_IncludeUnlistedTypes(t *testing.T) {
-	fast := fastSummary("j", reconcile.FastMirror, []reconcile.FastTask{{Type: "FutureTask", RelPath: "x.txt"}})
+	fast := fastSummary(SyncOptions{Name: "j", Mode: reconcile.FastMirror}, []reconcile.FastTask{{Type: "FutureTask", RelPath: "x.txt"}})
 	if !strings.Contains(fast, "FutureTask") || !strings.Contains(fast, "x.txt") {
 		t.Fatalf("unlisted fast type missing:\n%s", fast)
 	}
-	robust := robustSummary("j", []reconcile.Action{{Type: "FUTURE_ACTION", Path: "y.txt"}})
+	robust := robustSummary(SyncOptions{Name: "j"}, []reconcile.Action{{Type: "FUTURE_ACTION", Path: "y.txt"}})
 	if !strings.Contains(robust, "FUTURE_ACTION") || !strings.Contains(robust, "y.txt") {
 		t.Fatalf("unlisted robust type missing:\n%s", robust)
 	}

@@ -439,7 +439,7 @@ func TestFastSummary_ListsPathsDestructiveFirstWithCap(t *testing.T) {
 	}
 	tasks = append(tasks, reconcile.FastTask{Type: reconcile.CopyL2R, RelPath: "new.txt"})
 
-	out := fastSummary("job", reconcile.FastMirror, tasks)
+	out := fastSummary(SyncOptions{Name: "job", Mode: reconcile.FastMirror}, tasks)
 
 	delIdx := strings.Index(out, "DeleteR")
 	copyIdx := strings.Index(out, "CopyL2R")
@@ -473,7 +473,7 @@ func TestRobustSummary_ListsPathsDestructiveFirstWithCap(t *testing.T) {
 	}
 	actions = append(actions, reconcile.Action{Type: reconcile.ActionUpload, Path: "new.txt"})
 
-	out := robustSummary("job", actions)
+	out := robustSummary(SyncOptions{Name: "job"}, actions)
 
 	delIdx := strings.Index(out, "DELETE_REMOTE")
 	uploadIdx := strings.Index(out, "UPLOAD")
