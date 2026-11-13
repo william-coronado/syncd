@@ -114,9 +114,13 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 		res, err := ScanTree(ctx, localRoot, manifest, true, matcher, policy, localProgress)
 		ch <- item{key: "local", res: res, err: err}
 	}()
+	// The remote side's HashIfChanged cache keys off the remote stat
+	// recorded in the manifest, which can differ from the local one (see
+	// db.ManifestRow.RemoteStat).
+	remoteManifest := db.RemoteStatView(manifest)
 	go func() {
 		defer wg.Done()
-		res, err := ScanTree(ctx, remoteRoot, manifest, false, matcher, policy, remoteProgress)
+		res, err := ScanTree(ctx, remoteRoot, remoteManifest, false, matcher, policy, remoteProgress)
 		ch <- item{key: "remote", res: res, err: err}
 	}()
 	wg.Wait()

@@ -162,10 +162,18 @@ func noopManifestUpdates(plan reconcile.Plan, localFiles, remoteFiles map[string
 		}
 		path := action.Path
 		l, inLocal := localFiles[path]
-		_, inRemote := remoteFiles[path]
+		r, inRemote := remoteFiles[path]
 		if inLocal && inRemote {
-			if row, ok := manifest[path]; !ok || row.Hash != l.Hash || row.Size != l.Size || row.Mtime != l.Mtime {
-				upserts = append(upserts, db.ManifestRow{Path: path, Size: l.Size, Mtime: l.Mtime, Hash: l.Hash, LastSynced: now})
+			row, ok := manifest[path]
+			remoteSize, remoteMtime := row.RemoteStat()
+			if !ok || row.Hash != l.Hash || row.Size != l.Size || row.Mtime != l.Mtime || remoteSize != r.Size || remoteMtime != r.Mtime {
+				// Record each side's own stat: an identical pair can still
+				// differ in mtime (copied without preserving it), and the
+				// remote HashIfChanged cache needs the REMOTE stat to hit.
+				upserts = append(upserts, db.ManifestRow{
+					Path: path, Size: l.Size, Mtime: l.Mtime, Hash: l.Hash, LastSynced: now,
+					RemoteSize: r.Size, RemoteMtime: r.Mtime,
+				})
 			}
 			continue
 		}
@@ -233,26 +241,22 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	manifest, err := p.Repo.LoadAll(ctx)
+	// Only this batch's rows: loading the whole manifest per fsnotify batch
+	// made the scoped (hot) path's cost scale with the tree, not the batch.
+	scopedManifest, err := p.Repo.LoadPaths(ctx, relPaths)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	localScan, err := fs.ScanPaths(p.LocalRoot, relPaths, manifest, p.Policy, true, matcher)
+	localScan, err := fs.ScanPaths(p.LocalRoot, relPaths, scopedManifest, p.Policy, true, matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	remoteScan, err := fs.ScanPaths(p.RemoteRoot, relPaths, manifest, p.Policy, false, matcher)
+	remoteScan, err := fs.ScanPaths(p.RemoteRoot, relPaths, db.RemoteStatView(scopedManifest), p.Policy, false, matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
 	logScanIssues(p.Logger, "local", localScan.Issues)
 	logScanIssues(p.Logger, "remote", remoteScan.Issues)
-	scopedManifest := make(map[string]db.ManifestRow, len(relPaths))
-	for rel := range relPaths {
-		if row, ok := manifest[rel]; ok {
-			scopedManifest[rel] = row
-		}
-	}
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
 	execActions := make([]reconcile.Action, 0, len(plan.Actions))

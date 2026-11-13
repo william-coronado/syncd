@@ -368,7 +368,7 @@ func scanPairForOpts(ctx context.Context, opts SyncOptions, manifest map[string]
 	if err != nil {
 		return fs.ScanPairResult{}, err
 	}
-	remote, err := scanRootOrEmpty(ctx, opts.Right, manifest, false, matcher, policy)
+	remote, err := scanRootOrEmpty(ctx, opts.Right, db.RemoteStatView(manifest), false, matcher, policy)
 	if err != nil {
 		return fs.ScanPairResult{}, err
 	}

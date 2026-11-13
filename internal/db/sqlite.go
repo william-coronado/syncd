@@ -65,6 +65,14 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate manifest schema: %w", err)
 	}
+	if err := addColumnIfMissing(db, "file_manifest", "remote_size", "INTEGER"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate manifest schema: %w", err)
+	}
+	if err := addColumnIfMissing(db, "file_manifest", "remote_mtime", "INTEGER"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate manifest schema: %w", err)
+	}
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS job_state (
 			job   TEXT NOT NULL,
@@ -86,4 +94,34 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate dir_manifest schema: %w", err)
 	}
 	return db, nil
+}
+
+// addColumnIfMissing adds column (nullable, of the given SQL type) to table
+// unless it already exists - SQLite has no ADD COLUMN IF NOT EXISTS, and a
+// manifest created by an older syncd must keep working in place.
+func addColumnIfMissing(db *sql.DB, table, column, sqlType string) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("inspect %s columns: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + sqlType); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
 }
