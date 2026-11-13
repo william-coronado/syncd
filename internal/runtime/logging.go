@@ -91,11 +91,20 @@ func rotateLogIfNeeded(logPath string) error {
 	return nil
 }
 
+// Close closes the log file, if any. It is safe to call more than once and
+// concurrently with logging: later writes simply skip the file.
 func (l *Logger) Close() error {
-	if l == nil || l.file == nil {
+	if l == nil {
 		return nil
 	}
-	return l.file.Close()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
+	err := l.file.Close()
+	l.file = nil
+	return err
 }
 
 func (l *Logger) Info(msg string, ctx map[string]any) {

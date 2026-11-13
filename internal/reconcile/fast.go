@@ -26,6 +26,14 @@ const (
 	DeleteR FastTaskType = "DeleteR"
 	MoveL   FastTaskType = "MoveL"
 	MoveR   FastTaskType = "MoveR"
+	// ConflictL2R / ConflictR2L resolve a two-way conflict (both sides
+	// changed since the last run) in favor of the newer side, like
+	// CopyL2R / CopyR2L - but first rename the losing side's version aside
+	// to a "_conflict_<ts>" copy next to it, so that edit is kept rather
+	// than overwritten. The next two-way run sees the conflict copy as a
+	// new file on one side and copies it across.
+	ConflictL2R FastTaskType = "ConflictL2R"
+	ConflictR2L FastTaskType = "ConflictR2L"
 )
 
 // FastTask is a single unit of work produced by FastCompare.
@@ -97,8 +105,14 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, sk
 				continue
 			}
 			newState[relPath] = lState
+			// rsync --update semantics: copy when the destination is
+			// missing or older, never when it is NEWER - even if the sizes
+			// differ, since a newer destination is most likely an edit made
+			// there that copying would silently destroy. Equal mtimes with
+			// different sizes still copy (the source is not older, and the
+			// two plainly differ).
 			rState, rExists := right[relPath]
-			if !rExists || lState.Size != rState.Size || lState.Mtime > rState.Mtime {
+			if !rExists || lState.Mtime > rState.Mtime || (lState.Mtime == rState.Mtime && lState.Size != rState.Size) {
 				tasks = append(tasks, FastTask{Type: CopyL2R, RelPath: relPath, Size: lState.Size})
 			}
 		}
@@ -273,12 +287,13 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, sk
 			rDeleted := !rOk && prevOk
 
 			if lChanged && rChanged {
-				// Conflict: newer wins
+				// Conflict: newer wins, and the older side's edit is kept
+				// as a conflict copy instead of being overwritten.
 				if lState.Mtime > rState.Mtime {
-					tasks = append(tasks, FastTask{Type: CopyL2R, RelPath: p, Size: lState.Size})
+					tasks = append(tasks, FastTask{Type: ConflictL2R, RelPath: p, Size: lState.Size})
 					newState[p] = lState
 				} else if rState.Mtime > lState.Mtime {
-					tasks = append(tasks, FastTask{Type: CopyR2L, RelPath: p, Size: rState.Size})
+					tasks = append(tasks, FastTask{Type: ConflictR2L, RelPath: p, Size: rState.Size})
 					newState[p] = rState
 				} else if lState.Size == rState.Size {
 					// Equal mtime AND equal size: the fast reconciler never

@@ -36,13 +36,17 @@ type SyncOptions struct {
 	// can leave it empty.
 	StateKey string
 	Mode     reconcile.FastMode
-	UseHash           bool
-	Assume            bool // --yes: skip interactive confirm
-	DryRun            bool // --dry-run: print the summary and exit without mutating anything or persisting job state. Still acquires the per-job lock (cli.runSyncJob) and opens/creates the state db (SyncOnce below) - deliberate, since this is a read of shared job state, not a mutation; see docs/follow-ups.md #3.
-	Workers           int
-	DBPath            string
-	Confirm           func(summary string) bool // nil => auto-yes; cli passes a pterm confirm
-	Progress          execute.ProgressSink      // nil => no progress bar
+	UseHash  bool
+	Assume   bool // --yes: skip interactive confirm
+	DryRun   bool // --dry-run: print the summary and exit without mutating anything or persisting job state. Still acquires the per-job lock (cli.runSyncJob) and opens/creates the state db (SyncOnce below) - deliberate, since this is a read of shared job state, not a mutation; see docs/follow-ups.md #3.
+	Workers  int
+	DBPath   string
+	Confirm  func(summary string) bool // nil => auto-yes; cli passes a pterm confirm
+	Progress execute.ProgressSink      // nil => no progress bar
+	// HighlightPath, if set, styles the left/right root paths in the
+	// confirm/dry-run summary (the CLI passes a terminal color when stdout
+	// is a TTY). nil => plain text.
+	HighlightPath func(string) string
 }
 
 // SyncOnce runs a single fast job (mirror/update/two-way). If opts.UseHash
@@ -319,18 +323,25 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	// or persist two-way's job state, or the next real run would compute
 	// its diff against a baseline that never actually happened.
 	if opts.DryRun {
-		fmt.Println(fastSummary(opts.Name, opts.Mode, res.Tasks))
+		fmt.Println(fastSummary(opts, res.Tasks))
 		return nil
 	}
 
-	if !opts.Assume {
-		if !confirmOrDefault(opts.Confirm)(fastSummary(opts.Name, opts.Mode, res.Tasks)) {
-			return ErrAborted
+	// Nothing to do: report it, but don't ask "continue with the file
+	// transfers?" about zero transfers, or start an empty progress bar.
+	// Two-way state is still persisted below - a first run over two
+	// already-identical trees must still establish its baseline.
+	if len(res.Tasks) == 0 {
+		fmt.Println(fastSummary(opts, res.Tasks))
+	} else {
+		if !opts.Assume {
+			if !confirmOrDefault(opts.Confirm)(fastSummary(opts, res.Tasks)) {
+				return ErrAborted
+			}
 		}
-	}
-
-	if err := execute.RunFastTasks(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress); err != nil {
-		return fmt.Errorf("run fast tasks: %w", err)
+		if err := execute.RunFastTasks(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress); err != nil {
+			return fmt.Errorf("run fast tasks: %w", err)
+		}
 	}
 
 	if opts.Mode == reconcile.FastTwoWay {
@@ -368,7 +379,7 @@ func scanPairForOpts(ctx context.Context, opts SyncOptions, manifest map[string]
 	if err != nil {
 		return fs.ScanPairResult{}, err
 	}
-	remote, err := scanRootOrEmpty(ctx, opts.Right, manifest, false, matcher, policy)
+	remote, err := scanRootOrEmpty(ctx, opts.Right, db.RemoteStatView(manifest), false, matcher, policy)
 	if err != nil {
 		return fs.ScanPairResult{}, err
 	}
@@ -413,24 +424,118 @@ const summaryPathCap = 20
 // for a destructive mirror run this prompt is the only safety gate, and the
 // user needs to see WHICH files, not just how many. Destructive types
 // (DeleteL/DeleteR) are listed first, before the copies/moves.
-func fastSummary(name string, mode reconcile.FastMode, tasks []reconcile.FastTask) string {
+func fastSummary(opts SyncOptions, tasks []reconcile.FastTask) string {
+	var b strings.Builder
 	if len(tasks) == 0 {
-		return fmt.Sprintf("sync %q (%s): no changes", name, mode)
+		fmt.Fprintf(&b, "sync %q (%s): no changes", opts.Name, opts.Mode)
+	} else {
+		fmt.Fprintf(&b, "sync %q (%s): %d task(s)", opts.Name, opts.Mode, len(tasks))
+	}
+	leftRole, rightRole := fastRootRoles(opts.Mode)
+	appendRoots(&b, opts, leftRole, rightRole)
+	if len(tasks) == 0 {
+		return b.String()
 	}
 	byType := make(map[reconcile.FastTaskType][]string)
 	for _, t := range tasks {
-		byType[t.Type] = append(byType[t.Type], t.RelPath)
+		entry := t.RelPath
+		if t.OldRelPath != "" { // moves: show where from
+			entry = t.OldRelPath + " -> " + t.RelPath
+		}
+		byType[t.Type] = append(byType[t.Type], entry)
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "sync %q (%s): %d task(s)", name, mode, len(tasks))
-	for _, tt := range []reconcile.FastTaskType{
+	order := []reconcile.FastTaskType{
 		reconcile.DeleteL, reconcile.DeleteR, // destructive first
+		reconcile.ConflictL2R, reconcile.ConflictR2L,
 		reconcile.CopyL2R, reconcile.CopyR2L,
 		reconcile.MoveL, reconcile.MoveR,
-	} {
-		appendSummaryGroup(&b, string(tt), byType[tt])
+	}
+	for _, tt := range withUnlisted(order, byType) {
+		appendSummaryGroup(&b, fastTaskLabel(tt), byType[tt])
 	}
 	return b.String()
+}
+
+// fastTaskLabel is the summary heading for a fast task type; conflict
+// types spell out that the losing side is kept.
+func fastTaskLabel(tt reconcile.FastTaskType) string {
+	desc := map[reconcile.FastTaskType]string{
+		reconcile.CopyL2R:     "copy left -> right",
+		reconcile.CopyR2L:     "copy right -> left",
+		reconcile.DeleteL:     "delete from left",
+		reconcile.DeleteR:     "delete from right",
+		reconcile.MoveL:       "move within left",
+		reconcile.MoveR:       "move within right",
+		reconcile.ConflictL2R: "both changed, left newer: copy left -> right, right's version kept as a conflict copy",
+		reconcile.ConflictR2L: "both changed, right newer: copy right -> left, left's version kept as a conflict copy",
+	}[tt]
+	if desc == "" {
+		return string(tt)
+	}
+	return string(tt) + " (" + desc + ")"
+}
+
+// fastRootRoles names what each root is for in mode, for the summary's
+// root lines: mirror/update are one-way (left is the source of truth), and
+// two-way has no direction.
+func fastRootRoles(mode reconcile.FastMode) (left, right string) {
+	switch mode {
+	case reconcile.FastMirror:
+		return "source", "destination"
+	case reconcile.FastUpdate:
+		return "source", "destination"
+	}
+	return "", ""
+}
+
+// appendRoots writes the summary's root lines - both roots as absolute
+// paths, each with its role - so a summary read in a script's output (or a
+// confirm prompt) says unambiguously which directory "left" and "right"
+// are. The paths go through opts.HighlightPath when set.
+func appendRoots(b *strings.Builder, opts SyncOptions, leftRole, rightRole string) {
+	label := func(side, role string) string {
+		if role == "" {
+			return side
+		}
+		return side + " (" + role + ")"
+	}
+	leftLabel, rightLabel := label("left", leftRole), label("right", rightRole)
+	width := max(len(leftLabel), len(rightLabel)) + 1 // +1 for the colon
+	highlight := opts.HighlightPath
+	if highlight == nil {
+		highlight = func(s string) string { return s }
+	}
+	fmt.Fprintf(b, "\n  %-*s %s", width, leftLabel+":", highlight(absOrRaw(opts.Left)))
+	fmt.Fprintf(b, "\n  %-*s %s", width, rightLabel+":", highlight(absOrRaw(opts.Right)))
+}
+
+// absOrRaw returns p made absolute, or p unchanged if that fails - a
+// relative root in a script is exactly what makes "which one is left?"
+// hard to answer from its output.
+func absOrRaw(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// withUnlisted returns order followed by every other key of present, sorted,
+// so a task/action type missing from a summary's fixed display order is
+// still shown rather than executing without ever appearing in the summary
+// the user approves (docs/follow-ups.md #22).
+func withUnlisted[K ~string, V any](order []K, present map[K]V) []K {
+	listed := make(map[K]bool, len(order))
+	for _, k := range order {
+		listed[k] = true
+	}
+	var extra []K
+	for k := range present {
+		if !listed[k] {
+			extra = append(extra, k)
+		}
+	}
+	sort.Slice(extra, func(i, j int) bool { return extra[i] < extra[j] })
+	return append(append([]K(nil), order...), extra...)
 }
 
 // appendSummaryGroup writes one task/action-type section to b: a "Label: N"
@@ -460,18 +565,20 @@ func appendSummaryGroup(b *strings.Builder, label string, paths []string) {
 // runRobustOnce runs the robust, hash-based three-way engine for a single
 // ad-hoc job (the --hash bridge) by delegating the scan -> plan -> execute
 // -> manifest-update (+ empty-dir) cycle to the shared app.RunRobustOnce
-// (see run.go / sync_loop.go), so the --hash path benefits from the same
-// empty-dir create/cleanup and scan-progress logging as app.Run's always-on
-// loop.
+// (see sync_loop.go), so the --hash path benefits from the same empty-dir
+// create/cleanup and scan-progress logging as the always-on watch loop.
 //
-// RunRobustOnce has no pause point between planning and executing, but
-// SyncOnce supports an interactive confirm-before-mutate step (ptermConfirm
-// from the CLI). So when a confirmation is actually needed (!opts.Assume),
-// this builds a preview plan itself first - a second, hash-based scan -
-// purely to produce the summary text and get sign-off, then calls
-// RunRobustOnce for the (re-scanned) real run. The common automated case
-// (--yes) skips the preview and goes straight to RunRobustOnce, paying for
-// only one scan.
+// The interactive confirm-before-mutate step (!opts.Assume) runs INSIDE that
+// one cycle, via RobustParams.ConfirmPlan, between planning and executing:
+// the user approves exactly the actions that then execute. (It used to
+// build a separate preview plan from a second full HashAlways scan - twice
+// the hashing of both trees, and the plan that actually ran came from the
+// later scan, so it could include actions the user never saw.) A plan with
+// no file actions runs without prompting.
+//
+// --dry-run still builds its own preview (scanPairForOpts), since it must
+// tolerate a destination that doesn't exist yet and must never reach
+// RunRobustOnce at all.
 //
 // RunRobustOnce takes a *runtime.Logger, which SyncOptions has no
 // equivalent of; a non-silent logger (no log file) is constructed here,
@@ -485,12 +592,7 @@ func appendSummaryGroup(b *strings.Builder, label string, paths []string) {
 func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	repo := db.NewManifestRepo(sqlDB)
 
-	// A preview scan+plan is needed both to show the interactive confirm
-	// (!opts.Assume) and for --dry-run, which must print the same summary
-	// and exit before RunRobustOnce ever runs (no execution, no manifest
-	// persistence) - regardless of opts.Assume, since --dry-run must not
-	// require --yes either.
-	if opts.DryRun || !opts.Assume {
+	if opts.DryRun {
 		manifest, err := repo.LoadAll(ctx)
 		if err != nil {
 			return fmt.Errorf("load manifest: %w", err)
@@ -499,22 +601,27 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		if err != nil {
 			return fmt.Errorf("scan: %w", err)
 		}
+		dirBaseline, err := db.NewDirRepo(sqlDB).LoadAll(ctx)
+		if err != nil {
+			return fmt.Errorf("load dir manifest: %w", err)
+		}
 		skipped := mergeSkipSet(scans.Local, scans.Remote)
 		plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
-		execActions := make([]reconcile.Action, 0, len(plan.Actions))
-		for _, action := range plan.Actions {
-			if action.Type != reconcile.ActionNoOp {
-				execActions = append(execActions, action)
-			}
-		}
+		dirOps := visibleDirOps(planDirectories(scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped))
+		fmt.Println(robustSummary(opts, nonNoOpActions(plan), dirOps...))
+		return nil
+	}
 
-		summary := robustSummary(opts.Name, execActions)
-		if opts.DryRun {
-			fmt.Println(summary)
-			return nil
-		}
-		if !confirmOrDefault(opts.Confirm)(summary) {
-			return ErrAborted
+	var confirmPlan func([]reconcile.Action, []DirOp) bool
+	if !opts.Assume {
+		confirm := confirmOrDefault(opts.Confirm)
+		confirmPlan = func(actions []reconcile.Action, dirOps []DirOp) bool {
+			summary := robustSummary(opts, actions, dirOps...)
+			if len(actions) == 0 && len(dirOps) == 0 {
+				fmt.Println(summary)
+				return true
+			}
+			return confirm(summary)
 		}
 	}
 
@@ -525,14 +632,18 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	defer logger.Close()
 
 	_, failures, runErr := RunRobustOnce(ctx, RobustParams{
-		LocalRoot:  opts.Left,
-		RemoteRoot: opts.Right,
-		Workers:    opts.Workers,
-		Repo:       repo,
-		DB:         sqlDB,
-		Logger:     logger,
-		Policy:     fs.HashAlways,
+		LocalRoot:   opts.Left,
+		RemoteRoot:  opts.Right,
+		Workers:     opts.Workers,
+		Repo:        repo,
+		DB:          sqlDB,
+		Logger:      logger,
+		Policy:      fs.HashAlways,
+		ConfirmPlan: confirmPlan,
 	})
+	if errors.Is(runErr, ErrAborted) {
+		return ErrAborted
+	}
 	// A hard failure (manifest LoadAll, ScanPair, or ApplyUpdates) is
 	// reported with this call site's own original per-stage wrapping,
 	// matching this function's pre-RunRobustOnce error text exactly.
@@ -548,24 +659,73 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	return nil
 }
 
+// nonNoOpActions returns plan's actions minus the NoOps - the ones that
+// would actually execute.
+func nonNoOpActions(plan reconcile.Plan) []reconcile.Action {
+	out := make([]reconcile.Action, 0, len(plan.Actions))
+	for _, action := range plan.Actions {
+		if action.Type != reconcile.ActionNoOp {
+			out = append(out, action)
+		}
+	}
+	return out
+}
+
 // robustSummary is the --hash-path counterpart to fastSummary: see its doc
 // comment for the path-listing/cap/destructive-first rationale.
-func robustSummary(name string, actions []reconcile.Action) string {
-	if len(actions) == 0 {
-		return fmt.Sprintf("sync %q (hash): no changes", name)
+//
+// dirOps (the tree-changing directory operations the same cycle will make -
+// only ever empty directories, since removal is non-recursive) are listed
+// as RMDIR_*/MKDIR_* groups, so the summary is a complete list of what
+// will change (docs/follow-ups.md #29).
+func robustSummary(opts SyncOptions, actions []reconcile.Action, dirOps ...DirOp) string {
+	var b strings.Builder
+	if len(actions) == 0 && len(dirOps) == 0 {
+		fmt.Fprintf(&b, "sync %q (hash): no changes", opts.Name)
+		appendRoots(&b, opts, "local", "remote")
+		return b.String()
 	}
 	byType := make(map[reconcile.ActionType][]string)
 	for _, a := range actions {
 		byType[a.Type] = append(byType[a.Type], a.Path)
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "sync %q (hash): %d action(s)", name, len(actions))
-	for _, at := range []reconcile.ActionType{
+	for _, op := range dirOps {
+		byType[reconcile.ActionType(op.Kind)] = append(byType[reconcile.ActionType(op.Kind)], op.Path+"/")
+	}
+	fmt.Fprintf(&b, "sync %q (hash): %d action(s)", opts.Name, len(actions))
+	if len(dirOps) > 0 {
+		fmt.Fprintf(&b, ", %d empty-directory operation(s)", len(dirOps))
+	}
+	appendRoots(&b, opts, "local", "remote")
+	order := []reconcile.ActionType{
 		reconcile.ActionDeleteLocal, reconcile.ActionDeleteRemote, // destructive first
+		reconcile.ActionType(DirRemoveLocal), reconcile.ActionType(DirRemoveRemote),
 		reconcile.ActionUpload, reconcile.ActionDownload,
 		reconcile.ActionConflict,
-	} {
-		appendSummaryGroup(&b, string(at), byType[at])
+		reconcile.ActionType(DirCreateLocal), reconcile.ActionType(DirCreateRemote),
+	}
+	for _, at := range withUnlisted(order, byType) {
+		appendSummaryGroup(&b, robustActionLabel(at), byType[at])
 	}
 	return b.String()
+}
+
+// robustActionLabel is fastTaskLabel for the --hash engine, whose left root
+// is "local" and right root "remote".
+func robustActionLabel(at reconcile.ActionType) string {
+	desc := map[reconcile.ActionType]string{
+		reconcile.ActionUpload:                "copy left -> right",
+		reconcile.ActionDownload:              "copy right -> left",
+		reconcile.ActionDeleteLocal:           "delete from left",
+		reconcile.ActionDeleteRemote:          "delete from right",
+		reconcile.ActionConflict:              "changed on both sides: right's version kept, left's saved as a conflict copy on both",
+		reconcile.ActionType(DirCreateLocal):  "create empty directory in left",
+		reconcile.ActionType(DirCreateRemote): "create empty directory in right",
+		reconcile.ActionType(DirRemoveLocal):  "remove empty directory from left",
+		reconcile.ActionType(DirRemoveRemote): "remove empty directory from right",
+	}[at]
+	if desc == "" {
+		return string(at)
+	}
+	return string(at) + " (" + desc + ")"
 }

@@ -54,7 +54,7 @@ Import graph is a clean DAG: `cmd/syncd → cli → {app, watch}`; those →
 | `internal/cli` | cobra commands (`root`/`sync`/`watch`/`init`), `~/.syncd.yaml` loader, pterm UI |
 | `internal/app` | orchestration: `SyncOnce` (fast + `--hash`), `RunRobustOnce` (full-tree robust cycle), `RunRobustScoped` (scoped cycle), `RunWatch`, `RunInit` |
 | `internal/watch` | fsnotify `Watcher` (debounce/coalesce), the watch `Run` loop, scoped `ReconcilePaths` |
-| `internal/fs` | one scanner with a **hash policy** (`ScanTree`/`ScanPair`), scoped `ScanPaths`, `.syncdignore` matcher, NFC normalization, atomic copy, BLAKE3 hash |
+| `internal/fs` | one scanner with a **hash policy** (`ScanTree`/`ScanPair`), scoped `ScanPaths`/`ScanSubtree`, `.syncdignore` matcher, NFC normalization, atomic copy, BLAKE3 hash |
 | `internal/reconcile` | `fast.go` = size+mtime `FastCompare` (mirror/update/two-way + moves); `engine.go` = three-way hash `BuildPlan` |
 | `internal/execute` | `worker_pool.go` = robust action executor; `fast_exec.go` = fast executor (`RunFastTasks` + `ProgressSink`) |
 | `internal/db` | SQLite: `file_manifest` (hash/three-way) + `job_state` (fast two-way, keyed `(job,path)`) |
@@ -71,10 +71,24 @@ state store.
 
 **Watch loop** (`internal/watch/loop.go`): a single-consumer `select` serializes
 all cycles (no overlap). Local fsnotify batches → **scoped** `RunRobustScoped`
-(stat/hash only the changed paths — no full-tree walk, the SMB speedup).
+(stat/hash only the changed paths — no full-tree walk, the SMB speedup; a
+path that is a directory on either side is expanded to just that subtree, so
+directory renames and recursive deletes propagate in one cycle). Editing
+`.syncdignore` rebuilds the watcher with the new rules and rescans.
 `--remote-poll` and `--deep-scan` tickers → full `RunRobustOnce`. Each cycle
 re-checks the canary and skips (does not exit) if the mount vanished. Clean
-shutdown on ctx cancel / SIGINT / SIGTERM.
+shutdown on ctx cancel / SIGINT / SIGTERM. Batches are debounced but capped
+at 10× the debounce window so sustained activity still flushes.
+
+**Executor pre-checks** (`internal/execute/worker_pool.go`): every robust
+upload/download/delete re-stats its destination and defers
+(`ErrDestinationChanged`, no manifest update) unless it is exactly what the
+scan saw. Keep this — it is what stops a slow SMB cycle from clobbering an
+edit made mid-cycle.
+
+**Manifest remote stat**: `file_manifest.remote_size/remote_mtime` (NULL =
+same as local) key the remote side's `HashIfChanged` cache; scanners get the
+remote view via `db.RemoteStatView`.
 
 ## Invariants & conventions (do not break)
 
@@ -84,7 +98,11 @@ shutdown on ctx cancel / SIGINT / SIGTERM.
   remote shares. Never rename it.
 - Ignore file: `.syncdignore` (gitignore-style; lives in the **local** root).
   Batch config: `~/.syncd.yaml`. State dir: `~/.local/state/syncd/`
-  (`manifest.db` for watch, `jobs.db`/`hash-<id>.db` for `sync`).
+  (watch: `manifest-<pair>.db`, `sync-<pair>.lock`, `sync-<pair>.log`, named
+  per root pair; `sync`: `jobs.db`/`hash-<id>.db`).
+- **Two-way (fast) conflicts keep both edits**: newer mtime wins via
+  `ConflictL2R`/`ConflictR2L`, which rename the loser to `_conflict_<ts>`
+  first. `update` mode never overwrites a newer destination (rsync `-u`).
 - **Data-loss guard**: `mirror`/`update` and `--hash` require the **source** to
   exist (`app.prepareRoots`); only the destination is auto-created. `two-way`
   may create both. Never let an auto-created empty source drive deletions
@@ -106,10 +124,9 @@ without checking the source path first (see the data-loss guard).
 
 ## Gotchas / known follow-ups
 
-- **fsnotify `Errors` are silently dropped** (`internal/watch/watcher.go`) — the
-  watcher takes no logger, so inotify overflow / fd exhaustion is invisible. The
-  hourly deep scan backstops it. Follow-up: thread a logger in (keep the
-  constructor's current signature working for existing tests).
+- **fsnotify errors** are forwarded on `Watcher.Errors()` (best-effort, small
+  buffer) and logged by `watch.Run`; `fsnotify.ErrEventOverflow` triggers an
+  immediate full `RunRobustOnce` rescan, since the kernel dropped events.
 - **SMB xattr writes are rejected** on the test NAS (a mount permission quirk).
   syncd doesn't copy extended attributes, so it's unaffected — but plain `cp`
   will hit `Permission denied` on xattrs there.

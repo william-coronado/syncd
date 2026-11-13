@@ -31,7 +31,7 @@ func ResolvePaths(cfg Config) (RuntimePaths, error) {
 	}
 	logPath := cfg.LogPath
 	if logPath == "" {
-		logPath = filepath.Join(stateDir, "sync.log")
+		logPath = filepath.Join(stateDir, defaultLogName(cfg.LocalRoot, cfg.RemoteRoot))
 	}
 	lockPath := cfg.LockPath
 	if lockPath == "" {
@@ -88,4 +88,18 @@ func defaultLockName(localRoot, remoteRoot string) string {
 	}
 	sum := sha256.Sum256([]byte(localRoot + "\x00" + remoteRoot))
 	return "sync-" + hex.EncodeToString(sum[:6]) + ".lock"
+}
+
+// defaultLogName gives the default log file the same per-root-pair name as
+// defaultLockName/defaultManifestDBName. With one fixed "sync.log", two
+// watch daemons for different pairs interleaved their events in one file,
+// and one daemon's in-place rotation renamed the file out from under the
+// other, whose writes then landed in sync.log.old (docs/follow-ups.md #27).
+// Falls back to "sync.log" when both roots are empty, as the others do.
+func defaultLogName(localRoot, remoteRoot string) string {
+	if localRoot == "" && remoteRoot == "" {
+		return "sync.log"
+	}
+	sum := sha256.Sum256([]byte(localRoot + "\x00" + remoteRoot))
+	return "sync-" + hex.EncodeToString(sum[:6]) + ".log"
 }

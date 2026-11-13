@@ -406,8 +406,8 @@ func TestFastTwoWayConflict(t *testing.T) {
 	if len(res.Tasks) != 1 {
 		t.Fatalf("Expected 1 task for conflict resolution, got %d: %+v", len(res.Tasks), res.Tasks)
 	}
-	if res.Tasks[0].Type != CopyL2R || res.Tasks[0].RelPath != "fileA.txt" {
-		t.Errorf("Expected newer file in left to overwrite right, got %+v", res.Tasks[0])
+	if res.Tasks[0].Type != ConflictL2R || res.Tasks[0].RelPath != "fileA.txt" {
+		t.Errorf("Expected newer left to win, preserving right as a conflict copy, got %+v", res.Tasks[0])
 	}
 }
 

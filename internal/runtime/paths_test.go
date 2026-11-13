@@ -148,3 +148,37 @@ func TestResolvePaths_CreatesStateDir(t *testing.T) {
 		t.Errorf("expected state dir %s to be created: %v", paths.StateDir, statErr)
 	}
 }
+
+// Two watch daemons for different root pairs must not share (and rotate
+// each other's) default log file (docs/follow-ups.md #27); the same pair
+// must keep its log across restarts; an explicit --log-path still wins; and
+// a caller with no roots keeps the historical sync.log.
+func TestResolvePaths_DefaultLogPathIsPerRootPair(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgA := Config{LocalRoot: "/data/project-a/local", RemoteRoot: "/Volumes/share/project-a"}
+	cfgB := Config{LocalRoot: "/data/project-b/local", RemoteRoot: "/Volumes/share/project-b"}
+
+	a1, err := ResolvePaths(cfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, _ := ResolvePaths(cfgA)
+	b, _ := ResolvePaths(cfgB)
+	if a1.LogPath == b.LogPath {
+		t.Fatalf("distinct root pairs share default log %q", a1.LogPath)
+	}
+	if a1.LogPath != a2.LogPath {
+		t.Fatalf("default log path not stable: %q vs %q", a1.LogPath, a2.LogPath)
+	}
+
+	want := filepath.Join(home, "custom.log")
+	explicit, _ := ResolvePaths(Config{LocalRoot: "/a", RemoteRoot: "/b", LogPath: want})
+	if explicit.LogPath != want {
+		t.Fatalf("LogPath = %q, want explicit %q", explicit.LogPath, want)
+	}
+	none, _ := ResolvePaths(Config{})
+	if filepath.Base(none.LogPath) != "sync.log" {
+		t.Fatalf("rootless default = %q, want sync.log", none.LogPath)
+	}
+}

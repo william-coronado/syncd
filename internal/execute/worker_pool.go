@@ -2,6 +2,7 @@ package execute
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,13 +77,62 @@ func RunActions(ctx context.Context, workers int, state SyncState, actions []rec
 	}()
 
 	out := make([]Result, 0, len(actions))
+	cancelled := false
 	for res := range results {
+		if res.Error != nil && ctx.Err() != nil && errors.Is(res.Error, ctx.Err()) {
+			cancelled = true
+		}
 		out = append(out, res)
 	}
 	// Report cancellation to the caller even though we still return whatever
 	// partial results completed - the caller decides what to do with them
-	// (e.g. still commit manifest updates for actions that finished).
-	return out, ctx.Err()
+	// (e.g. still commit manifest updates for actions that finished). But
+	// only when cancellation actually cut the batch short: a SIGINT landing
+	// after the last action already finished must not make a fully
+	// successful run report "did not complete" (docs/follow-ups.md #16).
+	if cancelled || len(out) < len(actions) {
+		return out, ctx.Err()
+	}
+	return out, nil
+}
+
+// ErrDestinationChanged reports that an action's destination no longer
+// matches what this cycle's scan saw (it was created, modified, replaced,
+// or - for an overwrite - removed in between). The action is skipped rather
+// than applied, with no manifest update, so the next cycle re-plans it from
+// fresh state. Without this guard, a slow full-tree cycle over SMB leaves a
+// wide window in which a user's (or another machine's) write to the
+// destination is silently overwritten by a copy, or destroyed by a delete,
+// planned against a now-stale scan.
+var ErrDestinationChanged = errors.New("destination changed since scan; deferring to next cycle")
+
+// verifyDestinationUnchanged checks absPath against the scan's view of it:
+// scanned/present is the entry (if any) the scan recorded for that path on
+// the destination side. A path the scan saw absent must still be absent; a
+// path the scan saw must still be a regular file with the same size and
+// mtime. allowVanished tolerates a scanned path that has since disappeared
+// (correct for deletes, whose goal state is "absent" anyway).
+func verifyDestinationUnchanged(absPath string, scanned fs.FileEntry, present, allowVanished bool) error {
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat destination: %w", err)
+		}
+		if !present || allowVanished {
+			return nil
+		}
+		return fmt.Errorf("%w (scanned present, now missing)", ErrDestinationChanged)
+	}
+	if !present {
+		return fmt.Errorf("%w (scanned absent, now exists)", ErrDestinationChanged)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w (no longer a regular file)", ErrDestinationChanged)
+	}
+	if info.Size() != scanned.Size || info.ModTime().Unix() != scanned.Mtime {
+		return fmt.Errorf("%w (size/mtime %d/%d, scanned %d/%d)", ErrDestinationChanged, info.Size(), info.ModTime().Unix(), scanned.Size, scanned.Mtime)
+	}
+	return nil
 }
 
 func applyAction(state SyncState, action reconcile.Action) Result {
@@ -113,6 +163,10 @@ func runUpload(state SyncState, action reconcile.Action) Result {
 		return Result{Action: action, Error: fmt.Errorf("upload source missing: %s", action.Path)}
 	}
 	dst := filepath.Join(state.RemoteRoot, filepath.FromSlash(action.Path))
+	scanned, present := state.RemoteFiles[action.Path]
+	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
+		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
+	}
 	if err := fs.AtomicCopyFile(local.AbsPath, dst); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
@@ -132,6 +186,10 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 		return Result{Action: action, Error: fmt.Errorf("download source missing: %s", action.Path)}
 	}
 	dst := filepath.Join(state.LocalRoot, filepath.FromSlash(action.Path))
+	scanned, present := state.LocalFiles[action.Path]
+	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
+		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
+	}
 	if err := fs.AtomicCopyFile(remote.AbsPath, dst); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
 	}
@@ -146,11 +204,18 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 }
 
 func runDelete(state SyncState, action reconcile.Action, deleteLocal bool) Result {
-	targetRoot := state.RemoteRoot
+	targetRoot, targetFiles := state.RemoteRoot, state.RemoteFiles
 	if deleteLocal {
-		targetRoot = state.LocalRoot
+		targetRoot, targetFiles = state.LocalRoot, state.LocalFiles
 	}
 	targetPath := filepath.Join(targetRoot, filepath.FromSlash(action.Path))
+	// BuildPlan only deletes a path it saw, unchanged since the manifest, on
+	// the target side - so the target must still be exactly that file. If it
+	// was edited in the meantime, deleting it would destroy the edit.
+	scanned, present := targetFiles[action.Path]
+	if err := verifyDestinationUnchanged(targetPath, scanned, present, true); err != nil {
+		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
+	}
 	if err := removeIfExists(targetPath); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
 	}

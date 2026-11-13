@@ -45,7 +45,16 @@ paths from fsnotify events and never discovers descendants, so a file made
 unreachable by a newly-unreadable ancestor fails its own `Lstat` and gets an
 exact `Skipped` entry directly. The unreadable-directory case is caught by the
 next full `RunRobustOnce` cycle. Worth a comment if anyone ever gives `ScanPaths`
-directory-recursion.
+directory-recursion. (As of 2026-11-13 the scoped cycle expands directory
+paths via `fs.ScanSubtree`, which shares `ScanTree`'s walk and so does
+populate `SkippedDirs` for an unreadable directory inside the subtree;
+`ScanPaths` itself is unchanged.)
+
+Items #15, #16, #18, #19 and #21 from the second pass (debounce max-latency
+cap, `RunActions` ctx error on a completed batch, `cobra.CheckErr` in
+`initSyncConfig`, the unbounded conflict-name loop, `Logger.Close` locking)
+were resolved on 2026-11-13 alongside the third review pass's fixes - see
+the git history for that date.
 
 Items #11-#23 below are from a second full-codebase review pass (2026-07-31,
 Codex + Gemini 3.6, consolidated together). #1 and #2 from that pass (the
@@ -94,7 +103,10 @@ Deferred: bounding this needs either a buffered channel with an explicit
 overflow policy or a separate drain goroutine, and it's only been a
 theoretical gap so far — revisit if inotify/kqueue overflow ever shows up in
 the logs (see the existing fsnotify-errors-dropped gotcha above, which is the
-same class of "we'd only find out from the logs" problem).
+same class of "we'd only find out from the logs" problem). As of 2026-11-13
+fsnotify errors are logged and an `ErrEventOverflow` triggers an immediate
+full rescan (`watch.Run`), so an overflow caused by this is now both visible
+and self-correcting.
 
 ### 14. `AtomicCopyFile` does not fsync the destination directory after rename
 
@@ -108,25 +120,6 @@ where the server-side filesystem's durability semantics are out of syncd's
 control anyway, and a crash in that exact window is a narrow target. Revisit
 if syncd ever writes to a local ext4 destination where this matters more.
 
-### 15. Debounce timer has no max-latency cap
-
-`internal/watch/watcher.go` — each event resets the debounce timer, so a
-continuously-active tree (e.g. a build loop) can keep resetting it
-indefinitely and never flush a batch. `--remote-poll`/`--deep-scan` still
-catch everything eventually; the only cost is losing the "near-instant"
-latency benefit of the fsnotify path during sustained activity. Would need a
-force-flush deadline (e.g. "batch every N events or T seconds, whichever
-first") to bound it.
-
-### 16. `RunActions` reports `ctx.Err()` as failure even when every action succeeded
-
-`internal/execute/worker_pool.go` — `RunActions` returns `ctx.Err()` when
-`firstErr` is nil. A SIGINT landing in the window between the last action
-finishing and `RunActions` returning makes a fully-successful run get logged
-as "did not complete" / "reconcile cycle failed". Cosmetic (the sync itself
-completed correctly; only the log line is wrong) but worth fixing if it ever
-confuses on-call triage of Ctrl-C'd runs.
-
 ### 17. Negating a directory under an ignored tree doesn't re-include its contents
 
 `internal/fs/ignore.go` — a `dirOnly` negation rule is skipped for file
@@ -134,25 +127,6 @@ paths, so `build/` + `!build/keep/` still ignores `build/keep/x.txt` (gitignore
 would re-include it). Deferred: no current `.syncdignore` in the wild
 requires this pattern, and matching full gitignore precedence semantics for
 directory re-inclusion is nontrivially more code for a case nobody's hit yet.
-
-### 18. `cobra.CheckErr` exits directly from `initSyncConfig`
-
-`internal/cli/config.go` — calls `os.Exit(1)` via `cobra.CheckErr` from a
-function with an `error` return, instead of returning the error like
-everywhere else in the CLI layer. Only reachable if `$HOME` can't be
-resolved, which is already fatal for the process either way — so the
-externally-visible behavior is the same, just via a different code path than
-the rest of the codebase's convention. Low priority; fix opportunistically
-next time this function is touched.
-
-### 19. `findAvailableConflictPath` is an unbounded loop
-
-`internal/execute/conflict.go` — no upper bound on `attempt`, unlike the
-bounded retry in `fs.createTempSibling` (`maxTempSiblingAttempts`). Would only
-loop indefinitely given a pathological pile of pre-existing
-`*_conflict_<ts>-N` files for one path within one wall-clock second — not
-reachable through normal use. Bound it to match `createTempSibling`'s pattern
-if it's ever touched for another reason.
 
 ### 20. `ScanPaths` / `FileBLAKE3` ignore context cancellation mid-read
 
@@ -165,33 +139,22 @@ are scoped (fsnotify-triggered) or already run to completion by design
 elsewhere — revisit if large-file cancellation latency ever becomes a
 complaint.
 
-### 21. `Logger.Close()` isn't mutex-protected and doesn't nil out `l.file`
-
-`internal/runtime/logging.go` — `Close()` closes `l.file` without taking
-`l.mu` or clearing the field. Not currently reachable: it's always called
-via `defer` in the one goroutine that owns the logger, after all workers have
-joined, so there's no concurrent `write()` to race with today, and it's only
-ever called once. Latent, not live — fix if `Logger` ever gets a second
-caller of `Close`.
-
-### 22. Confirm-prompt summaries enumerate a fixed list of task types
-
-`internal/app/sync_once.go` (`fastSummary`/`robustSummary`) — both iterate a
-hardcoded slice of task types rather than the actual keys present. A new
-action type added to either reconciler would execute without ever appearing
-in the safety-gate summary the user approves before `--yes` is skipped.
-Currently exhaustive (matches every type both reconcilers emit today); would
-need to be revisited the next time a new task/action type is added, not
-before.
-
 ### 23. `ResolvePaths`' default db/lock naming doesn't canonicalize roots
 
-`internal/runtime/paths.go` — `defaultManifestDBName`/`defaultLockName` hash
+`internal/runtime/paths.go` — `defaultManifestDBName`/`defaultLockName`/`defaultLogName` hash
 `localRoot + "\x00" + remoteRoot` as given, without `filepath.Clean`. The CLI
 always passes `filepath.Abs`-resolved roots first, so this isn't reachable
 through `syncd sync`/`syncd watch` today, but a direct library caller passing
-a trailing slash or relative form would silently get a different db/lock
+a trailing slash or relative form would silently get a different db/lock/log
 path for what is really the same root pair. `jobStateKey`
 (`internal/cli/sync_cmd.go`) already does the `filepath.Abs` canonicalization
 this needs — same fix, if the library contract ever gets a caller other than
 the CLI.
+
+The third review pass (2026-11-13) fixed its defects directly and then
+resolved the six items it had recorded (#24-#29: `update` overwriting a
+newer destination, two-way conflicts keeping no copy of the losing edit,
+the scoped cycle not expanding directories, the shared default log, the
+watcher's startup-fixed ignore rules, and directory operations missing
+from the `--hash` summary), along with #22 from the second pass (summaries enumerating a
+fixed list of types). See the git history for that date.

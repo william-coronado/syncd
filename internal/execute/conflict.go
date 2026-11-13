@@ -30,7 +30,10 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 	localCanonicalPath := filepath.Join(state.LocalRoot, filepath.FromSlash(action.Path))
 	remoteCanonicalPath := filepath.Join(state.RemoteRoot, filepath.FromSlash(action.Path))
 
-	conflictRel := findAvailableConflictPath(state.LocalRoot, state.RemoteRoot, action.Path, timeNow().UTC())
+	conflictRel, err := findAvailableConflictPath(state.LocalRoot, state.RemoteRoot, action.Path, timeNow().UTC())
+	if err != nil {
+		return Result{Action: action, Error: err}
+	}
 	localConflictPath := filepath.Join(state.LocalRoot, filepath.FromSlash(conflictRel))
 	remoteConflictPath := filepath.Join(state.RemoteRoot, filepath.FromSlash(conflictRel))
 
@@ -101,17 +104,23 @@ func renameFile(src, dst string) error {
 // already-renamed-aside conflict copy (review finding "Medium 6"). A single
 // process handles one RunActions batch (one action per path) at a time and
 // watch/loop.go serializes cycles through a mutex, so the check-then-rename
-// here has no concurrent-writer race to guard against in practice.
-func findAvailableConflictPath(localRoot, remoteRoot, relPath string, ts time.Time) string {
-	for attempt := 0; ; attempt++ {
+// here has no concurrent-writer race to guard against in practice. Bounded
+// by maxConflictPathAttempts (docs/follow-ups.md #19) so a pathological pile
+// of same-second conflict copies fails this one action instead of spinning.
+func findAvailableConflictPath(localRoot, remoteRoot, relPath string, ts time.Time) (string, error) {
+	for attempt := 0; attempt < maxConflictPathAttempts; attempt++ {
 		candidate := conflictPathAttempt(relPath, ts, attempt)
 		localP := filepath.Join(localRoot, filepath.FromSlash(candidate))
 		remoteP := filepath.Join(remoteRoot, filepath.FromSlash(candidate))
 		if !pathExists(localP) && !pathExists(remoteP) {
-			return candidate
+			return candidate, nil
 		}
 	}
+	return "", fmt.Errorf("no available conflict filename for %s after %d attempts", relPath, maxConflictPathAttempts)
 }
+
+// maxConflictPathAttempts bounds findAvailableConflictPath's search.
+const maxConflictPathAttempts = 1000
 
 func pathExists(p string) bool {
 	_, err := os.Lstat(p)

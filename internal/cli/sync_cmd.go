@@ -211,6 +211,8 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 		DBPath:   dbPath,
 		Confirm:  ptermConfirm,
 		Progress: progress,
+
+		HighlightPath: summaryPathHighlighter(),
 	}
 
 	return app.SyncOnce(ctx, opts)
@@ -417,6 +419,26 @@ func sanitizeJobDBName(name string) string {
 		return "_"
 	}
 	return b.String()
+}
+
+// summaryPathHighlighter returns how the confirm/dry-run summary should
+// highlight the left/right root paths: bold cyan on an interactive
+// terminal, nil (plain text) when stdout is redirected - a script's log
+// file should not fill with escape codes - or when NO_COLOR is set
+// (https://no-color.org).
+func summaryPathHighlighter() func(string) string {
+	if os.Getenv("NO_COLOR") != "" || !isTerminal(os.Stdout) {
+		return nil
+	}
+	style := pterm.NewStyle(pterm.FgLightCyan, pterm.Bold)
+	return func(s string) string { return style.Sprint(s) }
+}
+
+// isTerminal reports whether f is a character device (a TTY), without
+// pulling in a terminal library for one check.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 // ptermConfirm is the interactive Confirm callback passed to app.SyncOnce:

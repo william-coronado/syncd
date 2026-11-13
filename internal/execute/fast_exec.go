@@ -106,6 +106,10 @@ func applyFastTask(left, right string, task reconcile.FastTask) error {
 		src := filepath.Join(right, filepath.FromSlash(task.RelPath))
 		dst := filepath.Join(left, filepath.FromSlash(task.RelPath))
 		return fs.AtomicCopyFile(src, dst)
+	case reconcile.ConflictL2R:
+		return copyPreservingDestination(left, right, task.RelPath)
+	case reconcile.ConflictR2L:
+		return copyPreservingDestination(right, left, task.RelPath)
 	case reconcile.DeleteL:
 		return removeIfExists(filepath.Join(left, filepath.FromSlash(task.RelPath)))
 	case reconcile.DeleteR:
@@ -158,3 +162,34 @@ var renameFunc = os.Rename
 // race that call guards against - without needing real concurrent
 // filesystem mutation.
 var copyFunc = fs.AtomicCopyFile
+
+// copyPreservingDestination copies srcRoot/rel over dstRoot/rel, first
+// renaming any existing destination aside to a conflict copy (the same
+// "_conflict_<ts>" naming the robust engine uses) so the losing side of a
+// two-way conflict is kept rather than overwritten. If the copy fails, the
+// destination is put back.
+func copyPreservingDestination(srcRoot, dstRoot, rel string) error {
+	src := filepath.Join(srcRoot, filepath.FromSlash(rel))
+	dst := filepath.Join(dstRoot, filepath.FromSlash(rel))
+	if _, err := os.Lstat(dst); err != nil {
+		if os.IsNotExist(err) {
+			return copyFunc(src, dst) // nothing to preserve
+		}
+		return fmt.Errorf("stat conflict destination %s: %w", rel, err)
+	}
+	conflictRel, err := findAvailableConflictPath(srcRoot, dstRoot, rel, timeNow().UTC())
+	if err != nil {
+		return err
+	}
+	preserved := filepath.Join(dstRoot, filepath.FromSlash(conflictRel))
+	if err := renameFunc(dst, preserved); err != nil {
+		return fmt.Errorf("preserve conflicting %s: %w", rel, err)
+	}
+	if err := copyFunc(src, dst); err != nil {
+		if rerr := renameFunc(preserved, dst); rerr != nil {
+			return fmt.Errorf("copy %s after preserving conflict copy: %w (restore also failed, original kept at %s: %v)", rel, err, conflictRel, rerr)
+		}
+		return fmt.Errorf("copy %s after preserving conflict copy: %w", rel, err)
+	}
+	return nil
+}

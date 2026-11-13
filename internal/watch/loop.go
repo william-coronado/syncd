@@ -2,8 +2,13 @@ package watch
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"syncd/internal/app"
 	"syncd/internal/fs"
@@ -32,6 +37,10 @@ const (
 // as watcher.go's fsAdd.
 var newTicker = time.NewTicker
 
+// newWatcher is NewWatcher, indirected so tests can reach the Watcher Run
+// creates (e.g. to inject an fsnotify error). Same pattern as newTicker.
+var newWatcher = NewWatcher
+
 // Run blocks until ctx is cancelled. It starts an fsnotify Watcher on
 // p.LocalRoot and drives three triggers, each running one reconcile cycle:
 //
@@ -57,11 +66,13 @@ var newTicker = time.NewTicker
 // Run returns nil on clean ctx cancellation (after closing the Watcher) or
 // a non-nil error if the Watcher itself failed to start.
 func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg LoopConfig) error {
-	w, err := NewWatcher(p.LocalRoot, matcher, cfg.Debounce)
+	w, err := newWatcher(p.LocalRoot, matcher, cfg.Debounce)
 	if err != nil {
 		return err
 	}
-	defer w.Close()
+	// w is replaced when .syncdignore changes (see reloadIgnore), so close
+	// whichever watcher is current at exit.
+	defer func() { w.Close() }()
 
 	// NewWatcher degrades to partial coverage rather than failing outright
 	// when some directories couldn't be added (e.g. Linux's
@@ -99,6 +110,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 	// channel closes, so the select case blocks forever afterward instead of
 	// spinning on a closed channel.
 	batches := w.Batches()
+	watchErrs := w.Errors()
 
 	var mu sync.Mutex
 
@@ -115,6 +127,51 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 		}
 		if err := fn(); err != nil {
 			p.Logger.Error("watch: reconcile cycle failed", map[string]any{"error": err.Error()})
+		}
+	}
+
+	// Scans reload .syncdignore every cycle, but the watcher's matcher
+	// (which decides what is watched at all) was fixed at startup: a
+	// directory un-ignored mid-run was never watched, so its changes only
+	// arrived via polls (docs/follow-ups.md #28). reloadIgnore rebuilds the
+	// watcher with the new rules when the file's content changes - checked
+	// when the file itself shows up in a batch, and on every remote poll in
+	// case that event was missed (or the file ignores itself). With rescan,
+	// it then reconciles the whole tree, since newly un-ignored paths may
+	// already hold unsynced files and the old watcher's pending events are
+	// gone.
+	ignorePath := filepath.Join(p.LocalRoot, fs.IgnoreFileName)
+	lastIgnore := ignoreFileSignature(ignorePath)
+	reloadIgnore := func(rescan bool) {
+		sig := ignoreFileSignature(ignorePath)
+		if sig == lastIgnore {
+			return
+		}
+		newMatcher, err := fs.LoadIgnoreMatcher(p.LocalRoot)
+		if err != nil {
+			// Keep the old rules; scans will fail on the same error until
+			// the file is fixed, which is the louder signal.
+			p.Logger.Error("watch: .syncdignore changed but could not be loaded; keeping previous rules", map[string]any{"error": err.Error()})
+			lastIgnore = sig
+			return
+		}
+		nw, err := newWatcher(p.LocalRoot, newMatcher, cfg.Debounce)
+		if err != nil {
+			p.Logger.Error("watch: could not rebuild watcher for new .syncdignore; keeping the old one", map[string]any{"error": err.Error()})
+			return // lastIgnore unchanged: retried at the next check
+		}
+		_ = w.Close()
+		w = nw
+		batches, watchErrs = w.Batches(), w.Errors()
+		lastIgnore = sig
+		p.Logger.Printf("watch: .syncdignore changed; watcher rebuilt with the new rules")
+		if rescan {
+			guardedCycle(func() error {
+				rescanParams := p
+				rescanParams.Policy = fs.HashIfChanged
+				_, _, err := app.RunRobustOnce(ctx, rescanParams)
+				return err
+			})
 		}
 	}
 
@@ -136,8 +193,33 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 				_, err := ReconcilePaths(ctx, p, batch)
 				return err
 			})
+			if _, ok := batch[fs.IgnoreFileName]; ok {
+				reloadIgnore(true)
+			}
+
+		case werr, ok := <-watchErrs:
+			if !ok {
+				watchErrs = nil
+				continue
+			}
+			if !errors.Is(werr, fsnotify.ErrEventOverflow) {
+				p.Logger.Error("watch: filesystem watcher error", map[string]any{"error": werr.Error()})
+				continue
+			}
+			// The kernel dropped events: some local changes may never
+			// arrive as a batch. Reconcile the whole tree now rather than
+			// leaving them until the next remote poll / deep scan.
+			p.Logger.Error("watch: filesystem event queue overflowed; running a full rescan", map[string]any{"error": werr.Error()})
+			guardedCycle(func() error {
+				rescanParams := p
+				rescanParams.Policy = fs.HashIfChanged
+				_, _, err := app.RunRobustOnce(ctx, rescanParams)
+				return err
+			})
+			drainQueuedErrors(watchErrs, p.Logger)
 
 		case <-pollTicker.C:
+			reloadIgnore(false) // this poll is itself the full rescan
 			guardedCycle(func() error {
 				pollParams := p
 				pollParams.Policy = fs.HashIfChanged
@@ -154,4 +236,36 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			})
 		}
 	}
+}
+
+// drainQueuedErrors empties errs without blocking - called right after an
+// overflow-triggered full rescan, which has just covered whatever further
+// queued overflows (typically more of the same burst) could have meant, so
+// those are dropped instead of each triggering another full rescan. Any
+// other error is still logged.
+func drainQueuedErrors(errs <-chan error, logger *runtime.Logger) {
+	for {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				return
+			}
+			if !errors.Is(err, fsnotify.ErrEventOverflow) {
+				logger.Error("watch: filesystem watcher error", map[string]any{"error": err.Error()})
+			}
+		default:
+			return
+		}
+	}
+}
+
+// ignoreFileSignature identifies the current content of the ignore file
+// (its bytes, or a marker for "absent/unreadable") so reloadIgnore can tell
+// a real change from an event that left it the same.
+func ignoreFileSignature(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "\x00absent"
+	}
+	return string(b)
 }

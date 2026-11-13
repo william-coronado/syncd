@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
@@ -43,7 +42,9 @@ func initSyncConfig(cfgFile string) error {
 		viper.SetConfigFile(cfgFile)
 	} else {
 		home, err := os.UserHomeDir()
-		cobra.CheckErr(err)
+		if err != nil {
+			return fmt.Errorf("resolve home directory: %w", err)
+		}
 
 		viper.AddConfigPath(home)
 		viper.SetConfigType("yaml")

@@ -407,3 +407,26 @@ func TestLogger_ConcurrentWritesAreRaceFree(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+// Close must be idempotent and safe against concurrent writes
+// (docs/follow-ups.md #21); run under -race.
+func TestLogger_CloseIsIdempotentAndRaceFree(t *testing.T) {
+	l, err := NewLogger(true, filepath.Join(t.TempDir(), "l.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			l.Info("tick", nil)
+		}
+	}()
+	if err := l.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	<-done
+	if err := l.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

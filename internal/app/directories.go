@@ -37,6 +37,56 @@ import (
 // one beneath a skipped directory) is left completely alone this cycle: no
 // create, no delete, no baseline change (review finding P1 #2, Codex).
 func reconcileDirectories(logger *runtime.Logger, localRoot, remoteRoot string, localDirs, remoteDirs, dirBaseline map[string]struct{}, skipped reconcile.SkipSet) (toAdd, toRemove []string, failures int) {
+	return applyDirOps(logger, localRoot, remoteRoot, planDirectories(localDirs, remoteDirs, dirBaseline, skipped))
+}
+
+// DirOpKind is one directory operation planDirectories can decide on. The
+// first four change a tree and are shown in the --hash confirm/dry-run
+// summary; the baseline-only kinds just update db.DirRepo.
+type DirOpKind string
+
+const (
+	DirCreateLocal  DirOpKind = "MKDIR_LOCAL"
+	DirCreateRemote DirOpKind = "MKDIR_REMOTE"
+	DirRemoveLocal  DirOpKind = "RMDIR_LOCAL"
+	DirRemoveRemote DirOpKind = "RMDIR_REMOTE"
+	// dirBaselineAdd: present on both sides but not yet baselined.
+	dirBaselineAdd DirOpKind = "baseline-add"
+	// dirBaselineRemove: gone from both sides, still baselined.
+	dirBaselineRemove DirOpKind = "baseline-remove"
+)
+
+// DirOp is a planned directory operation on Path (root-relative).
+type DirOp struct {
+	Kind DirOpKind
+	Path string
+}
+
+// changesTree reports whether op creates or removes a real directory (as
+// opposed to only updating the baseline).
+func (op DirOp) changesTree() bool {
+	return op.Kind != dirBaselineAdd && op.Kind != dirBaselineRemove
+}
+
+// visibleDirOps returns just the ops that change a tree - what a summary
+// should list.
+func visibleDirOps(ops []DirOp) []DirOp {
+	var out []DirOp
+	for _, op := range ops {
+		if op.changesTree() {
+			out = append(out, op)
+		}
+	}
+	return out
+}
+
+// planDirectories decides reconcileDirectories' operations without
+// touching disk, so they can be shown for confirmation first (see
+// RobustParams.ConfirmPlan). Ops are ordered deepest-first (reverse
+// lexicographic: "parent/child" always before "parent") - os.Remove is
+// non-recursive, so removing a parent before its still-present child would
+// fail purely because of iteration order.
+func planDirectories(localDirs, remoteDirs, dirBaseline map[string]struct{}, skipped reconcile.SkipSet) []DirOp {
 	allDirs := make(map[string]struct{}, len(localDirs)+len(remoteDirs)+len(dirBaseline))
 	for d := range localDirs {
 		allDirs[d] = struct{}{}
@@ -50,18 +100,13 @@ func reconcileDirectories(logger *runtime.Logger, localRoot, remoteRoot string, 
 	for d := range dirBaseline {
 		allDirs[d] = struct{}{}
 	}
-
-	// Visited deepest-first (reverse lexicographic: any path having another
-	// as a strict prefix always sorts after it, so "parent/child" is always
-	// removed before "parent") - os.Remove is non-recursive, so removing a
-	// parent before its still-present child would fail with ENOTEMPTY purely
-	// because of iteration order, not because anything is actually wrong.
 	dirs := make([]string, 0, len(allDirs))
 	for d := range allDirs {
 		dirs = append(dirs, d)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
 
+	var ops []DirOp
 	for _, dir := range dirs {
 		if skipped.Contains(dir) {
 			continue
@@ -69,44 +114,69 @@ func reconcileDirectories(logger *runtime.Logger, localRoot, remoteRoot string, 
 		_, inLocal := localDirs[dir]
 		_, inRemote := remoteDirs[dir]
 		_, inBaseline := dirBaseline[dir]
-
 		switch {
 		case inLocal && inRemote:
 			if !inBaseline {
-				toAdd = append(toAdd, dir)
+				ops = append(ops, DirOp{dirBaselineAdd, dir})
 			}
 		case inLocal && !inRemote:
 			if inBaseline {
-				if err := removeEmptyDir(filepath.Join(localRoot, filepath.FromSlash(dir))); err != nil {
-					failures++
-					logger.Error("failed to remove local directory", map[string]any{"path": dir, "error": err.Error()})
-					continue
-				}
-				toRemove = append(toRemove, dir)
-			} else if err := os.MkdirAll(filepath.Join(remoteRoot, filepath.FromSlash(dir)), 0o755); err != nil {
-				failures++
-				logger.Error("failed to create remote directory", map[string]any{"path": dir, "error": err.Error()})
+				ops = append(ops, DirOp{DirRemoveLocal, dir})
 			} else {
-				toAdd = append(toAdd, dir)
+				ops = append(ops, DirOp{DirCreateRemote, dir})
 			}
 		case !inLocal && inRemote:
 			if inBaseline {
-				if err := removeEmptyDir(filepath.Join(remoteRoot, filepath.FromSlash(dir))); err != nil {
-					failures++
-					logger.Error("failed to remove remote directory", map[string]any{"path": dir, "error": err.Error()})
-					continue
-				}
-				toRemove = append(toRemove, dir)
-			} else if err := os.MkdirAll(filepath.Join(localRoot, filepath.FromSlash(dir)), 0o755); err != nil {
-				failures++
-				logger.Error("failed to create local directory", map[string]any{"path": dir, "error": err.Error()})
+				ops = append(ops, DirOp{DirRemoveRemote, dir})
 			} else {
-				toAdd = append(toAdd, dir)
+				ops = append(ops, DirOp{DirCreateLocal, dir})
 			}
 		default: // gone from both sides
 			if inBaseline {
-				toRemove = append(toRemove, dir)
+				ops = append(ops, DirOp{dirBaselineRemove, dir})
 			}
+		}
+	}
+	return ops
+}
+
+// applyDirOps performs planDirectories' ops in order and returns the
+// baseline additions/removals they imply, for the caller to persist via
+// db.DirRepo.ApplyUpdates. Failures are logged and tallied rather than
+// aborting - a directory create/delete failure never loses file data
+// (os.Remove is non-recursive and refuses a non-empty directory), and a
+// failed op leaves the baseline unchanged for that path.
+func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []DirOp) (toAdd, toRemove []string, failures int) {
+	abs := func(root, rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }
+	for _, op := range ops {
+		var err error
+		var what string
+		switch op.Kind {
+		case dirBaselineAdd:
+			toAdd = append(toAdd, op.Path)
+			continue
+		case dirBaselineRemove:
+			toRemove = append(toRemove, op.Path)
+			continue
+		case DirRemoveLocal:
+			what, err = "failed to remove local directory", removeEmptyDir(abs(localRoot, op.Path))
+		case DirRemoveRemote:
+			what, err = "failed to remove remote directory", removeEmptyDir(abs(remoteRoot, op.Path))
+		case DirCreateLocal:
+			what, err = "failed to create local directory", os.MkdirAll(abs(localRoot, op.Path), 0o755)
+		case DirCreateRemote:
+			what, err = "failed to create remote directory", os.MkdirAll(abs(remoteRoot, op.Path), 0o755)
+		}
+		if err != nil {
+			failures++
+			logger.Error(what, map[string]any{"path": op.Path, "error": err.Error()})
+			continue
+		}
+		switch op.Kind {
+		case DirRemoveLocal, DirRemoveRemote:
+			toRemove = append(toRemove, op.Path)
+		default:
+			toAdd = append(toAdd, op.Path)
 		}
 	}
 	return toAdd, toRemove, failures
