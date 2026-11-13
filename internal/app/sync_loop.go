@@ -26,6 +26,14 @@ type RobustParams struct {
 	DB                    *sql.DB
 	Logger                *runtime.Logger
 	Policy                fs.HashPolicy // HashIfChanged for polls, HashAlways for deep verify
+	// ConfirmPlan, if set, is shown the non-NoOp actions RunRobustOnce is
+	// about to execute and may decline them (return false), in which case
+	// RunRobustOnce returns ErrAborted having changed nothing - no file
+	// action, no directory create/remove, no manifest write. It is how
+	// `syncd sync --hash`'s interactive confirm approves exactly the plan
+	// that then runs, rather than a separate preview scan's plan. nil
+	// (watch, --yes) means "always proceed".
+	ConfirmPlan func(actions []reconcile.Action) bool
 }
 
 // robustHardError marks an error from RunRobustOnce that happened before -
@@ -85,6 +93,10 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 		if action.Type != reconcile.ActionNoOp {
 			execActions = append(execActions, action)
 		}
+	}
+
+	if p.ConfirmPlan != nil && !p.ConfirmPlan(execActions) {
+		return plan, 0, ErrAborted
 	}
 
 	state := execute.SyncState{
@@ -284,6 +296,16 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 // directories if missing, and writes the remote canary file (.synclock) if
 // it isn't already there. It performs no reconciliation.
 func RunInit(localRoot, remoteRoot string, logger *runtime.Logger) error {
+	// Same guard watch and sync apply: a remote nested in the local root
+	// (or vice versa) would put the canary inside the tree being synced,
+	// and every later `watch` against this pair refuses to start anyway.
+	overlap, err := rootsOverlap(localRoot, remoteRoot)
+	if err != nil {
+		return fmt.Errorf("resolve init roots: %w", err)
+	}
+	if overlap {
+		return fmt.Errorf("local and remote roots must not be the same directory or nested inside one another: %s, %s", localRoot, remoteRoot)
+	}
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
 		return fmt.Errorf("create local root: %w", err)
 	}

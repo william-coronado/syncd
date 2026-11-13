@@ -323,14 +323,21 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		return nil
 	}
 
-	if !opts.Assume {
-		if !confirmOrDefault(opts.Confirm)(fastSummary(opts.Name, opts.Mode, res.Tasks)) {
-			return ErrAborted
+	// Nothing to do: report it, but don't ask "continue with the file
+	// transfers?" about zero transfers, or start an empty progress bar.
+	// Two-way state is still persisted below - a first run over two
+	// already-identical trees must still establish its baseline.
+	if len(res.Tasks) == 0 {
+		fmt.Println(fastSummary(opts.Name, opts.Mode, res.Tasks))
+	} else {
+		if !opts.Assume {
+			if !confirmOrDefault(opts.Confirm)(fastSummary(opts.Name, opts.Mode, res.Tasks)) {
+				return ErrAborted
+			}
 		}
-	}
-
-	if err := execute.RunFastTasks(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress); err != nil {
-		return fmt.Errorf("run fast tasks: %w", err)
+		if err := execute.RunFastTasks(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress); err != nil {
+			return fmt.Errorf("run fast tasks: %w", err)
+		}
 	}
 
 	if opts.Mode == reconcile.FastTwoWay {
@@ -460,18 +467,20 @@ func appendSummaryGroup(b *strings.Builder, label string, paths []string) {
 // runRobustOnce runs the robust, hash-based three-way engine for a single
 // ad-hoc job (the --hash bridge) by delegating the scan -> plan -> execute
 // -> manifest-update (+ empty-dir) cycle to the shared app.RunRobustOnce
-// (see run.go / sync_loop.go), so the --hash path benefits from the same
-// empty-dir create/cleanup and scan-progress logging as app.Run's always-on
-// loop.
+// (see sync_loop.go), so the --hash path benefits from the same empty-dir
+// create/cleanup and scan-progress logging as the always-on watch loop.
 //
-// RunRobustOnce has no pause point between planning and executing, but
-// SyncOnce supports an interactive confirm-before-mutate step (ptermConfirm
-// from the CLI). So when a confirmation is actually needed (!opts.Assume),
-// this builds a preview plan itself first - a second, hash-based scan -
-// purely to produce the summary text and get sign-off, then calls
-// RunRobustOnce for the (re-scanned) real run. The common automated case
-// (--yes) skips the preview and goes straight to RunRobustOnce, paying for
-// only one scan.
+// The interactive confirm-before-mutate step (!opts.Assume) runs INSIDE that
+// one cycle, via RobustParams.ConfirmPlan, between planning and executing:
+// the user approves exactly the actions that then execute. (It used to
+// build a separate preview plan from a second full HashAlways scan - twice
+// the hashing of both trees, and the plan that actually ran came from the
+// later scan, so it could include actions the user never saw.) A plan with
+// no file actions runs without prompting.
+//
+// --dry-run still builds its own preview (scanPairForOpts), since it must
+// tolerate a destination that doesn't exist yet and must never reach
+// RunRobustOnce at all.
 //
 // RunRobustOnce takes a *runtime.Logger, which SyncOptions has no
 // equivalent of; a non-silent logger (no log file) is constructed here,
@@ -485,12 +494,7 @@ func appendSummaryGroup(b *strings.Builder, label string, paths []string) {
 func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	repo := db.NewManifestRepo(sqlDB)
 
-	// A preview scan+plan is needed both to show the interactive confirm
-	// (!opts.Assume) and for --dry-run, which must print the same summary
-	// and exit before RunRobustOnce ever runs (no execution, no manifest
-	// persistence) - regardless of opts.Assume, since --dry-run must not
-	// require --yes either.
-	if opts.DryRun || !opts.Assume {
+	if opts.DryRun {
 		manifest, err := repo.LoadAll(ctx)
 		if err != nil {
 			return fmt.Errorf("load manifest: %w", err)
@@ -501,20 +505,20 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		}
 		skipped := mergeSkipSet(scans.Local, scans.Remote)
 		plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
-		execActions := make([]reconcile.Action, 0, len(plan.Actions))
-		for _, action := range plan.Actions {
-			if action.Type != reconcile.ActionNoOp {
-				execActions = append(execActions, action)
-			}
-		}
+		fmt.Println(robustSummary(opts.Name, nonNoOpActions(plan)))
+		return nil
+	}
 
-		summary := robustSummary(opts.Name, execActions)
-		if opts.DryRun {
-			fmt.Println(summary)
-			return nil
-		}
-		if !confirmOrDefault(opts.Confirm)(summary) {
-			return ErrAborted
+	var confirmPlan func([]reconcile.Action) bool
+	if !opts.Assume {
+		confirm := confirmOrDefault(opts.Confirm)
+		confirmPlan = func(actions []reconcile.Action) bool {
+			summary := robustSummary(opts.Name, actions)
+			if len(actions) == 0 {
+				fmt.Println(summary)
+				return true
+			}
+			return confirm(summary)
 		}
 	}
 
@@ -525,14 +529,18 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	defer logger.Close()
 
 	_, failures, runErr := RunRobustOnce(ctx, RobustParams{
-		LocalRoot:  opts.Left,
-		RemoteRoot: opts.Right,
-		Workers:    opts.Workers,
-		Repo:       repo,
-		DB:         sqlDB,
-		Logger:     logger,
-		Policy:     fs.HashAlways,
+		LocalRoot:   opts.Left,
+		RemoteRoot:  opts.Right,
+		Workers:     opts.Workers,
+		Repo:        repo,
+		DB:          sqlDB,
+		Logger:      logger,
+		Policy:      fs.HashAlways,
+		ConfirmPlan: confirmPlan,
 	})
+	if errors.Is(runErr, ErrAborted) {
+		return ErrAborted
+	}
 	// A hard failure (manifest LoadAll, ScanPair, or ApplyUpdates) is
 	// reported with this call site's own original per-stage wrapping,
 	// matching this function's pre-RunRobustOnce error text exactly.
@@ -546,6 +554,18 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		return fmt.Errorf("sync completed with %d failed action(s)", failures)
 	}
 	return nil
+}
+
+// nonNoOpActions returns plan's actions minus the NoOps - the ones that
+// would actually execute.
+func nonNoOpActions(plan reconcile.Plan) []reconcile.Action {
+	out := make([]reconcile.Action, 0, len(plan.Actions))
+	for _, action := range plan.Actions {
+		if action.Type != reconcile.ActionNoOp {
+			out = append(out, action)
+		}
+	}
+	return out
 }
 
 // robustSummary is the --hash-path counterpart to fastSummary: see its doc
