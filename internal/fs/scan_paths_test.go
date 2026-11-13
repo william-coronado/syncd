@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -130,5 +131,40 @@ func TestScanPaths_SkipsUnreadableFileAndRecordsIssue(t *testing.T) {
 	}
 	if _, ok := res.Skipped["unreadable.txt"]; !ok {
 		t.Errorf("expected unreadable.txt to be recorded as skipped, got %+v", res.Skipped)
+	}
+}
+
+// A directory-only ignore rule ("build/") must exclude files beneath that
+// directory from a scoped scan exactly as it does from a full ScanTree walk
+// (which never descends into the ignored directory at all).
+func TestScanPaths_HonorsIgnoredAncestorDirectory(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"build", "src"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(root, ignoreFileName), "build/\n")
+	writeFile(t, filepath.Join(root, "build", "out.bin"), "artifact")
+	writeFile(t, filepath.Join(root, "src", "main.go"), "package main")
+	matcher := newTestMatcher(t, root)
+
+	full, err := ScanTree(context.Background(), root, nil, true, matcher, HashNever, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := full.Files["build/out.bin"]; ok {
+		t.Fatal("precondition: full scan should ignore build/out.bin")
+	}
+
+	scoped, err := ScanPaths(root, map[string]struct{}{"build/out.bin": {}, "src/main.go": {}}, nil, HashNever, true, matcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := scoped.Files["build/out.bin"]; ok {
+		t.Fatal("scoped scan synced a file under an ignored directory")
+	}
+	if _, ok := scoped.Files["src/main.go"]; !ok {
+		t.Fatal("scoped scan dropped a non-ignored file")
 	}
 }

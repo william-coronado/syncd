@@ -117,6 +117,22 @@ func (m *IgnoreMatcher) Match(relPath string, isDir bool) bool {
 	return ignored
 }
 
+// MatchPathOrAncestor is Match, plus: relPath is also excluded when any of
+// its ancestor directories is. A full ScanTree walk gets that for free (it
+// never descends into an ignored directory), but code that looks up an
+// individual path directly - ScanPaths for an fsnotify batch, the watcher
+// itself - must check the ancestors explicitly, or a directory-only rule
+// like "build/" (which Match deliberately never applies to a FILE path)
+// would let "build/x.txt" through, diverging from what the full scan does.
+func (m *IgnoreMatcher) MatchPathOrAncestor(relPath string, isDir bool) bool {
+	for i := 0; i < len(relPath); i++ {
+		if relPath[i] == '/' && m.Match(relPath[:i], true) {
+			return true
+		}
+	}
+	return m.Match(relPath, isDir)
+}
+
 func (m *IgnoreMatcher) addPattern(raw string) error {
 	pattern := raw
 	negate := false

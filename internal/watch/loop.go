@@ -2,8 +2,11 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"syncd/internal/app"
 	"syncd/internal/fs"
@@ -32,6 +35,10 @@ const (
 // as watcher.go's fsAdd.
 var newTicker = time.NewTicker
 
+// newWatcher is NewWatcher, indirected so tests can reach the Watcher Run
+// creates (e.g. to inject an fsnotify error). Same pattern as newTicker.
+var newWatcher = NewWatcher
+
 // Run blocks until ctx is cancelled. It starts an fsnotify Watcher on
 // p.LocalRoot and drives three triggers, each running one reconcile cycle:
 //
@@ -57,7 +64,7 @@ var newTicker = time.NewTicker
 // Run returns nil on clean ctx cancellation (after closing the Watcher) or
 // a non-nil error if the Watcher itself failed to start.
 func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg LoopConfig) error {
-	w, err := NewWatcher(p.LocalRoot, matcher, cfg.Debounce)
+	w, err := newWatcher(p.LocalRoot, matcher, cfg.Debounce)
 	if err != nil {
 		return err
 	}
@@ -99,6 +106,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 	// channel closes, so the select case blocks forever afterward instead of
 	// spinning on a closed channel.
 	batches := w.Batches()
+	watchErrs := w.Errors()
 
 	var mu sync.Mutex
 
@@ -137,6 +145,27 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 				return err
 			})
 
+		case werr, ok := <-watchErrs:
+			if !ok {
+				watchErrs = nil
+				continue
+			}
+			if !errors.Is(werr, fsnotify.ErrEventOverflow) {
+				p.Logger.Error("watch: filesystem watcher error", map[string]any{"error": werr.Error()})
+				continue
+			}
+			// The kernel dropped events: some local changes may never
+			// arrive as a batch. Reconcile the whole tree now rather than
+			// leaving them until the next remote poll / deep scan.
+			p.Logger.Error("watch: filesystem event queue overflowed; running a full rescan", map[string]any{"error": werr.Error()})
+			guardedCycle(func() error {
+				rescanParams := p
+				rescanParams.Policy = fs.HashIfChanged
+				_, _, err := app.RunRobustOnce(ctx, rescanParams)
+				return err
+			})
+			drainQueuedErrors(watchErrs, p.Logger)
+
 		case <-pollTicker.C:
 			guardedCycle(func() error {
 				pollParams := p
@@ -152,6 +181,27 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 				_, _, err := app.RunRobustOnce(ctx, deepParams)
 				return err
 			})
+		}
+	}
+}
+
+// drainQueuedErrors empties errs without blocking - called right after an
+// overflow-triggered full rescan, which has just covered whatever further
+// queued overflows (typically more of the same burst) could have meant, so
+// those are dropped instead of each triggering another full rescan. Any
+// other error is still logged.
+func drainQueuedErrors(errs <-chan error, logger *runtime.Logger) {
+	for {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				return
+			}
+			if !errors.Is(err, fsnotify.ErrEventOverflow) {
+				logger.Error("watch: filesystem watcher error", map[string]any{"error": err.Error()})
+			}
+		default:
+			return
 		}
 	}
 }

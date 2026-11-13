@@ -33,7 +33,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 	}
 	scanStart := time.Now().Unix()
 	for rel := range relPaths {
-		if matcher.Match(rel, false) {
+		if matcher.MatchPathOrAncestor(rel, false) {
 			continue
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))

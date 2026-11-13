@@ -33,8 +33,13 @@ type Watcher struct {
 	debounce time.Duration
 
 	batches   chan map[string]struct{}
+	errs      chan error
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// maxLatency caps how long a batch can be held back by a stream of
+	// events that keeps resetting the debounce timer (see run).
+	maxLatency time.Duration
 
 	// addErrors records every fsw.Add failure hit while walking root in
 	// NewWatcher. It is only ever written during that synchronous walk,
@@ -134,13 +139,15 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 	}
 
 	w := &Watcher{
-		fsw:       fsw,
-		root:      root,
-		matcher:   matcher,
-		debounce:  debounce,
-		batches:   make(chan map[string]struct{}),
-		done:      make(chan struct{}),
-		addErrors: addErrors,
+		fsw:        fsw,
+		root:       root,
+		matcher:    matcher,
+		debounce:   debounce,
+		batches:    make(chan map[string]struct{}),
+		errs:       make(chan error, errorBuffer),
+		done:       make(chan struct{}),
+		addErrors:  addErrors,
+		maxLatency: maxBatchLatency(debounce),
 	}
 
 	go w.run()
@@ -155,6 +162,32 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 // it once and let the periodic deep scan backstop the gap.
 func (w *Watcher) AddErrors() []error {
 	return w.addErrors
+}
+
+// errorBuffer is how many fsnotify errors Errors() holds for a slow
+// consumer; beyond that they are dropped (a burst of identical overflow
+// errors needs only one rescan anyway).
+const errorBuffer = 8
+
+// maxBatchLatencyFactor bounds a batch's age at this many debounce windows
+// (5s at the default 500ms debounce). Without a cap, a continuously active
+// tree (a build loop) resets the debounce timer forever and its changes
+// wait for the next remote poll instead of syncing near-instantly
+// (docs/follow-ups.md #15).
+const maxBatchLatencyFactor = 10
+
+func maxBatchLatency(debounce time.Duration) time.Duration {
+	return debounce * maxBatchLatencyFactor
+}
+
+// Errors returns the channel on which errors reported by the underlying
+// fsnotify watcher are delivered - notably fsnotify.ErrEventOverflow, which
+// means the kernel dropped events and the watcher's view can no longer be
+// trusted (watch.Run answers it with a full rescan). Delivery is
+// best-effort: errors beyond a small buffer are dropped rather than ever
+// blocking event processing. Closed when the watcher stops.
+func (w *Watcher) Errors() <-chan error {
+	return w.errs
 }
 
 // Batches returns the receive-only channel of coalesced batches. Each value
@@ -182,6 +215,7 @@ func (w *Watcher) Close() error {
 // the only goroutine that ever sends on w.batches or closes it.
 func (w *Watcher) run() {
 	defer close(w.batches)
+	defer close(w.errs)
 
 	pending := make(map[string]struct{})
 	timer := time.NewTimer(w.debounce)
@@ -189,6 +223,9 @@ func (w *Watcher) run() {
 		<-timer.C
 	}
 	timerArmed := false
+	// firstPending is when the oldest path in pending arrived; together
+	// with maxLatency it bounds how long the debounce can keep deferring.
+	var firstPending time.Time
 
 	for {
 		select {
@@ -199,24 +236,38 @@ func (w *Watcher) run() {
 			if !ok {
 				return
 			}
+			wasEmpty := len(pending) == 0
 			w.handleEvent(ev, pending)
 			if len(pending) > 0 {
+				now := time.Now()
+				if wasEmpty {
+					firstPending = now
+				}
+				wait := w.debounce
+				if remaining := w.maxLatency - now.Sub(firstPending); remaining < wait {
+					wait = max(remaining, 0)
+				}
 				if timerArmed && !timer.Stop() {
 					select {
 					case <-timer.C:
 					default:
 					}
 				}
-				timer.Reset(w.debounce)
+				timer.Reset(wait)
 				timerArmed = true
 			}
 
-		case _, ok := <-w.fsw.Errors:
+		case err, ok := <-w.fsw.Errors:
 			if !ok {
 				return
 			}
-			// Errors from fsnotify are not fatal to the watch loop; drop
-			// and continue watching.
+			// Not fatal to the watcher: hand it to the consumer (which
+			// logs it, and rescans on overflow) and keep watching. Never
+			// block event processing on a slow consumer.
+			select {
+			case w.errs <- err:
+			default:
+			}
 
 		case <-timer.C:
 			timerArmed = false
@@ -261,7 +312,7 @@ func (w *Watcher) handleEvent(ev fsnotify.Event, pending map[string]struct{}) {
 	// The scanner (ScanTree/ScanPaths) also uses Lstat and rejects symlinks
 	// explicitly, so this keeps the two consistent.
 
-	if w.matcher.Match(rel, isDir) {
+	if w.matcher.MatchPathOrAncestor(rel, isDir) {
 		return
 	}
 
