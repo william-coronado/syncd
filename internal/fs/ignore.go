@@ -42,7 +42,10 @@ var defaultIgnorePatterns = []string{
 	"@eaDir",
 }
 
-const ignoreFileName = ".syncdignore"
+// IgnoreFileName is the per-local-root ignore file LoadIgnoreMatcher reads.
+const IgnoreFileName = ".syncdignore"
+
+const ignoreFileName = IgnoreFileName
 
 type ignoreRule struct {
 	negate  bool

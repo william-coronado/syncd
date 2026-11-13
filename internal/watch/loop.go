@@ -3,6 +3,8 @@ package watch
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -68,7 +70,9 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 	if err != nil {
 		return err
 	}
-	defer w.Close()
+	// w is replaced when .syncdignore changes (see reloadIgnore), so close
+	// whichever watcher is current at exit.
+	defer func() { w.Close() }()
 
 	// NewWatcher degrades to partial coverage rather than failing outright
 	// when some directories couldn't be added (e.g. Linux's
@@ -126,6 +130,51 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 		}
 	}
 
+	// Scans reload .syncdignore every cycle, but the watcher's matcher
+	// (which decides what is watched at all) was fixed at startup: a
+	// directory un-ignored mid-run was never watched, so its changes only
+	// arrived via polls (docs/follow-ups.md #28). reloadIgnore rebuilds the
+	// watcher with the new rules when the file's content changes - checked
+	// when the file itself shows up in a batch, and on every remote poll in
+	// case that event was missed (or the file ignores itself). With rescan,
+	// it then reconciles the whole tree, since newly un-ignored paths may
+	// already hold unsynced files and the old watcher's pending events are
+	// gone.
+	ignorePath := filepath.Join(p.LocalRoot, fs.IgnoreFileName)
+	lastIgnore := ignoreFileSignature(ignorePath)
+	reloadIgnore := func(rescan bool) {
+		sig := ignoreFileSignature(ignorePath)
+		if sig == lastIgnore {
+			return
+		}
+		newMatcher, err := fs.LoadIgnoreMatcher(p.LocalRoot)
+		if err != nil {
+			// Keep the old rules; scans will fail on the same error until
+			// the file is fixed, which is the louder signal.
+			p.Logger.Error("watch: .syncdignore changed but could not be loaded; keeping previous rules", map[string]any{"error": err.Error()})
+			lastIgnore = sig
+			return
+		}
+		nw, err := newWatcher(p.LocalRoot, newMatcher, cfg.Debounce)
+		if err != nil {
+			p.Logger.Error("watch: could not rebuild watcher for new .syncdignore; keeping the old one", map[string]any{"error": err.Error()})
+			return // lastIgnore unchanged: retried at the next check
+		}
+		_ = w.Close()
+		w = nw
+		batches, watchErrs = w.Batches(), w.Errors()
+		lastIgnore = sig
+		p.Logger.Printf("watch: .syncdignore changed; watcher rebuilt with the new rules")
+		if rescan {
+			guardedCycle(func() error {
+				rescanParams := p
+				rescanParams.Policy = fs.HashIfChanged
+				_, _, err := app.RunRobustOnce(ctx, rescanParams)
+				return err
+			})
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -144,6 +193,9 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 				_, err := ReconcilePaths(ctx, p, batch)
 				return err
 			})
+			if _, ok := batch[fs.IgnoreFileName]; ok {
+				reloadIgnore(true)
+			}
 
 		case werr, ok := <-watchErrs:
 			if !ok {
@@ -167,6 +219,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			drainQueuedErrors(watchErrs, p.Logger)
 
 		case <-pollTicker.C:
+			reloadIgnore(false) // this poll is itself the full rescan
 			guardedCycle(func() error {
 				pollParams := p
 				pollParams.Policy = fs.HashIfChanged
@@ -204,4 +257,15 @@ func drainQueuedErrors(errs <-chan error, logger *runtime.Logger) {
 			return
 		}
 	}
+}
+
+// ignoreFileSignature identifies the current content of the ignore file
+// (its bytes, or a marker for "absent/unreadable") so reloadIgnore can tell
+// a real change from an event that left it the same.
+func ignoreFileSignature(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "\x00absent"
+	}
+	return string(b)
 }
