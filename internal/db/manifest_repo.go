@@ -118,6 +118,23 @@ func (r *ManifestRepo) LoadPaths(ctx context.Context, paths map[string]struct{})
 	return out, nil
 }
 
+// LoadPrefix returns every manifest row strictly beneath directory dirRel
+// ("a/b" -> "a/b/x", "a/b/c/y", but never "a/bc"). Matching is on whole
+// path segments via a range scan on the primary key: '0' is the byte after
+// '/', so [dirRel+"/", dirRel+"0") is exactly the paths starting with
+// dirRel+"/".
+func (r *ManifestRepo) LoadPrefix(ctx context.Context, dirRel string) (map[string]ManifestRow, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT `+manifestColumns+` FROM file_manifest WHERE path >= ? AND path < ?`, dirRel+"/", dirRel+"0")
+	if err != nil {
+		return nil, fmt.Errorf("query manifest prefix: %w", err)
+	}
+	out := make(map[string]ManifestRow)
+	if err := scanManifestRows(rows, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 const manifestColumns = `path, size, mtime, hash, last_synced, remote_size, remote_mtime`
 
 // scanManifestRows drains rows (selected with manifestColumns) into out and

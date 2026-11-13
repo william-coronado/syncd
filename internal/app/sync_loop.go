@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"syncd/internal/db"
@@ -241,45 +243,91 @@ func collectManifestUpdates(results []execute.Result, logger *runtime.Logger) (u
 	return upserts, deletes, failures
 }
 
-// RunRobustScoped reconciles ONLY relPaths, scanning just those paths on
-// both sides via fs.ScanPaths (no tree walk). It mirrors RunRobustOnce's
-// scan -> plan -> execute -> manifest-commit flow but omits whole-tree
-// empty-dir CREATION (new empty dirs, and dirs emptied by a recursive
-// delete outside this batch, are picked up by the periodic deep scan
-// instead). Emptied-dir cleanup driven by this batch's own deletes still
-// runs, same as RunRobustOnce.
+// RunRobustScoped reconciles ONLY relPaths (an fsnotify batch) rather than
+// the whole tree. A file path is stat/hashed on both sides via fs.ScanPaths
+// - no tree walk. A path that is a DIRECTORY on either side (fsnotify
+// reports only the top-level path of a recursive delete, a directory
+// renamed in or out, or a directory created with contents) is expanded:
+// that subtree alone is walked on whichever side(s) it exists
+// (fs.ScanSubtree), its manifest rows are loaded by prefix, and its
+// directories are reconciled against the directory baseline - so a
+// recursive delete or a directory rename propagates in this cycle instead
+// of waiting for the next remote poll. The same prefix load is done for a
+// path that is now absent locally, since it may have been a directory.
+//
+// It otherwise mirrors RunRobustOnce's scan -> plan -> execute ->
+// manifest-commit flow. Directories outside the batch's subtrees (e.g. new
+// empty directories elsewhere) are left to the periodic full cycles.
 func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]struct{}) (reconcile.Plan, int, error) {
 	matcher, err := fs.LoadIgnoreMatcher(p.LocalRoot)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	// Only this batch's rows: loading the whole manifest per fsnotify batch
-	// made the scoped (hot) path's cost scale with the tree, not the batch.
+	subtrees, prefixes := scopedSubtrees(p.LocalRoot, p.RemoteRoot, relPaths, matcher)
+
+	// Only this batch's rows (plus everything beneath its directory
+	// paths): loading the whole manifest per fsnotify batch made the
+	// scoped (hot) path's cost scale with the tree, not the batch.
 	scopedManifest, err := p.Repo.LoadPaths(ctx, relPaths)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
+	for _, prefix := range prefixes {
+		rows, err := p.Repo.LoadPrefix(ctx, prefix)
+		if err != nil {
+			return reconcile.Plan{}, 0, err
+		}
+		for k, v := range rows {
+			scopedManifest[k] = v
+		}
+	}
+	remoteManifest := db.RemoteStatView(scopedManifest)
+
 	localScan, err := fs.ScanPaths(p.LocalRoot, relPaths, scopedManifest, p.Policy, true, matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	remoteScan, err := fs.ScanPaths(p.RemoteRoot, relPaths, db.RemoteStatView(scopedManifest), p.Policy, false, matcher)
+	remoteScan, err := fs.ScanPaths(p.RemoteRoot, relPaths, remoteManifest, p.Policy, false, matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
+	}
+	for _, st := range subtrees {
+		if st.local {
+			sub, err := fs.ScanSubtree(ctx, p.LocalRoot, st.rel, scopedManifest, true, matcher, p.Policy)
+			if err != nil {
+				return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
+			}
+			mergeScanResult(&localScan, sub)
+		}
+		if st.remote {
+			sub, err := fs.ScanSubtree(ctx, p.RemoteRoot, st.rel, remoteManifest, false, matcher, p.Policy)
+			if err != nil {
+				return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
+			}
+			mergeScanResult(&remoteScan, sub)
+		}
 	}
 	logScanIssues(p.Logger, "local", localScan.Issues)
 	logScanIssues(p.Logger, "remote", remoteScan.Issues)
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
-	execActions := make([]reconcile.Action, 0, len(plan.Actions))
-	for _, a := range plan.Actions {
-		if a.Type != reconcile.ActionNoOp {
-			execActions = append(execActions, a)
-		}
-	}
+	execActions := nonNoOpActions(plan)
 	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files}
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
+
+	var dirsToAdd, dirsToRemove []string
+	dirRepo := db.NewDirRepo(p.DB)
+	if len(subtrees) > 0 {
+		dirBaseline, err := dirRepo.LoadAll(ctx)
+		if err != nil {
+			return plan, failures, &robustHardError{stage: "load dir manifest", err: err}
+		}
+		var dirFailures int
+		dirsToAdd, dirsToRemove, dirFailures = reconcileDirectories(p.Logger, p.LocalRoot, p.RemoteRoot,
+			localScan.Dirs, remoteScan.Dirs, baselineWithin(dirBaseline, subtrees), skipped)
+		failures += dirFailures
+	}
 	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
 
 	noopUpserts, noopDeletes := noopManifestUpdates(plan, localScan.Files, remoteScan.Files, scopedManifest)
@@ -289,7 +337,99 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	if err := commitManifestUpdates(ctx, p.Repo, upserts, deletes); err != nil {
 		return plan, failures, err
 	}
+	// Detached context, as in RunRobustOnce: completed directory
+	// creates/removes must be recorded even if ctx was cancelled.
+	if err := dirRepo.ApplyUpdates(context.WithoutCancel(ctx), dirsToAdd, dirsToRemove); err != nil {
+		return plan, failures, &robustHardError{stage: "apply dir manifest updates", err: err}
+	}
 	return plan, failures, runErr
+}
+
+// scopedSubtree is a batch path that is a directory on at least one side.
+type scopedSubtree struct {
+	rel           string
+	local, remote bool // which side(s) it is a real directory on
+}
+
+// scopedSubtrees classifies a batch for RunRobustScoped: the directory
+// paths to walk (outermost only - a path beneath another one in the batch
+// is already covered by its walk), and the prefixes whose manifest rows
+// must be loaded: every walked directory, plus every path now absent
+// locally (it may have been a directory whose tracked contents need
+// reconciling). Ignored paths are dropped.
+func scopedSubtrees(localRoot, remoteRoot string, relPaths map[string]struct{}, matcher *fs.IgnoreMatcher) ([]scopedSubtree, []string) {
+	isDir := func(root, rel string) (dir, missing bool) {
+		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			return false, os.IsNotExist(err)
+		}
+		return info.IsDir(), false // Lstat: a symlink is never a directory here
+	}
+	var subtrees []scopedSubtree
+	var prefixes []string
+	for rel := range relPaths {
+		localDir, localMissing := isDir(localRoot, rel)
+		remoteDir, _ := isDir(remoteRoot, rel)
+		if (localDir || remoteDir) && !matcher.MatchPathOrAncestor(rel, true) {
+			subtrees = append(subtrees, scopedSubtree{rel: rel, local: localDir, remote: remoteDir})
+		} else if localMissing && !matcher.MatchPathOrAncestor(rel, true) {
+			prefixes = append(prefixes, rel)
+		}
+	}
+	// Keep only outermost subtrees.
+	sort.Slice(subtrees, func(i, j int) bool { return subtrees[i].rel < subtrees[j].rel })
+	outer := subtrees[:0]
+	for _, st := range subtrees {
+		if len(outer) > 0 && isWithin(st.rel, outer[len(outer)-1].rel) {
+			continue
+		}
+		outer = append(outer, st)
+	}
+	for _, st := range outer {
+		prefixes = append(prefixes, st.rel)
+	}
+	sort.Strings(prefixes)
+	return outer, prefixes
+}
+
+// isWithin reports whether rel is dir itself or beneath it, by whole
+// path segments.
+func isWithin(rel, dir string) bool {
+	return rel == dir || strings.HasPrefix(rel, dir+"/")
+}
+
+// baselineWithin restricts the directory baseline to the walked subtrees,
+// so reconcileDirectories never mistakes a directory outside them (which
+// this cycle didn't scan) for one deleted on both sides.
+func baselineWithin(baseline map[string]struct{}, subtrees []scopedSubtree) map[string]struct{} {
+	out := make(map[string]struct{})
+	for d := range baseline {
+		for _, st := range subtrees {
+			if isWithin(d, st.rel) {
+				out[d] = struct{}{}
+				break
+			}
+		}
+	}
+	return out
+}
+
+// mergeScanResult folds src (a subtree scan of the same root) into dst.
+func mergeScanResult(dst *fs.ScanResult, src fs.ScanResult) {
+	for k, v := range src.Files {
+		dst.Files[k] = v
+	}
+	for k := range src.Skipped {
+		dst.Skipped[k] = struct{}{}
+		delete(dst.Files, k)
+	}
+	for k := range src.SkippedDirs {
+		dst.SkippedDirs[k] = struct{}{}
+	}
+	for k := range src.Dirs {
+		dst.Dirs[k] = struct{}{}
+	}
+	dst.Issues = append(dst.Issues, src.Issues...)
 }
 
 // RunInit bootstraps first-time setup: creates the local and remote root

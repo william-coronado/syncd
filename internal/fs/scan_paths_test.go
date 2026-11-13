@@ -168,3 +168,36 @@ func TestScanPaths_HonorsIgnoredAncestorDirectory(t *testing.T) {
 		t.Fatal("scoped scan dropped a non-ignored file")
 	}
 }
+
+// ScanSubtree reports root-relative paths and applies anchored ignore rules
+// against them, so its result merges with a full scan of the same root.
+func TestScanSubtree_RootRelativePathsAndAnchoredIgnores(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"proj/src", "proj/out", "other"} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(d)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(root, ignoreFileName), "/proj/out\n")
+	writeFile(t, filepath.Join(root, "proj", "src", "a.go"), "a")
+	writeFile(t, filepath.Join(root, "proj", "out", "bin"), "b")
+	writeFile(t, filepath.Join(root, "other", "c.txt"), "c")
+	matcher := newTestMatcher(t, root)
+
+	res, err := ScanSubtree(context.Background(), root, "proj", nil, true, matcher, HashNever)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := res.Files["proj/src/a.go"]; !ok {
+		t.Fatalf("want root-relative proj/src/a.go, got %v", res.Files)
+	}
+	if _, ok := res.Files["proj/out/bin"]; ok {
+		t.Fatal("anchored ignore /proj/out not applied in subtree scan")
+	}
+	if _, ok := res.Files["other/c.txt"]; ok {
+		t.Fatal("subtree scan escaped its subtree")
+	}
+	if _, ok := res.Dirs["proj"]; !ok {
+		t.Fatalf("subtree root itself should be in Dirs: %v", res.Dirs)
+	}
+}

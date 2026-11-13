@@ -116,3 +116,27 @@ func TestManifestRepo_LoadPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestManifestRepo_LoadPrefixMatchesWholeSegments(t *testing.T) {
+	repo := openTestDB(t)
+	ctx := context.Background()
+	var rows []ManifestRow
+	for _, p := range []string{"a/b", "a/b/x", "a/b/c/y", "a/bc", "a/bc/z", "a/b0", "a/b.txt"} {
+		rows = append(rows, ManifestRow{Path: p, Size: 1, Mtime: 1, Hash: "h"})
+	}
+	if err := repo.ApplyUpdates(ctx, rows, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.LoadPrefix(ctx, "a/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want exactly a/b/x and a/b/c/y, got %v", got)
+	}
+	for _, p := range []string{"a/b/x", "a/b/c/y"} {
+		if _, ok := got[p]; !ok {
+			t.Fatalf("missing %s in %v", p, got)
+		}
+	}
+}
