@@ -426,18 +426,55 @@ func fastSummary(name string, mode reconcile.FastMode, tasks []reconcile.FastTas
 	}
 	byType := make(map[reconcile.FastTaskType][]string)
 	for _, t := range tasks {
-		byType[t.Type] = append(byType[t.Type], t.RelPath)
+		entry := t.RelPath
+		if t.OldRelPath != "" { // moves: show where from
+			entry = t.OldRelPath + " -> " + t.RelPath
+		}
+		byType[t.Type] = append(byType[t.Type], entry)
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "sync %q (%s): %d task(s)", name, mode, len(tasks))
-	for _, tt := range []reconcile.FastTaskType{
+	order := []reconcile.FastTaskType{
 		reconcile.DeleteL, reconcile.DeleteR, // destructive first
+		reconcile.ConflictL2R, reconcile.ConflictR2L,
 		reconcile.CopyL2R, reconcile.CopyR2L,
 		reconcile.MoveL, reconcile.MoveR,
-	} {
-		appendSummaryGroup(&b, string(tt), byType[tt])
+	}
+	for _, tt := range withUnlisted(order, byType) {
+		appendSummaryGroup(&b, fastTaskLabel(tt), byType[tt])
 	}
 	return b.String()
+}
+
+// fastTaskLabel is the summary heading for a fast task type; conflict
+// types spell out that the losing side is kept.
+func fastTaskLabel(tt reconcile.FastTaskType) string {
+	switch tt {
+	case reconcile.ConflictL2R:
+		return "ConflictL2R (left newer; right's version kept as conflict copy)"
+	case reconcile.ConflictR2L:
+		return "ConflictR2L (right newer; left's version kept as conflict copy)"
+	}
+	return string(tt)
+}
+
+// withUnlisted returns order followed by every other key of present, sorted,
+// so a task/action type missing from a summary's fixed display order is
+// still shown rather than executing without ever appearing in the summary
+// the user approves (docs/follow-ups.md #22).
+func withUnlisted[K ~string, V any](order []K, present map[K]V) []K {
+	listed := make(map[K]bool, len(order))
+	for _, k := range order {
+		listed[k] = true
+	}
+	var extra []K
+	for k := range present {
+		if !listed[k] {
+			extra = append(extra, k)
+		}
+	}
+	sort.Slice(extra, func(i, j int) bool { return extra[i] < extra[j] })
+	return append(append([]K(nil), order...), extra...)
 }
 
 // appendSummaryGroup writes one task/action-type section to b: a "Label: N"
@@ -580,11 +617,12 @@ func robustSummary(name string, actions []reconcile.Action) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "sync %q (hash): %d action(s)", name, len(actions))
-	for _, at := range []reconcile.ActionType{
+	order := []reconcile.ActionType{
 		reconcile.ActionDeleteLocal, reconcile.ActionDeleteRemote, // destructive first
 		reconcile.ActionUpload, reconcile.ActionDownload,
 		reconcile.ActionConflict,
-	} {
+	}
+	for _, at := range withUnlisted(order, byType) {
 		appendSummaryGroup(&b, string(at), byType[at])
 	}
 	return b.String()
