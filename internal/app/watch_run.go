@@ -89,6 +89,8 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 		return err
 	}
 	defer logger.Close()
+	// The default log is named per root pair, so say where it is.
+	logger.Printf("syncd watch: local=%s remote=%s log=%s", cfg.LocalRoot, cfg.RemoteRoot, paths.LogPath)
 
 	lock, err := runtime.AcquireLock(paths.LockPath)
 	if err != nil {

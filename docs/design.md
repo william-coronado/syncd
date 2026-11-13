@@ -136,7 +136,7 @@ New `internal/watch` package (multi-writer SMB confirmed):
 - Binary and module: **`syncd`**.
 - Config file: `~/.syncd.yaml`.
 - Ignore file: `.syncdignore` (built-in defaults preserved).
-- State dir: `~/.local/state/syncd/` (`manifest.db`, `sync.lock`, `sync.log`).
+- State dir: `~/.local/state/syncd/` (`manifest-<pair>.db`, `sync-<pair>.lock`, `sync-<pair>.log` for watch, named per root pair).
 - Canary file stays `.synclock` (already deployed on remotes; renaming it would
   break existing shares — keep as-is).
 - Deploy units renamed to `syncd.service` / `syncd.timer` /

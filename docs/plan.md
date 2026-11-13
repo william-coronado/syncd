@@ -12,7 +12,7 @@
 
 - Module path: `syncd`. All internal imports are `syncd/internal/...`.
 - Binary name: `syncd`. Config file: `~/.syncd.yaml`. Ignore file: `.syncdignore`.
-- State dir default: `~/.local/state/syncd/` (`manifest.db`, `sync.lock`, `sync.log`).
+- State dir default: `~/.local/state/syncd/` (`manifest-<pair>.db`, `sync-<pair>.lock`, `sync-<pair>.log` for watch, named per root pair).
 - Canary filename stays `.synclock` (already deployed on remote shares — do NOT rename).
 - Cross-platform: every task must build and test on both macOS (darwin) and Ubuntu (linux). No OS-specific syscalls outside files already guarded.
 - TDD: write the failing test first, watch it fail, implement, watch it pass, commit.
