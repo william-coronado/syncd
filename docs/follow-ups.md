@@ -45,7 +45,10 @@ paths from fsnotify events and never discovers descendants, so a file made
 unreachable by a newly-unreadable ancestor fails its own `Lstat` and gets an
 exact `Skipped` entry directly. The unreadable-directory case is caught by the
 next full `RunRobustOnce` cycle. Worth a comment if anyone ever gives `ScanPaths`
-directory-recursion.
+directory-recursion. (As of 2026-11-13 the scoped cycle expands directory
+paths via `fs.ScanSubtree`, which shares `ScanTree`'s walk and so does
+populate `SkippedDirs` for an unreadable directory inside the subtree;
+`ScanPaths` itself is unchanged.)
 
 Items #15, #16, #18, #19 and #21 from the second pass (debounce max-latency
 cap, `RunActions` ctx error on a completed batch, `cobra.CheckErr` in
@@ -136,94 +139,22 @@ are scoped (fsnotify-triggered) or already run to completion by design
 elsewhere — revisit if large-file cancellation latency ever becomes a
 complaint.
 
-### 22. Confirm-prompt summaries enumerate a fixed list of task types
-
-`internal/app/sync_once.go` (`fastSummary`/`robustSummary`) — both iterate a
-hardcoded slice of task types rather than the actual keys present. A new
-action type added to either reconciler would execute without ever appearing
-in the safety-gate summary the user approves before `--yes` is skipped.
-Currently exhaustive (matches every type both reconcilers emit today); would
-need to be revisited the next time a new task/action type is added, not
-before.
-
 ### 23. `ResolvePaths`' default db/lock naming doesn't canonicalize roots
 
-`internal/runtime/paths.go` — `defaultManifestDBName`/`defaultLockName` hash
+`internal/runtime/paths.go` — `defaultManifestDBName`/`defaultLockName`/`defaultLogName` hash
 `localRoot + "\x00" + remoteRoot` as given, without `filepath.Clean`. The CLI
 always passes `filepath.Abs`-resolved roots first, so this isn't reachable
 through `syncd sync`/`syncd watch` today, but a direct library caller passing
-a trailing slash or relative form would silently get a different db/lock
+a trailing slash or relative form would silently get a different db/lock/log
 path for what is really the same root pair. `jobStateKey`
 (`internal/cli/sync_cmd.go`) already does the `filepath.Abs` canonicalization
 this needs — same fix, if the library contract ever gets a caller other than
 the CLI.
 
-Items #24-#29 are from a third review pass (2026-11-13). That pass's real
-defects were fixed directly (see git history for that date): the robust
-executor overwriting/deleting destinations changed since the scan, the
-remote-side hash cache never hitting for identical pairs with differing
-mtimes, `sync --hash` executing a different plan than the one confirmed,
-duplicate CLI error output with a usage dump, the scoped scan ignoring
-directory-only ignore rules on ancestors, and fsnotify errors being dropped.
-What follows was judged worth recording but not changing unilaterally.
-
-### 24. Fast `update` mode overwrites a newer destination when sizes differ
-
-`internal/reconcile/fast.go` — `update` copies L→R when
-`lState.Size != rState.Size || lState.Mtime > rState.Mtime`, so a destination
-file that is *newer* than the source but a different size is overwritten.
-rsync's `--update` skips any destination newer than the source regardless
-of size. This is a straight port of file_sync_util's behavior, so changing
-it is a semantics decision for the owner, not a bug fix: decide whether
-"update" means "never clobber a newer destination" and, if so, drop the
-size clause for the `rState.Mtime > lState.Mtime` case.
-
-### 25. Fast two-way "newer wins" conflicts keep no copy of the losing edit
-
-`internal/reconcile/fast.go` — when both sides changed since the last
-two-way run, the newer mtime wins and the other side's edit is overwritten
-with no conflict copy (unlike the robust engine, which preserves both).
-Documented file_sync_util behavior; the robust engine (`--hash`) is the
-answer when that matters. Revisit if users mix fast two-way with real
-concurrent editing.
-
-### 26. Scoped cycle doesn't expand a deleted/renamed local directory
-
-`internal/app/sync_loop.go` (`RunRobustScoped`) — fsnotify reports only the
-top-level path of a recursive delete or a directory rename, and
-`ScanPaths` skips directories, so the children wait for the next
-`--remote-poll` (30s default). Expanding an absent-locally directory path to
-its manifest children would propagate the delete immediately, but for a
-rename the new side's files still need a subtree walk, so doing only the
-delete half would briefly leave the remote with neither copy. Worth doing
-both halves together (a scoped subtree `ScanTree`) if poll latency for
-directory moves ever matters.
-
-### 27. Concurrent `watch` instances share the default `sync.log`
-
-`internal/runtime/paths.go` — the default db and lock are per root pair,
-but the default log is a fixed `sync.log`, so two watch daemons for
-different pairs interleave in one file, and one's in-place rotation renames
-the file out from under the other (whose writes then land in `.old` until
-it rotates itself). Fix by deriving the default log name from the root pair
-like `defaultLockName`; deferred because it changes where operators look for
-logs.
-
-### 28. The watcher's ignore matcher is fixed at startup
-
-`internal/app/watch_run.go` / `internal/watch/watcher.go` — scans reload
-`.syncdignore` every cycle, but the fsnotify watcher keeps the matcher it
-started with: a directory un-ignored mid-run is never added to the watch
-set (its changes arrive only via polls), and a newly ignored one keeps
-generating events (harmless: the scoped scan reloads the matcher and drops
-them). Restart the daemon after editing `.syncdignore`, or rebuild the
-watcher when the file changes.
-
-### 29. The `--hash` confirm summary doesn't list directory operations
-
-`internal/app/sync_once.go` (`robustSummary`) — the approved summary lists
-file actions only; `reconcileDirectories` may also create empty
-directories, or remove empty directories whose deletion it is propagating,
-in the same cycle. Only ever empty directories (`os.Remove` is
-non-recursive), so no file data is at risk, but the prompt is not a
-complete list of what will change.
+The third review pass (2026-11-13) fixed its defects directly and then
+resolved the six items it had recorded (#24-#29: `update` overwriting a
+newer destination, two-way conflicts keeping no copy of the losing edit,
+the scoped cycle not expanding directories, the shared default log, the
+watcher's startup-fixed ignore rules, and directory operations missing
+from the `--hash` summary), along with #22 from the second pass (summaries enumerating a
+fixed list of types). See the git history for that date.
