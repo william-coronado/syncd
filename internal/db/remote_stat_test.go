@@ -116,4 +116,3 @@ func TestManifestRepo_LoadPaths(t *testing.T) {
 		}
 	}
 }
-
