@@ -97,8 +97,14 @@ func FastCompare(mode FastMode, left, right, prev map[string]db.JobFileState, sk
 				continue
 			}
 			newState[relPath] = lState
+			// rsync --update semantics: copy when the destination is
+			// missing or older, never when it is NEWER - even if the sizes
+			// differ, since a newer destination is most likely an edit made
+			// there that copying would silently destroy. Equal mtimes with
+			// different sizes still copy (the source is not older, and the
+			// two plainly differ).
 			rState, rExists := right[relPath]
-			if !rExists || lState.Size != rState.Size || lState.Mtime > rState.Mtime {
+			if !rExists || lState.Mtime > rState.Mtime || (lState.Mtime == rState.Mtime && lState.Size != rState.Size) {
 				tasks = append(tasks, FastTask{Type: CopyL2R, RelPath: relPath, Size: lState.Size})
 			}
 		}
