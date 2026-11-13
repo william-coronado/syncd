@@ -29,13 +29,15 @@ type RobustParams struct {
 	Logger                *runtime.Logger
 	Policy                fs.HashPolicy // HashIfChanged for polls, HashAlways for deep verify
 	// ConfirmPlan, if set, is shown the non-NoOp actions RunRobustOnce is
-	// about to execute and may decline them (return false), in which case
+	// about to execute, plus the directory creates/removes it will make
+	// (dirOps lists only those that change a tree), and may decline them
+	// (return false), in which case
 	// RunRobustOnce returns ErrAborted having changed nothing - no file
 	// action, no directory create/remove, no manifest write. It is how
 	// `syncd sync --hash`'s interactive confirm approves exactly the plan
 	// that then runs, rather than a separate preview scan's plan. nil
 	// (watch, --yes) means "always proceed".
-	ConfirmPlan func(actions []reconcile.Action) bool
+	ConfirmPlan func(actions []reconcile.Action, dirOps []DirOp) bool
 }
 
 // robustHardError marks an error from RunRobustOnce that happened before -
@@ -97,7 +99,11 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 		}
 	}
 
-	if p.ConfirmPlan != nil && !p.ConfirmPlan(execActions) {
+	// Planned from the scan now, applied after the file actions below (the
+	// same scan-time view the apply step always used), so the confirm can
+	// show directory operations too.
+	dirOps := planDirectories(scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped)
+	if p.ConfirmPlan != nil && !p.ConfirmPlan(execActions, visibleDirOps(dirOps)) {
 		return plan, 0, ErrAborted
 	}
 
@@ -114,7 +120,7 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 
-	dirsToAdd, dirsToRemove, dirFailures := reconcileDirectories(p.Logger, p.LocalRoot, p.RemoteRoot, scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped)
+	dirsToAdd, dirsToRemove, dirFailures := applyDirOps(p.Logger, p.LocalRoot, p.RemoteRoot, dirOps)
 	failures += dirFailures
 	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
 

@@ -540,18 +540,23 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		if err != nil {
 			return fmt.Errorf("scan: %w", err)
 		}
+		dirBaseline, err := db.NewDirRepo(sqlDB).LoadAll(ctx)
+		if err != nil {
+			return fmt.Errorf("load dir manifest: %w", err)
+		}
 		skipped := mergeSkipSet(scans.Local, scans.Remote)
 		plan := reconcile.BuildPlan(scans.Local.Files, scans.Remote.Files, manifest, skipped)
-		fmt.Println(robustSummary(opts.Name, nonNoOpActions(plan)))
+		dirOps := visibleDirOps(planDirectories(scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped))
+		fmt.Println(robustSummary(opts.Name, nonNoOpActions(plan), dirOps...))
 		return nil
 	}
 
-	var confirmPlan func([]reconcile.Action) bool
+	var confirmPlan func([]reconcile.Action, []DirOp) bool
 	if !opts.Assume {
 		confirm := confirmOrDefault(opts.Confirm)
-		confirmPlan = func(actions []reconcile.Action) bool {
-			summary := robustSummary(opts.Name, actions)
-			if len(actions) == 0 {
+		confirmPlan = func(actions []reconcile.Action, dirOps []DirOp) bool {
+			summary := robustSummary(opts.Name, actions, dirOps...)
+			if len(actions) == 0 && len(dirOps) == 0 {
 				fmt.Println(summary)
 				return true
 			}
@@ -607,20 +612,33 @@ func nonNoOpActions(plan reconcile.Plan) []reconcile.Action {
 
 // robustSummary is the --hash-path counterpart to fastSummary: see its doc
 // comment for the path-listing/cap/destructive-first rationale.
-func robustSummary(name string, actions []reconcile.Action) string {
-	if len(actions) == 0 {
+//
+// dirOps (the tree-changing directory operations the same cycle will make -
+// only ever empty directories, since removal is non-recursive) are listed
+// as RMDIR_*/MKDIR_* groups, so the summary is a complete list of what
+// will change (docs/follow-ups.md #29).
+func robustSummary(name string, actions []reconcile.Action, dirOps ...DirOp) string {
+	if len(actions) == 0 && len(dirOps) == 0 {
 		return fmt.Sprintf("sync %q (hash): no changes", name)
 	}
 	byType := make(map[reconcile.ActionType][]string)
 	for _, a := range actions {
 		byType[a.Type] = append(byType[a.Type], a.Path)
 	}
+	for _, op := range dirOps {
+		byType[reconcile.ActionType(op.Kind)] = append(byType[reconcile.ActionType(op.Kind)], op.Path+"/")
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "sync %q (hash): %d action(s)", name, len(actions))
+	if len(dirOps) > 0 {
+		fmt.Fprintf(&b, ", %d empty-directory operation(s)", len(dirOps))
+	}
 	order := []reconcile.ActionType{
 		reconcile.ActionDeleteLocal, reconcile.ActionDeleteRemote, // destructive first
+		reconcile.ActionType(DirRemoveLocal), reconcile.ActionType(DirRemoveRemote),
 		reconcile.ActionUpload, reconcile.ActionDownload,
 		reconcile.ActionConflict,
+		reconcile.ActionType(DirCreateLocal), reconcile.ActionType(DirCreateRemote),
 	}
 	for _, at := range withUnlisted(order, byType) {
 		appendSummaryGroup(&b, string(at), byType[at])
