@@ -269,7 +269,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	subtrees, prefixes := scopedSubtrees(p.LocalRoot, p.RemoteRoot, relPaths, matcher)
+	subtrees, prefixes, unknown := scopedSubtrees(p.LocalRoot, p.RemoteRoot, relPaths, matcher)
 
 	// Only this batch's rows (plus everything beneath its directory
 	// paths): loading the whole manifest per fsnotify batch made the
@@ -313,22 +313,49 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 			mergeScanResult(&remoteScan, sub)
 		}
 	}
+	// A batch path that couldn't be stat'd on one side (e.g. an ancestor
+	// lost search permission) is unknown on that side - and so is
+	// everything beneath it. Mark it as a skipped DIRECTORY, not just an
+	// exact skip (all ScanPaths records for it), so SkipSet suppresses
+	// every descendant too: otherwise the other side's expanded subtree
+	// plus the manifest prefix would read the unreadable side's tracked
+	// children as deleted, and delete the intact copies on the readable
+	// side.
+	for _, u := range unknown {
+		localScan.Skipped[u.rel] = struct{}{}
+		localScan.SkippedDirs[u.rel] = struct{}{}
+		issue := fs.ScanIssue{Path: u.rel, Reason: fmt.Sprintf("lstat: %s; treating its whole subtree as unknown this cycle", u.err)}
+		if u.side == "remote" {
+			remoteScan.Issues = append(remoteScan.Issues, issue)
+		} else {
+			localScan.Issues = append(localScan.Issues, issue)
+		}
+	}
 	logScanIssues(p.Logger, "local", localScan.Issues)
 	logScanIssues(p.Logger, "remote", remoteScan.Issues)
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
 	execActions := nonNoOpActions(plan)
+
+	// Loaded BEFORE executing anything: once file actions have run, nothing
+	// that can fail on a cancelled ctx may stand between them and
+	// commitManifestUpdates, or completed changes would go unrecorded in
+	// the three-way baseline.
+	dirRepo := db.NewDirRepo(p.DB)
+	var dirBaseline map[string]struct{}
+	if len(subtrees) > 0 {
+		if dirBaseline, err = dirRepo.LoadAll(ctx); err != nil {
+			return plan, 0, &robustHardError{stage: "load dir manifest", err: err}
+		}
+	}
+
 	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files}
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
+	scopedActionsDone()
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 
 	var dirsToAdd, dirsToRemove []string
-	dirRepo := db.NewDirRepo(p.DB)
 	if len(subtrees) > 0 {
-		dirBaseline, err := dirRepo.LoadAll(ctx)
-		if err != nil {
-			return plan, failures, &robustHardError{stage: "load dir manifest", err: err}
-		}
 		var dirFailures int
 		dirsToAdd, dirsToRemove, dirFailures = reconcileDirectories(p.Logger, p.LocalRoot, p.RemoteRoot,
 			localScan.Dirs, remoteScan.Dirs, baselineWithin(dirBaseline, subtrees), skipped)
@@ -357,25 +384,62 @@ type scopedSubtree struct {
 	local, remote bool // which side(s) it is a real directory on
 }
 
+// scopedUnknown is a batch path whose Lstat failed on side ("local" or
+// "remote") for a reason other than not-existing.
+type scopedUnknown struct {
+	rel, side string
+	err       error
+}
+
+// scopedLstat is os.Lstat, indirected so tests can simulate a permission
+// error on one side deterministically (chmod can't, when tests run as
+// root). Same pattern as watch's newTicker/newWatcher.
+var scopedLstat = os.Lstat
+
+// scopedActionsDone runs right after RunRobustScoped's file actions finish;
+// a no-op in production. Tests use it to cancel ctx at exactly that point.
+var scopedActionsDone = func() {}
+
 // scopedSubtrees classifies a batch for RunRobustScoped: the directory
 // paths to walk (outermost only - a path beneath another one in the batch
 // is already covered by its walk), and the prefixes whose manifest rows
 // must be loaded: every walked directory, plus every path now absent
 // locally (it may have been a directory whose tracked contents need
 // reconciling). Ignored paths are dropped.
-func scopedSubtrees(localRoot, remoteRoot string, relPaths map[string]struct{}, matcher *fs.IgnoreMatcher) ([]scopedSubtree, []string) {
-	isDir := func(root, rel string) (dir, missing bool) {
-		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(rel)))
+//
+// A path whose Lstat fails on either side for any reason other than
+// not-existing is returned in unknown instead, and neither expanded nor
+// prefix-loaded: its state on that side is not known, so nothing beneath
+// it may be planned from this cycle (see RunRobustScoped).
+func scopedSubtrees(localRoot, remoteRoot string, relPaths map[string]struct{}, matcher *fs.IgnoreMatcher) ([]scopedSubtree, []string, []scopedUnknown) {
+	stat := func(root, rel string) (dir, missing bool, err error) {
+		info, err := scopedLstat(filepath.Join(root, filepath.FromSlash(rel)))
 		if err != nil {
-			return false, os.IsNotExist(err)
+			if os.IsNotExist(err) {
+				return false, true, nil
+			}
+			return false, false, err
 		}
-		return info.IsDir(), false // Lstat: a symlink is never a directory here
+		return info.IsDir(), false, nil // Lstat: a symlink is never a directory here
 	}
 	var subtrees []scopedSubtree
 	var prefixes []string
+	var unknown []scopedUnknown
 	for rel := range relPaths {
-		localDir, localMissing := isDir(localRoot, rel)
-		remoteDir, _ := isDir(remoteRoot, rel)
+		if matcher.MatchPathOrAncestor(rel, true) && matcher.MatchPathOrAncestor(rel, false) {
+			continue // ignored whether file or directory: nothing to do
+		}
+		localDir, localMissing, localErr := stat(localRoot, rel)
+		remoteDir, _, remoteErr := stat(remoteRoot, rel)
+		if localErr != nil || remoteErr != nil {
+			if localErr != nil {
+				unknown = append(unknown, scopedUnknown{rel: rel, side: "local", err: localErr})
+			}
+			if remoteErr != nil {
+				unknown = append(unknown, scopedUnknown{rel: rel, side: "remote", err: remoteErr})
+			}
+			continue
+		}
 		if (localDir || remoteDir) && !matcher.MatchPathOrAncestor(rel, true) {
 			subtrees = append(subtrees, scopedSubtree{rel: rel, local: localDir, remote: remoteDir})
 		} else if localMissing && !matcher.MatchPathOrAncestor(rel, true) {
@@ -395,7 +459,8 @@ func scopedSubtrees(localRoot, remoteRoot string, relPaths map[string]struct{}, 
 		prefixes = append(prefixes, st.rel)
 	}
 	sort.Strings(prefixes)
-	return outer, prefixes
+	sort.Slice(unknown, func(i, j int) bool { return unknown[i].rel < unknown[j].rel })
+	return outer, prefixes, unknown
 }
 
 // isWithin reports whether rel is dir itself or beneath it, by whole
