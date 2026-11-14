@@ -38,6 +38,52 @@ type RobustParams struct {
 	// that then runs, rather than a separate preview scan's plan. nil
 	// (watch, --yes) means "always proceed".
 	ConfirmPlan func(actions []reconcile.Action, dirOps []DirOp) bool
+	// MaxDelete caps how many tracked files one cycle may delete from
+	// either side; a cycle over it returns reconcile.ErrDeleteLimit having
+	// changed nothing. The zero value imposes no limit.
+	MaxDelete reconcile.DeleteLimit
+	// ApproveDeletes, if set, is asked when a cycle exceeds MaxDelete and
+	// may let that one cycle run anyway (`syncd approve-deletes`).
+	ApproveDeletes func() bool
+	// Trash receives deleted files that live on a local disk; nil removes
+	// them outright.
+	Trash *fs.Trash
+}
+
+// checkDeleteLimit enforces p.MaxDelete against the deletes in actions.
+// total (the number of tracked files, the denominator for a percentage
+// limit) is only fetched when there is something to check.
+func (p RobustParams) checkDeleteLimit(actions []reconcile.Action, total func() (int, error)) error {
+	if p.MaxDelete.Unlimited() {
+		return nil
+	}
+	var local, remote int
+	for _, a := range actions {
+		switch a.Type {
+		case reconcile.ActionDeleteLocal:
+			local++
+		case reconcile.ActionDeleteRemote:
+			remote++
+		}
+	}
+	if local == 0 && remote == 0 {
+		return nil
+	}
+	n, err := total()
+	if err != nil {
+		return err
+	}
+	err = p.MaxDelete.Check("local", local, n)
+	if err == nil {
+		err = p.MaxDelete.Check("remote", remote, n)
+	}
+	if err != nil && p.ApproveDeletes != nil && p.ApproveDeletes() {
+		p.Logger.Warn("delete limit exceeded, but this cycle was approved; proceeding", map[string]any{
+			"delete_local": local, "delete_remote": remote, "tracked": n,
+		})
+		return nil
+	}
+	return err
 }
 
 // robustHardError marks an error from RunRobustOnce that happened before -
@@ -103,6 +149,9 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	// same scan-time view the apply step always used), so the confirm can
 	// show directory operations too.
 	dirOps := planDirectories(scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped)
+	if err := p.checkDeleteLimit(execActions, func() (int, error) { return len(manifest), nil }); err != nil {
+		return plan, 0, err
+	}
 	if p.ConfirmPlan != nil && !p.ConfirmPlan(execActions, visibleDirOps(dirOps)) {
 		return plan, 0, ErrAborted
 	}
@@ -112,6 +161,7 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 		RemoteRoot:  p.RemoteRoot,
 		LocalFiles:  localFiles,
 		RemoteFiles: remoteFiles,
+		Trash:       p.Trash,
 	}
 	// runErr (e.g. context cancellation) is deliberately not returned yet:
 	// results may be partial, but whatever did complete should still be
@@ -336,6 +386,11 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
 	execActions := nonNoOpActions(plan)
+	// The scoped manifest holds only this batch's rows, so a percentage
+	// limit is measured against the whole manifest's size.
+	if err := p.checkDeleteLimit(execActions, func() (int, error) { return p.Repo.Count(ctx) }); err != nil {
+		return plan, 0, err
+	}
 
 	// Loaded BEFORE executing anything: once file actions have run, nothing
 	// that can fail on a cancelled ctx may stand between them and
@@ -349,7 +404,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 		}
 	}
 
-	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files}
+	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files, Trash: p.Trash}
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
 	scopedActionsDone()
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)

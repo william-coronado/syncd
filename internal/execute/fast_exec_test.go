@@ -52,7 +52,7 @@ func TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory(t *
 		t.Fatalf("write unexpected.txt: %v", err)
 	}
 
-	err := applyFastTask(left, "", reconcile.FastTask{Type: reconcile.DeleteL, RelPath: "was-a-file"})
+	err := applyFastTask(left, "", reconcile.FastTask{Type: reconcile.DeleteL, RelPath: "was-a-file"}, nil)
 	if err == nil {
 		t.Fatal("expected an error deleting a non-empty directory where a file was expected, got nil")
 	}
@@ -110,7 +110,7 @@ func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirector
 
 	err := applyFastTask(root, root, reconcile.FastTask{
 		Type: reconcile.MoveR, RelPath: "new/moved", OldRelPath: "old",
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected an error removing the non-empty directory left behind by the TOCTOU race, got nil")
 	}

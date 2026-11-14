@@ -158,3 +158,14 @@ the scoped cycle not expanding directories, the shared default log, the
 watcher's startup-fixed ignore rules, and directory operations missing
 from the `--hash` summary), along with #22 from the second pass (summaries enumerating a
 fixed list of types). See the git history for that date.
+
+### 30. Two watch tests fail under `-race` on macOS (test-only race with fsnotify)
+
+`internal/watch/overflow_test.go` — `TestWatcher_ForwardsFsnotifyErrors` and
+`TestRun_OverflowTriggersFullRescan` inject an error by sending on fsnotify's
+own `Errors` channel, which races with the kqueue backend goroutine that owns
+that channel. Found 2026-11-14 while adding the delete guard / trash /
+`service` command; it reproduces on the commit before that work, so it is not
+caused by it. Production code is not involved. Done = the tests inject through
+a seam syncd owns (e.g. an indirected error source on `Watcher`) and
+`go test ./... -race` is green on darwin.

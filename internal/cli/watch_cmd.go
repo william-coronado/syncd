@@ -13,6 +13,7 @@ import (
 
 	"syncd/internal/app"
 	"syncd/internal/fs"
+	"syncd/internal/reconcile"
 	"syncd/internal/watch"
 )
 
@@ -21,17 +22,53 @@ import (
 // per-deployment, so it is a constant rather than a flag.
 const watchDebounce = 500 * time.Millisecond
 
-var (
-	watchLocal      string
-	watchRemote     string
-	watchRemotePoll time.Duration
-	watchDeepScan   time.Duration
-	watchSilent     bool
-	watchWorkers    int
-	watchStateDir   string
-	watchDBPath     string
-	watchLogPath    string
-	watchLockPath   string
+// watchFlags holds the `syncd watch` flag values. `syncd service install`
+// registers the same set (see addWatchFlags), so a service can be given
+// exactly the flags the daemon itself accepts.
+type watchFlags struct {
+	local, remote        string
+	remotePoll, deepScan time.Duration
+	silent               bool
+	workers              int
+	stateDir             string
+	dbPath               string
+	logPath              string
+	lockPath             string
+	waitForRemote        bool
+	maxDelete            string
+	noTrash              bool
+	trashDays            int
+}
+
+var watchOpts watchFlags
+
+// addWatchFlags registers the watch daemon's flags on cmd, bound to o.
+func addWatchFlags(cmd *cobra.Command, o *watchFlags) {
+	f := cmd.Flags()
+	f.StringVar(&o.local, "local", "", "Local directory path (required)")
+	f.StringVar(&o.remote, "remote", "", "Remote directory path (required)")
+	f.DurationVar(&o.remotePoll, "remote-poll", 30*time.Second, "Full remote poll cadence (catches other machines' remote writes)")
+	f.DurationVar(&o.deepScan, "deep-scan", time.Hour, "Full-tree deep-scan safety-net cadence")
+	f.BoolVar(&o.silent, "silent", false, "Write structured logs only, suppress stdout")
+	f.IntVar(&o.workers, "workers", stdruntime.NumCPU(), "Worker pool size")
+	f.StringVar(&o.stateDir, "state-dir", "", "State directory for lock/db/log/trash")
+	f.StringVar(&o.dbPath, "db-path", "", "Path to SQLite manifest file")
+	f.StringVar(&o.logPath, "log-path", "", "Path to JSON log file")
+	f.StringVar(&o.lockPath, "lock-path", "", "Path to lock file")
+	f.BoolVar(&o.waitForRemote, "wait-for-remote", false, "Wait for the remote share to be mounted instead of exiting when it is missing at startup")
+	f.StringVar(&o.maxDelete, "max-delete", reconcile.DefaultDeleteLimit, maxDeleteUsage+"; a cycle over the limit is skipped until 'syncd approve-deletes' allows it")
+	f.BoolVar(&o.noTrash, "no-trash", false, noTrashUsage)
+	f.IntVar(&o.trashDays, "trash-days", defaultTrashDays, trashDaysUsage)
+	_ = cmd.MarkFlagRequired("local")
+	_ = cmd.MarkFlagRequired("remote")
+}
+
+// Shared by `syncd sync` and `syncd watch`.
+const (
+	maxDeleteUsage   = "Most files one unattended run may delete from either side: a count (100), a percentage of the files there (50%; never trips on 10 or fewer), or off"
+	noTrashUsage     = "Delete files outright instead of moving those on a local disk to <state-dir>/trash"
+	trashDaysUsage   = "Days to keep trashed files (0 keeps them forever)"
+	defaultTrashDays = 30
 )
 
 // watchCmd is the always-on daemon path of the merged tool: `syncd watch`.
@@ -56,19 +93,7 @@ the remote canary file.`,
 }
 
 func init() {
-	watchCmd.Flags().StringVar(&watchLocal, "local", "", "Local directory path (required)")
-	watchCmd.Flags().StringVar(&watchRemote, "remote", "", "Remote directory path (required)")
-	watchCmd.Flags().DurationVar(&watchRemotePoll, "remote-poll", 30*time.Second, "Full remote poll cadence (catches other machines' remote writes)")
-	watchCmd.Flags().DurationVar(&watchDeepScan, "deep-scan", time.Hour, "Full-tree deep-scan safety-net cadence")
-	watchCmd.Flags().BoolVar(&watchSilent, "silent", false, "Write structured logs only, suppress stdout")
-	watchCmd.Flags().IntVar(&watchWorkers, "workers", stdruntime.NumCPU(), "Worker pool size")
-	watchCmd.Flags().StringVar(&watchStateDir, "state-dir", "", "State directory for lock/db/log")
-	watchCmd.Flags().StringVar(&watchDBPath, "db-path", "", "Path to SQLite manifest file")
-	watchCmd.Flags().StringVar(&watchLogPath, "log-path", "", "Path to JSON log file")
-	watchCmd.Flags().StringVar(&watchLockPath, "lock-path", "", "Path to lock file")
-	_ = watchCmd.MarkFlagRequired("local")
-	_ = watchCmd.MarkFlagRequired("remote")
-
+	addWatchFlags(watchCmd, &watchOpts)
 	rootCmd.AddCommand(watchCmd)
 }
 
@@ -90,35 +115,54 @@ func validateWatchFlags(workers int, remotePoll, deepScan time.Duration) error {
 	return nil
 }
 
+// watchConfig validates o and turns it into the daemon's configuration,
+// with both roots made absolute.
+func (o watchFlags) watchConfig() (app.WatchConfig, error) {
+	localAbs, err := filepath.Abs(o.local)
+	if err != nil {
+		return app.WatchConfig{}, fmt.Errorf("resolve --local: %w", err)
+	}
+	remoteAbs, err := filepath.Abs(o.remote)
+	if err != nil {
+		return app.WatchConfig{}, fmt.Errorf("resolve --remote: %w", err)
+	}
+	if err := validateWatchFlags(o.workers, o.remotePoll, o.deepScan); err != nil {
+		return app.WatchConfig{}, err
+	}
+	maxDelete, err := reconcile.ParseDeleteLimit(o.maxDelete)
+	if err != nil {
+		return app.WatchConfig{}, fmt.Errorf("--max-delete: %w", err)
+	}
+	if o.trashDays < 0 {
+		return app.WatchConfig{}, fmt.Errorf("--trash-days must be >= 0")
+	}
+	return app.WatchConfig{
+		LocalRoot:     localAbs,
+		RemoteRoot:    remoteAbs,
+		Silent:        o.silent,
+		Workers:       o.workers,
+		StateDir:      o.stateDir,
+		DBPath:        o.dbPath,
+		LogPath:       o.logPath,
+		LockPath:      o.lockPath,
+		RemotePoll:    o.remotePoll,
+		DeepScan:      o.deepScan,
+		Debounce:      watchDebounce,
+		WaitForRemote: o.waitForRemote,
+		MaxDelete:     maxDelete,
+		NoTrash:       o.noTrash,
+		TrashDays:     o.trashDays,
+	}, nil
+}
+
 func runWatchCmd(cmd *cobra.Command, _ []string) error {
-	localAbs, err := filepath.Abs(watchLocal)
+	cfg, err := watchOpts.watchConfig()
 	if err != nil {
-		return fmt.Errorf("resolve --local: %w", err)
-	}
-	remoteAbs, err := filepath.Abs(watchRemote)
-	if err != nil {
-		return fmt.Errorf("resolve --remote: %w", err)
-	}
-	if err := validateWatchFlags(watchWorkers, watchRemotePoll, watchDeepScan); err != nil {
 		return err
 	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	cfg := app.WatchConfig{
-		LocalRoot:  localAbs,
-		RemoteRoot: remoteAbs,
-		Silent:     watchSilent,
-		Workers:    watchWorkers,
-		StateDir:   watchStateDir,
-		DBPath:     watchDBPath,
-		LogPath:    watchLogPath,
-		LockPath:   watchLockPath,
-		RemotePoll: watchRemotePoll,
-		DeepScan:   watchDeepScan,
-		Debounce:   watchDebounce,
-	}
 
 	return app.RunWatch(ctx, cfg, func(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg app.WatchConfig) error {
 		return watch.Run(ctx, p, matcher, watch.LoopConfig{

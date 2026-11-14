@@ -13,6 +13,10 @@ One cross-platform Go binary that merges two directory-sync tools:
   paths; a periodic remote poll catches other machines' writes; a deep scan is
   the safety net.
 - **`syncd init`** — bootstrap local/remote roots + the remote `.synclock` canary.
+- **`syncd service install|uninstall|status`** — run `watch` as a per-user
+  launchd agent (macOS) or systemd user unit (Linux).
+- **`syncd approve-deletes`** — let a watch daemon run one cycle it refused
+  for exceeding `--max-delete`.
 
 The fast/slow split is fundamentally **when you hash**: `sync` never hashes
 (fast, can't see content-only changes); `watch` hashes (robust over SMB). One
@@ -45,8 +49,8 @@ committing. This project was built test-first; keep that.
 
 ## Architecture
 
-Import graph is a clean DAG: `cmd/syncd → cli → {app, watch}`; those →
-`{fs, db, reconcile, execute, runtime}`. `db` and `runtime` are leaves.
+Import graph is a clean DAG: `cmd/syncd → cli → {app, watch, service}`; those →
+`{fs, db, reconcile, execute, runtime}`. `db`, `runtime` and `service` are leaves.
 
 | Package | Responsibility |
 |---|---|
@@ -58,6 +62,7 @@ Import graph is a clean DAG: `cmd/syncd → cli → {app, watch}`; those →
 | `internal/reconcile` | `fast.go` = size+mtime `FastCompare` (mirror/update/two-way + moves); `engine.go` = three-way hash `BuildPlan` |
 | `internal/execute` | `worker_pool.go` = robust action executor; `fast_exec.go` = fast executor (`RunFastTasks` + `ProgressSink`) |
 | `internal/db` | SQLite: `file_manifest` (hash/three-way) + `job_state` (fast two-way, keyed `(job,path)`) |
+| `internal/service` | leaf: renders the launchd plist / systemd user unit and drives `launchctl`/`systemctl` through an injectable `Runner` (both platforms' code compiles and is tested everywhere) |
 | `internal/runtime` | lockfile, remote canary, JSON logging + rotation, path resolution, `Config` |
 
 **Two reconcilers, one of everything else.** The fast (size+mtime) and robust
@@ -108,6 +113,21 @@ remote view via `db.RemoteStatView`.
   may create both. Never let an auto-created empty source drive deletions
   (mirror would wipe the destination). There's a regression test for this —
   keep it.
+- **Delete limit** (`reconcile.DeleteLimit`, `--max-delete`, default `50%`):
+  enforced for unattended runs only — `watch` cycles and `sync --yes` — and
+  always *before* anything is executed or the manifest is touched, so a
+  refused cycle is re-planned identically next time. Interactive `sync` is
+  gated by its confirm prompt instead. The scoped cycle measures a percentage
+  against `ManifestRepo.Count`, not its batch-sized manifest. A zero
+  `DeleteLimit` means unlimited (what tests and library callers get).
+- **Trash** (`fs.Trash`): every sync-driven file delete goes through
+  `Trash.Remove`. Files on a local disk move to `<state-dir>/trash/<day>/`;
+  files on a network filesystem (`isNetworkFilesystem`, per-OS statfs) are
+  removed outright. A nil `*Trash` is valid and removes. It must never fall
+  back to deleting when the move to trash fails.
+- `watch --wait-for-remote` waits *before* roots are resolved or the lock is
+  taken; `syncd service install` always passes it. The generated service
+  definitions carry no mount dependency on purpose.
 - `RunRobustOnce`'s `app.Run`-era error-path behavior is gone with `app.Run`;
   the live error contract lives in `SyncOnce`/`RunRobust*`.
 - Two import cycles were deliberately broken and must stay broken: CLI config
@@ -141,4 +161,4 @@ without checking the source path first (see the data-loss guard).
 
 Fresh repo; the finished work is on **`main`**. A `feat/syncd` branch may exist
 pointing at an earlier commit. No remote is configured. End commit messages with
-`Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+`Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.

@@ -29,6 +29,13 @@ type ProgressSink interface {
 // RunFastTasks executes fast tasks against the two roots using atomic writes.
 // progress may be nil (non-interactive). Returns the first error encountered.
 func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []reconcile.FastTask, progress ProgressSink) error {
+	return RunFastTasksWithTrash(ctx, workers, left, right, tasks, progress, nil)
+}
+
+// RunFastTasksWithTrash is RunFastTasks, with deleted files that live on a
+// local disk moved to trash instead of removed outright (see fs.Trash). A
+// nil trash removes them, exactly as RunFastTasks does.
+func RunFastTasksWithTrash(ctx context.Context, workers int, left, right string, tasks []reconcile.FastTask, progress ProgressSink, trash *fs.Trash) error {
 	if workers < 1 {
 		workers = 1
 	}
@@ -50,7 +57,7 @@ func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []
 					errs <- err
 					continue
 				}
-				err := applyFastTask(left, right, task)
+				err := applyFastTask(left, right, task, trash)
 				if err == nil && progress != nil {
 					progress.Advance(task.Size)
 				}
@@ -96,7 +103,7 @@ func RunFastTasks(ctx context.Context, workers int, left, right string, tasks []
 	return ctx.Err()
 }
 
-func applyFastTask(left, right string, task reconcile.FastTask) error {
+func applyFastTask(left, right string, task reconcile.FastTask, trash *fs.Trash) error {
 	switch task.Type {
 	case reconcile.CopyL2R:
 		src := filepath.Join(left, filepath.FromSlash(task.RelPath))
@@ -111,9 +118,9 @@ func applyFastTask(left, right string, task reconcile.FastTask) error {
 	case reconcile.ConflictR2L:
 		return copyPreservingDestination(right, left, task.RelPath)
 	case reconcile.DeleteL:
-		return removeIfExists(filepath.Join(left, filepath.FromSlash(task.RelPath)))
+		return trash.Remove(left, task.RelPath)
 	case reconcile.DeleteR:
-		return removeIfExists(filepath.Join(right, filepath.FromSlash(task.RelPath)))
+		return trash.Remove(right, task.RelPath)
 	case reconcile.MoveL:
 		return moveFastFile(left, task)
 	case reconcile.MoveR:

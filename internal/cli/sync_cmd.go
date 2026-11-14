@@ -20,6 +20,7 @@ import (
 
 	"syncd/internal/app"
 	"syncd/internal/execute"
+	"syncd/internal/fs"
 	"syncd/internal/reconcile"
 	"syncd/internal/runtime"
 )
@@ -33,6 +34,10 @@ var (
 	syncUseHash bool
 	syncAssume  bool
 	syncDryRun  bool
+
+	syncMaxDelete string
+	syncNoTrash   bool
+	syncTrashDays int
 )
 
 // syncCmd is the ad-hoc/fast path of the merged tool: `syncd sync`. It runs
@@ -60,6 +65,9 @@ func init() {
 	syncCmd.Flags().BoolVar(&syncUseHash, "hash", false, "Use the robust hash-based engine instead of the fast size+mtime reconciler")
 	syncCmd.Flags().BoolVar(&syncAssume, "yes", false, "Skip the interactive confirmation prompt")
 	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Print the sync summary and exit without changing anything or persisting job state (does not require --yes). Still takes the per-job lock and opens the state database.")
+	syncCmd.Flags().StringVar(&syncMaxDelete, "max-delete", reconcile.DefaultDeleteLimit, maxDeleteUsage+"; applies with --yes (the confirm prompt is the gate otherwise)")
+	syncCmd.Flags().BoolVar(&syncNoTrash, "no-trash", false, noTrashUsage)
+	syncCmd.Flags().IntVar(&syncTrashDays, "trash-days", defaultTrashDays, trashDaysUsage)
 
 	rootCmd.AddCommand(syncCmd)
 }
@@ -87,6 +95,26 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	maxDelete, err := reconcile.ParseDeleteLimit(syncMaxDelete)
+	if err != nil {
+		return fmt.Errorf("--max-delete: %w", err)
+	}
+	if syncTrashDays < 0 {
+		return errors.New("--trash-days must be >= 0")
+	}
+	var trash *fs.Trash
+	if !syncNoTrash && !syncDryRun {
+		stateDir, err := syncdStateDir()
+		if err != nil {
+			return err
+		}
+		trashDir := filepath.Join(stateDir, fs.TrashDirName)
+		if _, err := fs.PruneTrash(trashDir, syncTrashDays); err != nil {
+			pterm.Warning.Printf("could not prune trash %s: %v\n", trashDir, err)
+		}
+		trash = fs.NewTrash(trashDir)
+	}
+
 	// Mirrors runWatchCmd (watch_cmd.go): without this, Ctrl-C kills a sync
 	// mid-copy without running AtomicCopyFile's cleanup defer, orphaning
 	// temp files on the destination.
@@ -98,6 +126,8 @@ func runSyncCmd(cmd *cobra.Command, _ []string) error {
 		Assume:     syncAssume,
 		DryRun:     syncDryRun,
 		JobsDBPath: jobsDBPath,
+		MaxDelete:  maxDelete,
+		Trash:      trash,
 	})
 }
 
@@ -114,6 +144,9 @@ type syncRunOptions struct {
 	// when UseHash is true, since each --hash job gets its own db from
 	// hashJobDBPath instead.
 	JobsDBPath string
+	// MaxDelete and Trash are passed through to app.SyncOptions.
+	MaxDelete reconcile.DeleteLimit
+	Trash     *fs.Trash
 }
 
 // runSyncJobs runs every job in turn and reports a per-job outcome. A job
@@ -199,18 +232,20 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 	}
 
 	opts := app.SyncOptions{
-		Name:     job.Name,
-		StateKey: stateKey,
-		Left:     job.Left,
-		Right:    job.Right,
-		Mode:     mode,
-		UseHash:  ropts.UseHash,
-		Assume:   ropts.Assume,
-		DryRun:   ropts.DryRun,
-		Workers:  stdruntime.NumCPU(),
-		DBPath:   dbPath,
-		Confirm:  ptermConfirm,
-		Progress: progress,
+		Name:      job.Name,
+		StateKey:  stateKey,
+		Left:      job.Left,
+		Right:     job.Right,
+		Mode:      mode,
+		UseHash:   ropts.UseHash,
+		Assume:    ropts.Assume,
+		DryRun:    ropts.DryRun,
+		Workers:   stdruntime.NumCPU(),
+		DBPath:    dbPath,
+		Confirm:   ptermConfirm,
+		Progress:  progress,
+		MaxDelete: ropts.MaxDelete,
+		Trash:     ropts.Trash,
 
 		HighlightPath: summaryPathHighlighter(),
 	}
