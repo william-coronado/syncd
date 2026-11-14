@@ -92,12 +92,16 @@ func TestManifestRepo_LoadPaths(t *testing.T) {
 	ctx := context.Background()
 	var rows []ManifestRow
 	want := map[string]struct{}{}
-	for i := 0; i < manifestLoadChunk*2+7; i++ { // spans several chunks
+	// Request every one of 33,000 stored paths (plus one absent path) in a
+	// single call. That exceeds SQLITE_MAX_VARIABLE_NUMBER - 32,766 since
+	// SQLite 3.32 (the bundled modernc build is newer), not the classic 999,
+	// which 1,000-odd placeholders no longer trip - so a regression to one
+	// placeholder per requested path fails here with "too many SQL
+	// variables".
+	for i := 0; i < 33000; i++ {
 		p := filepath.ToSlash(filepath.Join("d", string(rune('a'+i%26)), "f"+strconv.Itoa(i)))
 		rows = append(rows, ManifestRow{Path: p, Size: int64(i), Mtime: 1, Hash: "h"})
-		if i%3 == 0 {
-			want[p] = struct{}{}
-		}
+		want[p] = struct{}{}
 	}
 	if err := repo.ApplyUpdates(ctx, rows, nil); err != nil {
 		t.Fatal(err)
@@ -138,5 +142,67 @@ func TestManifestRepo_LoadPrefixMatchesWholeSegments(t *testing.T) {
 		if _, ok := got[p]; !ok {
 			t.Fatalf("missing %s in %v", p, got)
 		}
+	}
+}
+
+// Paths are bound as data, never spliced into SQL: names full of quotes,
+// brackets and SQL keywords must round-trip exactly and leave the table
+// intact.
+func TestManifestRepo_LoadPathsTreatsHostileNamesAsData(t *testing.T) {
+	repo := openTestDB(t)
+	ctx := context.Background()
+	hostile := []string{
+		`a'); DROP TABLE file_manifest; --`,
+		`b") OR 1=1 --`,
+		`c\"],["x`,
+		`d' OR '1'='1`,
+	}
+	var rows []ManifestRow
+	want := map[string]struct{}{}
+	for _, p := range hostile {
+		rows = append(rows, ManifestRow{Path: p, Size: 1, Mtime: 1, Hash: "h"})
+		want[p] = struct{}{}
+	}
+	rows = append(rows, ManifestRow{Path: "innocent.txt", Size: 1, Mtime: 1, Hash: "h"})
+	if err := repo.ApplyUpdates(ctx, rows, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.LoadPaths(ctx, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(hostile) {
+		t.Fatalf("got %d rows, want exactly the %d requested: %v", len(got), len(hostile), got)
+	}
+	for _, p := range hostile {
+		if _, ok := got[p]; !ok {
+			t.Fatalf("hostile path %q did not round-trip", p)
+		}
+	}
+	all, err := repo.LoadAll(ctx)
+	if err != nil || len(all) != len(rows) {
+		t.Fatalf("table damaged: err=%v rows=%d want %d", err, len(all), len(rows))
+	}
+}
+
+// Linux filenames are arbitrary bytes, and fs.NormalizeRelativePath passes
+// invalid UTF-8 through unchanged, so a manifest path can hold bytes that
+// are not valid UTF-8. LoadPaths must find such a row exactly (PR #5
+// review: a JSON-encoded lookup rewrote them to U+FFFD and silently missed
+// the row, so a deleted file of that name was re-downloaded instead of the
+// delete propagating).
+func TestManifestRepo_LoadPathsPreservesNonUTF8Bytes(t *testing.T) {
+	repo := openTestDB(t)
+	ctx := context.Background()
+	raw := "dir/bad\xffname.txt"
+	if err := repo.ApplyUpdates(ctx, []ManifestRow{{Path: raw, Size: 1, Mtime: 1, Hash: "h"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.LoadPaths(ctx, map[string]struct{}{raw: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[raw]; !ok || len(got) != 1 {
+		t.Fatalf("non-UTF-8 path not found by exact lookup: %v", got)
 	}
 }

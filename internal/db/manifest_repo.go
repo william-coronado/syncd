@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -70,7 +69,7 @@ func NewManifestRepo(db *sql.DB) *ManifestRepo {
 }
 
 func (r *ManifestRepo) LoadAll(ctx context.Context) (map[string]ManifestRow, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT `+manifestColumns+` FROM file_manifest`)
+	rows, err := r.db.QueryContext(ctx, `SELECT path, size, mtime, hash, last_synced, remote_size, remote_mtime FROM file_manifest`)
 	if err != nil {
 		return nil, fmt.Errorf("query manifest: %w", err)
 	}
@@ -81,39 +80,34 @@ func (r *ManifestRepo) LoadAll(ctx context.Context) (map[string]ManifestRow, err
 	return out, nil
 }
 
-// manifestLoadChunk bounds how many paths LoadPaths binds per query, safely
-// under SQLite's host-parameter limit.
-const manifestLoadChunk = 500
-
 // LoadPaths returns the manifest rows for just the given paths (absent ones
 // are simply missing from the result). The scoped watch cycle reconciles a
 // handful of fsnotify paths at a time; loading the whole manifest for each
 // batch made its cost proportional to the tree size instead of the batch.
+//
+// One constant, prepared `path = ?` statement runs per path. Each path is
+// bound as-is, so a name that isn't valid UTF-8 (legal on Linux, and passed
+// through unchanged by fs.NormalizeRelativePath) matches its row byte for
+// byte - packing the paths into a JSON array would rewrite such bytes to
+// U+FFFD and silently miss the row. Each lookup is a primary-key probe.
 func (r *ManifestRepo) LoadPaths(ctx context.Context, paths map[string]struct{}) (map[string]ManifestRow, error) {
 	out := make(map[string]ManifestRow, len(paths))
-	batch := make([]any, 0, manifestLoadChunk)
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
-		rows, err := r.db.QueryContext(ctx, `SELECT `+manifestColumns+` FROM file_manifest WHERE path IN (`+placeholders+`)`, batch...)
-		if err != nil {
-			return fmt.Errorf("query manifest paths: %w", err)
-		}
-		batch = batch[:0]
-		return scanManifestRows(rows, out)
+	if len(paths) == 0 {
+		return out, nil
 	}
+	stmt, err := r.db.PrepareContext(ctx, `SELECT path, size, mtime, hash, last_synced, remote_size, remote_mtime FROM file_manifest WHERE path = ?`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare manifest path lookup: %w", err)
+	}
+	defer stmt.Close()
 	for p := range paths {
-		batch = append(batch, p)
-		if len(batch) == manifestLoadChunk {
-			if err := flush(); err != nil {
-				return nil, err
-			}
+		rows, err := stmt.QueryContext(ctx, p)
+		if err != nil {
+			return nil, fmt.Errorf("query manifest path: %w", err)
 		}
-	}
-	if err := flush(); err != nil {
-		return nil, err
+		if err := scanManifestRows(rows, out); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -124,7 +118,7 @@ func (r *ManifestRepo) LoadPaths(ctx context.Context, paths map[string]struct{})
 // '/', so [dirRel+"/", dirRel+"0") is exactly the paths starting with
 // dirRel+"/".
 func (r *ManifestRepo) LoadPrefix(ctx context.Context, dirRel string) (map[string]ManifestRow, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT `+manifestColumns+` FROM file_manifest WHERE path >= ? AND path < ?`, dirRel+"/", dirRel+"0")
+	rows, err := r.db.QueryContext(ctx, `SELECT path, size, mtime, hash, last_synced, remote_size, remote_mtime FROM file_manifest WHERE path >= ? AND path < ?`, dirRel+"/", dirRel+"0")
 	if err != nil {
 		return nil, fmt.Errorf("query manifest prefix: %w", err)
 	}
@@ -135,9 +129,8 @@ func (r *ManifestRepo) LoadPrefix(ctx context.Context, dirRel string) (map[strin
 	return out, nil
 }
 
-const manifestColumns = `path, size, mtime, hash, last_synced, remote_size, remote_mtime`
-
-// scanManifestRows drains rows (selected with manifestColumns) into out and
+// scanManifestRows drains rows (selecting path, size, mtime, hash,
+// last_synced, remote_size, remote_mtime, in that order) into out and
 // closes rows. NULL remote_size/remote_mtime (no distinct remote stat, and
 // every row written before those columns existed) scan as zero - see
 // ManifestRow.RemoteStat.

@@ -8,7 +8,7 @@ require (
 	github.com/pterm/pterm v0.12.79
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.18.2
-	golang.org/x/text v0.40.0
+	golang.org/x/text v0.41.0
 	lukechampine.com/blake3 v1.4.1
 	modernc.org/sqlite v1.54.0
 )
