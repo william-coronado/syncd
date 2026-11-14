@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -86,28 +85,29 @@ func (r *ManifestRepo) LoadAll(ctx context.Context) (map[string]ManifestRow, err
 // handful of fsnotify paths at a time; loading the whole manifest for each
 // batch made its cost proportional to the tree size instead of the batch.
 //
-// The paths are bound as ONE parameter - a JSON array expanded by SQLite's
-// json_each - so the SQL text is a fixed constant regardless of how many
-// paths there are (no generated placeholder list, no host-parameter limit).
+// One constant, prepared `path = ?` statement runs per path. Each path is
+// bound as-is, so a name that isn't valid UTF-8 (legal on Linux, and passed
+// through unchanged by fs.NormalizeRelativePath) matches its row byte for
+// byte - packing the paths into a JSON array would rewrite such bytes to
+// U+FFFD and silently miss the row. Each lookup is a primary-key probe.
 func (r *ManifestRepo) LoadPaths(ctx context.Context, paths map[string]struct{}) (map[string]ManifestRow, error) {
 	out := make(map[string]ManifestRow, len(paths))
 	if len(paths) == 0 {
 		return out, nil
 	}
-	list := make([]string, 0, len(paths))
+	stmt, err := r.db.PrepareContext(ctx, `SELECT path, size, mtime, hash, last_synced, remote_size, remote_mtime FROM file_manifest WHERE path = ?`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare manifest path lookup: %w", err)
+	}
+	defer stmt.Close()
 	for p := range paths {
-		list = append(list, p)
-	}
-	encoded, err := json.Marshal(list)
-	if err != nil {
-		return nil, fmt.Errorf("encode manifest paths: %w", err)
-	}
-	rows, err := r.db.QueryContext(ctx, `SELECT path, size, mtime, hash, last_synced, remote_size, remote_mtime FROM file_manifest WHERE path IN (SELECT value FROM json_each(?))`, string(encoded))
-	if err != nil {
-		return nil, fmt.Errorf("query manifest paths: %w", err)
-	}
-	if err := scanManifestRows(rows, out); err != nil {
-		return nil, err
+		rows, err := stmt.QueryContext(ctx, p)
+		if err != nil {
+			return nil, fmt.Errorf("query manifest path: %w", err)
+		}
+		if err := scanManifestRows(rows, out); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

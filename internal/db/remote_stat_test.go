@@ -92,7 +92,7 @@ func TestManifestRepo_LoadPaths(t *testing.T) {
 	ctx := context.Background()
 	var rows []ManifestRow
 	want := map[string]struct{}{}
-	for i := 0; i < 1207; i++ { // well past SQLite's classic 999 host-parameter limit
+	for i := 0; i < 1207; i++ { // a large batch
 		p := filepath.ToSlash(filepath.Join("d", string(rune('a'+i%26)), "f"+strconv.Itoa(i)))
 		rows = append(rows, ManifestRow{Path: p, Size: int64(i), Mtime: 1, Hash: "h"})
 		if i%3 == 0 {
@@ -178,5 +178,27 @@ func TestManifestRepo_LoadPathsTreatsHostileNamesAsData(t *testing.T) {
 	all, err := repo.LoadAll(ctx)
 	if err != nil || len(all) != len(rows) {
 		t.Fatalf("table damaged: err=%v rows=%d want %d", err, len(all), len(rows))
+	}
+}
+
+// Linux filenames are arbitrary bytes, and fs.NormalizeRelativePath passes
+// invalid UTF-8 through unchanged, so a manifest path can hold bytes that
+// are not valid UTF-8. LoadPaths must find such a row exactly (PR #5
+// review: a JSON-encoded lookup rewrote them to U+FFFD and silently missed
+// the row, so a deleted file of that name was re-downloaded instead of the
+// delete propagating).
+func TestManifestRepo_LoadPathsPreservesNonUTF8Bytes(t *testing.T) {
+	repo := openTestDB(t)
+	ctx := context.Background()
+	raw := "dir/bad\xffname.txt"
+	if err := repo.ApplyUpdates(ctx, []ManifestRow{{Path: raw, Size: 1, Mtime: 1, Hash: "h"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.LoadPaths(ctx, map[string]struct{}{raw: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[raw]; !ok || len(got) != 1 {
+		t.Fatalf("non-UTF-8 path not found by exact lookup: %v", got)
 	}
 }
