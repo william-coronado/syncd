@@ -92,12 +92,16 @@ func TestManifestRepo_LoadPaths(t *testing.T) {
 	ctx := context.Background()
 	var rows []ManifestRow
 	want := map[string]struct{}{}
-	for i := 0; i < 1207; i++ { // a large batch
+	// Request every one of 33,000 stored paths (plus one absent path) in a
+	// single call. That exceeds SQLITE_MAX_VARIABLE_NUMBER - 32,766 since
+	// SQLite 3.32 (the bundled modernc build is newer), not the classic 999,
+	// which 1,000-odd placeholders no longer trip - so a regression to one
+	// placeholder per requested path fails here with "too many SQL
+	// variables".
+	for i := 0; i < 33000; i++ {
 		p := filepath.ToSlash(filepath.Join("d", string(rune('a'+i%26)), "f"+strconv.Itoa(i)))
 		rows = append(rows, ManifestRow{Path: p, Size: int64(i), Mtime: 1, Hash: "h"})
-		if i%3 == 0 {
-			want[p] = struct{}{}
-		}
+		want[p] = struct{}{}
 	}
 	if err := repo.ApplyUpdates(ctx, rows, nil); err != nil {
 		t.Fatal(err)

@@ -65,13 +65,26 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate manifest schema: %w", err)
 	}
-	if err := addColumnIfMissing(db, "file_manifest", "remote_size", `ALTER TABLE file_manifest ADD COLUMN remote_size INTEGER`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("migrate manifest schema: %w", err)
+	// SQLite has no ADD COLUMN IF NOT EXISTS, and a manifest created by an
+	// older syncd must keep working in place, so each column is added only
+	// when hasColumn says it is missing. Each ALTER TABLE is a literal at its
+	// own Exec call: identifiers can't be bound as parameters, and no SQL
+	// text here is ever built from or passed in as a variable.
+	hasRemoteSize, err := hasColumn(db, "file_manifest", "remote_size")
+	if err == nil && !hasRemoteSize {
+		_, err = db.Exec(`ALTER TABLE file_manifest ADD COLUMN remote_size INTEGER`)
 	}
-	if err := addColumnIfMissing(db, "file_manifest", "remote_mtime", `ALTER TABLE file_manifest ADD COLUMN remote_mtime INTEGER`); err != nil {
+	if err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("migrate manifest schema: %w", err)
+		return nil, fmt.Errorf("migrate manifest schema (remote_size): %w", err)
+	}
+	hasRemoteMtime, err := hasColumn(db, "file_manifest", "remote_mtime")
+	if err == nil && !hasRemoteMtime {
+		_, err = db.Exec(`ALTER TABLE file_manifest ADD COLUMN remote_mtime INTEGER`)
+	}
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate manifest schema (remote_mtime): %w", err)
 	}
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS job_state (
@@ -96,35 +109,12 @@ func Open(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// addColumnIfMissing runs addColumnDDL - a complete, constant ALTER TABLE
-// statement adding column to table - unless column already exists. SQLite
-// has no ADD COLUMN IF NOT EXISTS, and a manifest created by an older syncd
-// must keep working in place. Identifiers can't be bound as parameters, so
-// callers pass the whole statement as a literal rather than this function
-// assembling SQL from pieces.
-func addColumnIfMissing(db *sql.DB, table, column, addColumnDDL string) error {
-	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
-	if err != nil {
-		return fmt.Errorf("inspect %s columns: %w", table, err)
+// hasColumn reports whether table has a column named column. Both names
+// are bound as parameters to the pragma_table_info table-valued function.
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return false, fmt.Errorf("inspect %s columns: %w", table, err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("inspect %s columns: %w", table, err)
-		}
-		if name == column {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect %s columns: %w", table, err)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if _, err := db.Exec(addColumnDDL); err != nil {
-		return fmt.Errorf("add %s.%s: %w", table, column, err)
-	}
-	return nil
+	return n > 0, nil
 }
