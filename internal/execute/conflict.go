@@ -27,23 +27,23 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 		return Result{Action: action, Error: fmt.Errorf("conflict requires local and remote versions: %s", action.Path)}
 	}
 
-	localCanonicalPath := filepath.Join(state.LocalRoot, filepath.FromSlash(action.Path))
-	remoteCanonicalPath := filepath.Join(state.RemoteRoot, filepath.FromSlash(action.Path))
+	localCanonicalPath := filepath.FromSlash(action.Path)
+	remoteCanonicalPath := filepath.FromSlash(action.Path)
 
 	conflictRel, err := findAvailableConflictPath(state.LocalRoot, state.RemoteRoot, action.Path, timeNow().UTC())
 	if err != nil {
 		return Result{Action: action, Error: err}
 	}
-	localConflictPath := filepath.Join(state.LocalRoot, filepath.FromSlash(conflictRel))
-	remoteConflictPath := filepath.Join(state.RemoteRoot, filepath.FromSlash(conflictRel))
+	localConflictPath := filepath.FromSlash(conflictRel)
+	remoteConflictPath := filepath.FromSlash(conflictRel)
 
-	if err := fs.EnsureParents(localConflictPath); err != nil {
+	if err := fs.MkdirInRoot(state.LocalRoot, filepath.Dir(localConflictPath)); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("prepare local conflict parent: %w", err)}
 	}
-	if err := renameFile(localCanonicalPath, localConflictPath); err != nil {
+	if err := fs.RenameInRoots(state.LocalRoot, localCanonicalPath, state.LocalRoot, localConflictPath); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("rename local conflict file: %w", err)}
 	}
-	if err := fs.AtomicCopyFile(remoteCanonicalPath, localCanonicalPath); err != nil {
+	if err := fs.AtomicCopyFileInRoots(state.RemoteRoot, remoteCanonicalPath, state.LocalRoot, localCanonicalPath); err != nil {
 		// Best-effort rollback: put the local original back so this failed
 		// cycle doesn't leave localCanonicalPath looking deleted - without
 		// this, that only gets fixed by a LATER cycle's scan/plan noticing
@@ -51,12 +51,12 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 		// (review finding, Gemini 3.6). If the rollback itself fails too,
 		// surface both errors - the caller needs to know the file is
 		// genuinely missing, not just that the download failed.
-		if rerr := renameFile(localConflictPath, localCanonicalPath); rerr != nil {
+		if rerr := fs.RenameInRoots(state.LocalRoot, localConflictPath, state.LocalRoot, localCanonicalPath); rerr != nil {
 			return Result{Action: action, Error: fmt.Errorf("download remote canonical after conflict rename: %w (rollback also failed, local file may be missing: %v)", err, rerr)}
 		}
 		return Result{Action: action, Error: fmt.Errorf("download remote canonical after conflict rename: %w", err)}
 	}
-	if err := fs.AtomicCopyFile(localConflictPath, remoteConflictPath); err != nil {
+	if err := fs.AtomicCopyFileInRoots(state.LocalRoot, localConflictPath, state.RemoteRoot, remoteConflictPath); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload conflict copy to remote: %w", err)}
 	}
 
@@ -90,23 +90,11 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 	}
 }
 
-func renameFile(src, dst string) error {
-	return os.Rename(src, dst)
-}
-
-// findAvailableConflictPath returns conflictPath(relPath, ts), or - if that
-// name is already occupied on either side - a disambiguated variant that
-// exists on neither, by trying successive attempt numbers. conflictPath's
-// timestamp has only 1-second resolution, and renameFile is a bare
-// os.Rename, which silently REPLACES an existing destination on Unix - so
-// without this, two conflicts on the same relPath within the same
-// wall-clock second would have the second one clobber the first call's
-// already-renamed-aside conflict copy (review finding "Medium 6"). A single
-// process handles one RunActions batch (one action per path) at a time and
-// watch/loop.go serializes cycles through a mutex, so the check-then-rename
-// here has no concurrent-writer race to guard against in practice. Bounded
-// by maxConflictPathAttempts (docs/follow-ups.md #19) so a pathological pile
-// of same-second conflict copies fails this one action instead of spinning.
+// findAvailableConflictPath picks a name not occupied on either side.
+// The timestamp alone has only one-second resolution, so repeated conflicts
+// need a suffix. The search is bounded to fail rather than spin forever.
+// The pair lock serializes syncd processes; other writers can still race
+// with this check, so the actual filesystem operations remain confined.
 func findAvailableConflictPath(localRoot, remoteRoot, relPath string, ts time.Time) (string, error) {
 	for attempt := 0; attempt < maxConflictPathAttempts; attempt++ {
 		candidate := conflictPathAttempt(relPath, ts, attempt)

@@ -86,7 +86,7 @@ func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirector
 
 	// Force the Rename→fallback path by making the rename always fail.
 	origRename := renameFunc
-	renameFunc = func(_, _ string) error {
+	renameFunc = func(_, _, _, _ string) error {
 		return fmt.Errorf("simulated cross-device rename failure")
 	}
 	defer func() { renameFunc = origRename }()
@@ -94,7 +94,8 @@ func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirector
 	// Simulate the copy succeeding, then the TOCTOU race replacing src with a
 	// non-empty directory before moveFastFile's os.Remove(src) runs.
 	origCopy := copyFunc
-	copyFunc = func(srcPath, dstPath string) error {
+	copyFunc = func(srcRoot, srcRel, dstRoot, dstRel string) error {
+		srcPath, dstPath := filepath.Join(srcRoot, srcRel), filepath.Join(dstRoot, dstRel)
 		if err := os.WriteFile(dstPath, []byte("hi"), 0o644); err != nil {
 			return err
 		}

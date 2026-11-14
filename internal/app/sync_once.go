@@ -338,6 +338,13 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		}
 	}
 
+	baseline := make(map[string]db.ManifestRow, len(prev))
+	for path := range prev {
+		baseline[path] = db.ManifestRow{Path: path}
+	}
+	if err := fs.CheckCaseAliases(baseline, scans.Local, scans.Remote); err != nil {
+		return err
+	}
 	res := reconcile.FastCompare(opts.Mode, left, right, prev, skipped)
 
 	// --dry-run prints the same summary the interactive confirm would show
@@ -430,6 +437,9 @@ func scanPairForOpts(ctx context.Context, opts SyncOptions, manifest map[string]
 	}
 	remote, err := scanRootOrEmpty(ctx, opts.Right, db.RemoteStatView(manifest), false, matcher, policy)
 	if err != nil {
+		return fs.ScanPairResult{}, err
+	}
+	if err := fs.CheckCaseAliases(manifest, local, remote); err != nil {
 		return fs.ScanPairResult{}, err
 	}
 	return fs.ScanPairResult{Local: local, Remote: remote}, nil

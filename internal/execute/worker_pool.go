@@ -115,8 +115,8 @@ var ErrDestinationChanged = errors.New("destination changed since scan; deferrin
 // path the scan saw must still be a regular file with the same size and
 // mtime. allowVanished tolerates a scanned path that has since disappeared
 // (correct for deletes, whose goal state is "absent" anyway).
-func verifyDestinationUnchanged(absPath string, scanned fs.FileEntry, present, allowVanished bool) error {
-	info, err := os.Lstat(absPath)
+func verifyDestinationUnchanged(root, rel string, scanned fs.FileEntry, present, allowVanished bool) error {
+	info, err := fs.LstatInRoot(root, rel)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("stat destination: %w", err)
@@ -132,8 +132,20 @@ func verifyDestinationUnchanged(absPath string, scanned fs.FileEntry, present, a
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w (no longer a regular file)", ErrDestinationChanged)
 	}
-	if info.Size() != scanned.Size || info.ModTime().Unix() != scanned.Mtime {
+	if info.Size() != scanned.Size || info.ModTime().Unix() != scanned.Mtime || (!scanned.ModTime.IsZero() && !info.ModTime().Equal(scanned.ModTime)) {
 		return fmt.Errorf("%w (size/mtime %d/%d, scanned %d/%d)", ErrDestinationChanged, info.Size(), info.ModTime().Unix(), scanned.Size, scanned.Mtime)
+	}
+	// A coarse timestamp, or a writer that preserves timestamps, can hide
+	// an edit even when the stat matches. Robust scans have a content hash;
+	// validate it before a destructive action as well.
+	if scanned.Hash != "" {
+		hash, err := fs.FileBLAKE3InRoot(root, rel)
+		if err != nil {
+			return fmt.Errorf("verify destination content: %w", err)
+		}
+		if hash != scanned.Hash {
+			return fmt.Errorf("%w (content changed)", ErrDestinationChanged)
+		}
 	}
 	return nil
 }
@@ -165,9 +177,8 @@ func runUpload(state SyncState, action reconcile.Action) Result {
 	if !ok {
 		return Result{Action: action, Error: fmt.Errorf("upload source missing: %s", action.Path)}
 	}
-	dst := filepath.Join(state.RemoteRoot, filepath.FromSlash(action.Path))
 	scanned, present := state.RemoteFiles[action.Path]
-	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
+	if err := verifyDestinationUnchanged(state.RemoteRoot, filepath.FromSlash(action.Path), scanned, present, false); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
 	if action.PreserveDest {
@@ -175,7 +186,7 @@ func runUpload(state SyncState, action reconcile.Action) Result {
 			return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 		}
 	}
-	if err := fs.AtomicCopyFile(local.AbsPath, dst); err != nil {
+	if err := fs.AtomicCopyFileInRoots(state.LocalRoot, relativeSource(state.LocalRoot, local), state.RemoteRoot, filepath.FromSlash(action.Path)); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
 	return Result{
@@ -193,9 +204,8 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 	if !ok {
 		return Result{Action: action, Error: fmt.Errorf("download source missing: %s", action.Path)}
 	}
-	dst := filepath.Join(state.LocalRoot, filepath.FromSlash(action.Path))
 	scanned, present := state.LocalFiles[action.Path]
-	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
+	if err := verifyDestinationUnchanged(state.LocalRoot, filepath.FromSlash(action.Path), scanned, present, false); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
 	}
 	if action.PreserveDest {
@@ -203,7 +213,7 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 			return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
 		}
 	}
-	if err := fs.AtomicCopyFile(remote.AbsPath, dst); err != nil {
+	if err := fs.AtomicCopyFileInRoots(state.RemoteRoot, relativeSource(state.RemoteRoot, remote), state.LocalRoot, filepath.FromSlash(action.Path)); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
 	}
 	return Result{
@@ -221,12 +231,11 @@ func runDelete(state SyncState, action reconcile.Action, deleteLocal bool) Resul
 	if deleteLocal {
 		targetRoot, targetFiles = state.LocalRoot, state.LocalFiles
 	}
-	targetPath := filepath.Join(targetRoot, filepath.FromSlash(action.Path))
 	// BuildPlan only deletes a path it saw, unchanged since the manifest, on
 	// the target side - so the target must still be exactly that file. If it
 	// was edited in the meantime, deleting it would destroy the edit.
 	scanned, present := targetFiles[action.Path]
-	if err := verifyDestinationUnchanged(targetPath, scanned, present, true); err != nil {
+	if err := verifyDestinationUnchanged(targetRoot, filepath.FromSlash(action.Path), scanned, present, true); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
 	}
 	if err := state.Trash.Remove(targetRoot, action.Path); err != nil {
@@ -238,4 +247,12 @@ func runDelete(state SyncState, action reconcile.Action, deleteLocal bool) Resul
 			{Path: action.Path, Delete: true},
 		},
 	}
+}
+
+func relativeSource(root string, entry fs.FileEntry) string {
+	rel, err := filepath.Rel(root, entry.AbsPath)
+	if err != nil {
+		return entry.AbsPath
+	}
+	return rel
 }

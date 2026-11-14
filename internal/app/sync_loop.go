@@ -469,6 +469,9 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	}
 	logScanIssues(p.Logger, "local", localScan.Issues)
 	logScanIssues(p.Logger, "remote", remoteScan.Issues)
+	if err := fs.CheckCaseAliases(scopedManifest, localScan, remoteScan); err != nil {
+		return reconcile.Plan{}, 0, err
+	}
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
 	if _, err := p.applyFirstSync(&plan, localScan.Files, remoteScan.Files, scopedManifest, func() (bool, error) {
@@ -562,6 +565,9 @@ var scopedActionsDone = func() {}
 // it may be planned from this cycle (see RunRobustScoped).
 func scopedSubtrees(localRoot, remoteRoot string, relPaths map[string]struct{}, matcher *fs.IgnoreMatcher) ([]scopedSubtree, []string, []scopedUnknown) {
 	stat := func(root, rel string) (dir, missing bool, err error) {
+		if err := fs.CheckPath(root, filepath.FromSlash(rel)); err != nil {
+			return false, false, err
+		}
 		info, err := scopedLstat(filepath.Join(root, filepath.FromSlash(rel)))
 		if err != nil {
 			if os.IsNotExist(err) {

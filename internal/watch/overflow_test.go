@@ -20,13 +20,14 @@ import (
 func TestWatcher_ForwardsFsnotifyErrors(t *testing.T) {
 	root := t.TempDir()
 	m, _ := fs.LoadIgnoreMatcher(root)
-	w, err := NewWatcher(root, m, 20*time.Millisecond)
+	injected := make(chan error, 1)
+	w, err := newWatcherWithErrors(root, m, 20*time.Millisecond, injected)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 
-	w.fsw.Errors <- fsnotify.ErrEventOverflow
+	injected <- fsnotify.ErrEventOverflow
 	select {
 	case got := <-w.Errors():
 		if got != fsnotify.ErrEventOverflow {
@@ -95,10 +96,11 @@ func TestRun_OverflowTriggersFullRescan(t *testing.T) {
 	m, _ := fs.LoadIgnoreMatcher(local)
 	p := app.RobustParams{LocalRoot: local, RemoteRoot: remote, Workers: 1, Repo: db.NewManifestRepo(dbh), DB: dbh, Logger: logger}
 
+	injected := make(chan error, 1)
 	created := make(chan *Watcher, 1)
 	orig := newWatcher
 	newWatcher = func(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) (*Watcher, error) {
-		w, err := orig(root, matcher, debounce)
+		w, err := newWatcherWithErrors(root, matcher, debounce, injected)
 		if err == nil {
 			created <- w
 		}
@@ -116,13 +118,12 @@ func TestRun_OverflowTriggersFullRescan(t *testing.T) {
 		<-done
 	}()
 
-	var w *Watcher
 	select {
-	case w = <-created:
+	case <-created:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not create a watcher")
 	}
-	w.fsw.Errors <- fsnotify.ErrEventOverflow
+	injected <- fsnotify.ErrEventOverflow
 
 	deadline := time.After(3 * time.Second)
 	for {

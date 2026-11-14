@@ -10,38 +10,54 @@ import (
 	"unicode/utf8"
 )
 
+// AtomicCopyFile is the unscoped convenience API. Sync operations use
+// AtomicCopyFileInRoots so neither side can escape its configured root.
 func AtomicCopyFile(srcPath, dstPath string) error {
-	srcInfo, err := os.Stat(srcPath)
-	if err != nil {
-		return fmt.Errorf("stat source file: %w", err)
-	}
-	if srcInfo.IsDir() {
-		return fmt.Errorf("source is directory: %s", srcPath)
-	}
 	if err := EnsureParents(dstPath); err != nil {
-		return fmt.Errorf("create destination parent: %w", err)
+		return err
 	}
+	return AtomicCopyFileInRoots(filepath.Dir(srcPath), filepath.Base(srcPath), filepath.Dir(dstPath), filepath.Base(dstPath))
+}
 
-	src, err := os.Open(srcPath)
+func AtomicCopyFileInRoots(srcRoot, srcRel, dstRoot, dstRel string) error {
+	source, err := openSyncRoot(srcRoot)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	src, err := openRegularInRoot(source, srcRel)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
 	defer src.Close()
-
-	tmp, tmpPath, err := createTempSibling(dstPath, srcInfo.Mode().Perm())
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return err
+	}
+	dest, err := openSyncRoot(dstRoot)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+	if err := checkPath(dest, dstRel); err != nil {
+		return err
+	}
+	if err := dest.MkdirAll(filepath.Dir(dstRel), 0o755); err != nil {
+		return err
+	}
+	tmp, tmpPath, err := createTempSiblingInRoot(dest, dstRel, srcInfo.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
-	tmpClosed := false
-	defer func() {
-		if !tmpClosed {
-			_ = tmp.Close()
-		}
-		_ = os.Remove(tmpPath)
-	}()
-
+	defer tmp.Close()
+	defer dest.Remove(tmpPath)
 	if _, err := io.Copy(tmp, src); err != nil {
 		return fmt.Errorf("copy bytes: %w", err)
+	}
+	// Root.Chtimes confines traversal and does not follow a concurrently
+	// substituted final symlink on Unix. Keep the source's full precision.
+	if err := dest.Chtimes(tmpPath, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
+		return fmt.Errorf("set temp mtime: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("sync temp file: %w", err)
@@ -49,12 +65,7 @@ func AtomicCopyFile(srcPath, dstPath string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	tmpClosed = true
-
-	if err := os.Chtimes(tmpPath, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
-		return fmt.Errorf("set temp mtime: %w", err)
-	}
-	if err := os.Rename(tmpPath, dstPath); err != nil {
+	if err := dest.Rename(tmpPath, dstRel); err != nil {
 		return fmt.Errorf("rename temp into place: %w", err)
 	}
 	return nil
@@ -121,11 +132,18 @@ const maxTempSiblingAttempts = 5
 // O_TRUNC alone would clobber a stale leftover temp file from a crashed
 // prior run, or the vanishingly rare genuine name collision, instead of
 // failing or picking a different name (review finding, Gemini 3.6).
-func createTempSibling(dstPath string, perm os.FileMode) (*os.File, string, error) {
+func createTempSiblingInRoot(root *os.Root, dstPath string, perm os.FileMode) (*os.File, string, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxTempSiblingAttempts; attempt++ {
 		tmpPath := tempSiblingPathFunc(dstPath)
-		tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+		if filepath.IsAbs(tmpPath) {
+			var err error
+			tmpPath, err = filepath.Rel(root.Name(), tmpPath)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		tmp, err := root.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 		if err == nil {
 			return tmp, tmpPath, nil
 		}

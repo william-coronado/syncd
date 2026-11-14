@@ -1,11 +1,13 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 
+	"syncd/internal/fs"
 	"syncd/internal/reconcile"
 	"syncd/internal/runtime"
 )
@@ -147,7 +149,6 @@ func planDirectories(localDirs, remoteDirs, dirBaseline map[string]struct{}, ski
 // (os.Remove is non-recursive and refuses a non-empty directory), and a
 // failed op leaves the baseline unchanged for that path.
 func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []DirOp) (toAdd, toRemove []string, failures int) {
-	abs := func(root, rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }
 	for _, op := range ops {
 		var err error
 		var what string
@@ -159,13 +160,13 @@ func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []Dir
 			toRemove = append(toRemove, op.Path)
 			continue
 		case DirRemoveLocal:
-			what, err = "failed to remove local directory", removeEmptyDir(abs(localRoot, op.Path))
+			what, err = "failed to remove local directory", removeEmptyDirInRoot(localRoot, op.Path)
 		case DirRemoveRemote:
-			what, err = "failed to remove remote directory", removeEmptyDir(abs(remoteRoot, op.Path))
+			what, err = "failed to remove remote directory", removeEmptyDirInRoot(remoteRoot, op.Path)
 		case DirCreateLocal:
-			what, err = "failed to create local directory", os.MkdirAll(abs(localRoot, op.Path), 0o755)
+			what, err = "failed to create local directory", fs.MkdirInRoot(localRoot, filepath.FromSlash(op.Path))
 		case DirCreateRemote:
-			what, err = "failed to create remote directory", os.MkdirAll(abs(remoteRoot, op.Path), 0o755)
+			what, err = "failed to create remote directory", fs.MkdirInRoot(remoteRoot, filepath.FromSlash(op.Path))
 		}
 		if err != nil {
 			failures++
@@ -182,16 +183,6 @@ func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []Dir
 	return toAdd, toRemove, failures
 }
 
-// removeEmptyDir removes dir if it exists, tolerating its prior absence -
-// os.Remove refuses (ENOTEMPTY) if dir unexpectedly still contains entries,
-// which is the desired safety: this never recurses or forces a delete.
-func removeEmptyDir(dir string) error {
-	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
 // cleanupEmptiedDirs removes directories, on both local and remote, that
 // held one of this run's deleted files (or held a directory this run
 // emptied out) and are now empty on that side. A directory that was already
@@ -202,11 +193,7 @@ func removeEmptyDir(dir string) error {
 // Every ancestor of each deleted path is a candidate, not just its immediate
 // parent: removing "sub/nested/emptied" (itself emptied by a delete) can in
 // turn empty "sub/nested", and so on up the tree. Candidates are visited
-// deepest-first (same reasoning as reconcileDirectories' nested-deletion
-// ordering) so a now-empty parent is reconsidered only after its child is
-// actually gone; removeIfEmpty's own os.ReadDir check stops the cascade the
-// moment it hits an ancestor that still holds something else (review
-// finding, Gemini 3.6).
+// deepest-first, and non-recursive removal leaves non-empty directories intact.
 func cleanupEmptiedDirs(localRoot, remoteRoot string, deletedRelPaths []string) {
 	touched := make(map[string]struct{})
 	for _, relPath := range deletedRelPaths {
@@ -221,15 +208,26 @@ func cleanupEmptiedDirs(localRoot, remoteRoot string, deletedRelPaths []string) 
 	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
 
 	for _, relDir := range dirs {
-		removeIfEmpty(filepath.Join(localRoot, filepath.FromSlash(relDir)))
-		removeIfEmpty(filepath.Join(remoteRoot, filepath.FromSlash(relDir)))
+		_ = removeEmptyDirInRoot(localRoot, relDir)
+		_ = removeEmptyDirInRoot(remoteRoot, relDir)
 	}
 }
 
-func removeIfEmpty(absDir string) {
-	entries, err := os.ReadDir(absDir)
-	if err != nil || len(entries) > 0 {
-		return
+func removeEmptyDirInRoot(root, rel string) error {
+	// Lstat verifies this is still a directory; Remove remains non-recursive.
+	info, err := fs.LstatInRoot(root, filepath.FromSlash(rel))
+	if os.IsNotExist(err) {
+		return nil
 	}
-	_ = os.Remove(absDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("not a directory: %s", rel)
+	}
+	err = fs.RemoveInRoot(root, filepath.FromSlash(rel))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }

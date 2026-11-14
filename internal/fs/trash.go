@@ -53,15 +53,15 @@ var (
 // returned: failing a delete (it is retried next run) is better than making
 // an unrecoverable one.
 //
-// Anything that is not a regular file is handed to os.Remove unchanged, so
+// Symlinks are rejected. Other non-regular paths use non-recursive removal, so
 // a path that has become a non-empty directory since the scan still fails
 // with ENOTEMPTY instead of being moved wholesale.
 func (t *Trash) Remove(root, rel string) error {
 	abs := filepath.Join(root, filepath.FromSlash(rel))
 	if t == nil {
-		return removeIfExists(abs)
+		return removeInRootIfExists(root, filepath.FromSlash(rel))
 	}
-	info, err := os.Lstat(abs)
+	info, err := LstatInRoot(root, filepath.FromSlash(rel))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -71,7 +71,7 @@ func (t *Trash) Remove(root, rel string) error {
 	// Classified by the file's own directory, not the root: a root can
 	// contain a mount of a different kind.
 	if !info.Mode().IsRegular() || t.onNetwork(filepath.Dir(abs)) {
-		return removeIfExists(abs)
+		return removeInRootIfExists(root, filepath.FromSlash(rel))
 	}
 
 	dst, err := t.reserve(root, rel)
@@ -79,16 +79,16 @@ func (t *Trash) Remove(root, rel string) error {
 		return fmt.Errorf("move to trash: %w", err)
 	}
 	// dst is an empty file only this call owns, so replacing it is safe.
-	if err := os.Rename(abs, dst); err == nil {
+	if err := RenameInRoots(root, filepath.FromSlash(rel), t.Dir, mustRelative(t.Dir, dst)); err == nil {
 		return nil
 	}
 	// Rename fails across filesystems (a tree on a different disk from the
 	// state directory): copy, then remove the original.
-	if err := AtomicCopyFile(abs, dst); err != nil {
+	if err := AtomicCopyFileInRoots(root, filepath.FromSlash(rel), t.Dir, mustRelative(t.Dir, dst)); err != nil {
 		_ = os.Remove(dst)
 		return fmt.Errorf("move to trash: %w", err)
 	}
-	return removeIfExists(abs)
+	return removeInRootIfExists(root, filepath.FromSlash(rel))
 }
 
 // Preserve copies root/rel into the trash and leaves the original where it
@@ -100,8 +100,7 @@ func (t *Trash) Preserve(root, rel string) error {
 	if t == nil {
 		return nil
 	}
-	abs := filepath.Join(root, filepath.FromSlash(rel))
-	info, err := os.Lstat(abs)
+	info, err := LstatInRoot(root, filepath.FromSlash(rel))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -115,7 +114,7 @@ func (t *Trash) Preserve(root, rel string) error {
 	if err != nil {
 		return fmt.Errorf("keep a copy in trash: %w", err)
 	}
-	if err := AtomicCopyFile(abs, dst); err != nil {
+	if err := AtomicCopyFileInRoots(root, filepath.FromSlash(rel), t.Dir, mustRelative(t.Dir, dst)); err != nil {
 		_ = os.Remove(dst)
 		return fmt.Errorf("keep a copy in trash: %w", err)
 	}
@@ -178,13 +177,6 @@ func lexists(p string) bool {
 	return err == nil
 }
 
-func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
 // PruneTrash deletes the per-day trash directories under dir that are more
 // than keepDays days old, returning how many it removed. keepDays <= 0
 // keeps everything. Entries that are not day directories are left alone.
@@ -221,4 +213,11 @@ func PruneTrash(dir string, keepDays int) (int, error) {
 		removed++
 	}
 	return removed, firstErr
+}
+
+func removeInRootIfExists(root, rel string) error {
+	if err := RemoveInRoot(root, rel); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

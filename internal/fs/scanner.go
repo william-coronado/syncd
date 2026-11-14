@@ -26,6 +26,7 @@ type FileEntry struct {
 	Size    int64
 	Mtime   int64
 	Hash    string
+	ModTime time.Time // full-resolution scan timestamp for execution preconditions
 }
 
 // ScanResult holds one tree scan's outcome. A per-entry problem — a symlink,
@@ -137,6 +138,9 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 			out.Remote = it.res
 		}
 	}
+	if err := CheckCaseAliases(manifest, out.Local, out.Remote); err != nil {
+		return ScanPairResult{}, err
+	}
 	return out, nil
 }
 
@@ -185,7 +189,20 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 	scanStart := time.Now().Unix()
 	scanned := 0
 	lastReport := time.Now()
-	err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, walkErr error) error {
+	tree, err := openSyncRoot(root)
+	if err != nil {
+		return ScanResult{}, err
+	}
+	defer tree.Close()
+	walkRel, err := filepath.Rel(root, walkRoot)
+	if err != nil {
+		return ScanResult{}, err
+	}
+	if err := checkPath(tree, walkRel); err != nil {
+		return ScanResult{}, err
+	}
+	err = fs.WalkDir(tree.FS(), filepath.ToSlash(walkRel), func(rel string, d fs.DirEntry, walkErr error) error {
+		path := filepath.Join(root, filepath.FromSlash(rel))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -259,6 +276,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 		if d.Type()&os.ModeSymlink != 0 {
 			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "symlink not supported"})
 			result.Skipped[relPath] = struct{}{}
+			result.SkippedDirs[relPath] = struct{}{}
 			return nil
 		}
 		// Devices, sockets, and FIFOs are skipped the same way - hashing a
@@ -292,7 +310,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 		case HashNever:
 			// leave hash empty; reconciler compares on size+mtime
 		case HashAlways:
-			h, hashErr := FileBLAKE3(path)
+			h, hashErr := hashRegularInRoot(tree, filepath.FromSlash(rel))
 			if hashErr != nil {
 				result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 				result.Skipped[relPath] = struct{}{}
@@ -303,7 +321,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			if row, ok := manifest[relPath]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
 				hash = row.Hash
 			} else {
-				h, hashErr := FileBLAKE3(path)
+				h, hashErr := hashRegularInRoot(tree, filepath.FromSlash(rel))
 				if hashErr != nil {
 					result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 					result.Skipped[relPath] = struct{}{}
@@ -318,6 +336,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			Size:    size,
 			Mtime:   mtime,
 			Hash:    hash,
+			ModTime: info.ModTime(),
 		})
 		scanned++
 		if progress != nil && time.Since(lastReport) >= progressReportInterval {

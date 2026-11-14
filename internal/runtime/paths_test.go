@@ -182,3 +182,29 @@ func TestResolvePaths_DefaultLogPathIsPerRootPair(t *testing.T) {
 		t.Fatalf("rootless default = %q, want sync.log", none.LogPath)
 	}
 }
+
+func TestRootPairKeyResolvesAliasesAndMissingChildren(t *testing.T) {
+	base, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(base, alias); err != nil {
+		t.Fatal(err)
+	}
+	a, err := RootPairKey(filepath.Join(base, "new"), other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := RootPairKey(other, filepath.Join(alias, "new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b {
+		t.Fatalf("aliases differ: %s vs %s", a, b)
+	}
+	if err := os.Mkdir(filepath.Join(base, "new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, err := RootPairKey(other, filepath.Join(alias, "new"))
+	if err != nil || a != c {
+		t.Fatalf("identity changed after creating root: %s vs %s (%v)", a, c, err)
+	}
+}

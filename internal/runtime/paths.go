@@ -48,7 +48,11 @@ func ResolvePaths(cfg Config) (RuntimePaths, error) {
 	}
 	lockPath := cfg.LockPath
 	if lockPath == "" {
-		lockPath = filepath.Join(stateDir, defaultLockName(cfg.LocalRoot, cfg.RemoteRoot))
+		name, err := defaultLockName(cfg.LocalRoot, cfg.RemoteRoot)
+		if err != nil {
+			return RuntimePaths{}, err
+		}
+		lockPath = filepath.Join(stateDir, name)
 	}
 
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
@@ -90,25 +94,20 @@ func defaultManifestDBName(localRoot, remoteRoot string) string {
 	return "manifest-" + hex.EncodeToString(sum[:6]) + ".db"
 }
 
-// defaultLockName mirrors defaultManifestDBName's root-pair hashing for the
-// default lock filename: the default database is already isolated per root
-// pair (see defaultManifestDBName), but the default lock was left as the
-// fixed "sync.lock" - so two `syncd watch` instances for unrelated root
-// pairs could never run concurrently, contrary to RunWatch's stated
-// one-watcher-per-local-root behavior (review finding P2 #4, Codex). Falls
-// back to the historical fixed name "sync.lock" when both roots are empty,
-// for the same reason defaultManifestDBName does: existing callers that
-// never set them keep today's behavior.
-func defaultLockName(localRoot, remoteRoot string) string {
+// defaultLockName uses the same canonical, unordered identity as sync.
+func defaultLockName(localRoot, remoteRoot string) (string, error) {
 	if localRoot == "" && remoteRoot == "" {
-		return "sync.lock"
+		return "sync.lock", nil
 	}
-	sum := sha256.Sum256([]byte(localRoot + "\x00" + remoteRoot))
-	return "sync-" + hex.EncodeToString(sum[:6]) + ".lock"
+	key, err := RootPairKey(localRoot, remoteRoot)
+	if err != nil {
+		return "", err
+	}
+	return "sync-" + key + ".lock", nil
 }
 
-// defaultLogName gives the default log file the same per-root-pair name as
-// defaultLockName/defaultManifestDBName. With one fixed "sync.log", two
+// defaultLogName gives the default log file the same ordered root-pair identity
+// as defaultManifestDBName. With one fixed "sync.log", two
 // watch daemons for different pairs interleaved their events in one file,
 // and one daemon's in-place rotation renamed the file out from under the
 // other, whose writes then landed in sync.log.old (docs/follow-ups.md #27).

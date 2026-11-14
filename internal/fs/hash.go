@@ -22,3 +22,27 @@ func FileBLAKE3(path string) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
+
+// FileBLAKE3InRoot hashes through a confined descriptor, never through an
+// absolute path whose parent might have been replaced by a symlink.
+func FileBLAKE3InRoot(root, rel string) (string, error) {
+	r, err := openSyncRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	return hashRegularInRoot(r, rel)
+}
+
+func hashRegularInRoot(r *os.Root, rel string) (string, error) {
+	f, err := openRegularInRoot(r, rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := blake3.New(32, nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

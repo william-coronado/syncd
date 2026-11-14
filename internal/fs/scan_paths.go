@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,12 +38,16 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 			continue
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
-		info, err := os.Lstat(abs)
+		info, err := LstatInRoot(root, filepath.FromSlash(rel))
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue // absent on this side
 			}
-			result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: fmt.Sprintf("lstat: %s", err)})
+			reason := fmt.Sprintf("lstat: %s", err)
+			if errors.Is(err, ErrSymlink) {
+				reason = ErrSymlink.Error()
+			}
+			result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: reason})
 			result.Skipped[rel] = struct{}{}
 			continue
 		}
@@ -73,7 +78,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 		switch policy {
 		case HashNever:
 		case HashAlways:
-			h, hashErr := FileBLAKE3(abs)
+			h, hashErr := FileBLAKE3InRoot(root, filepath.FromSlash(rel))
 			if hashErr != nil {
 				result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 				result.Skipped[rel] = struct{}{}
@@ -84,7 +89,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 			if row, ok := manifest[rel]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
 				hash = row.Hash
 			} else {
-				h, hashErr := FileBLAKE3(abs)
+				h, hashErr := FileBLAKE3InRoot(root, filepath.FromSlash(rel))
 				if hashErr != nil {
 					result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 					result.Skipped[rel] = struct{}{}
@@ -93,7 +98,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 				hash = h
 			}
 		}
-		result.Files[rel] = FileEntry{Path: rel, AbsPath: abs, Size: size, Mtime: mtime, Hash: hash}
+		result.Files[rel] = FileEntry{Path: rel, AbsPath: abs, Size: size, Mtime: mtime, Hash: hash, ModTime: info.ModTime()}
 	}
 	return result, nil
 }

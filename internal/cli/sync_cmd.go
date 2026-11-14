@@ -324,32 +324,10 @@ func jobStateKey(name, left, right string) (string, error) {
 	return name + "-" + hex.EncodeToString(sum[:6]), nil
 }
 
-// rootPairKey derives the filesystem-exclusion identity for a root pair:
-// canonicalized via filepath.Abs like jobStateKey, but deliberately NOT the
-// same value. jobStateKey folds in the job's display Name and is
-// order-sensitive (Left then Right) - correct for persisted state, since a
-// fast two-way job's job_state row and a --hash job's manifest baseline
-// legitimately depend on which side is "left". But two DIFFERENTLY-named
-// jobs pointed at the identical directories, or the same two directories
-// with Left/Right swapped, are still one physical pair of trees - locking on
-// jobStateKey let them acquire two different lock files and mutate the same
-// files concurrently (review finding, GPT-5.6 Sol). rootPairKey drops the
-// Name and sorts the canonicalized pair before hashing, so {A,B} and {B,A}
-// - under any job name - always produce the same key.
+// rootPairKey shares watch's canonical, order-independent exclusion key.
+// Job names and manifest identities remain independent of filesystem locks.
 func rootPairKey(left, right string) (string, error) {
-	canonLeft, err := filepath.Abs(left)
-	if err != nil {
-		return "", fmt.Errorf("resolve left root %q: %w", left, err)
-	}
-	canonRight, err := filepath.Abs(right)
-	if err != nil {
-		return "", fmt.Errorf("resolve right root %q: %w", right, err)
-	}
-	if canonLeft > canonRight {
-		canonLeft, canonRight = canonRight, canonLeft
-	}
-	sum := sha256.Sum256([]byte(canonLeft + "\x00" + canonRight))
-	return "roots-" + hex.EncodeToString(sum[:6]), nil
+	return runtime.RootPairKey(left, right)
 }
 
 func parseFastMode(mode string) (reconcile.FastMode, error) {
@@ -410,13 +388,8 @@ func hashJobDBPath(jobName string) (string, error) {
 	return filepath.Join(dir, "hash-"+sanitizeJobDBName(jobName)+".db"), nil
 }
 
-// syncLockPath returns the per-job lock file path used to serialize two
-// concurrent runs of the SAME job: ~/.local/state/syncd/sync-<id>.lock,
-// where <id> is jobName run through sanitizeJobDBName (the same sanitizer
-// hashJobDBPath uses, since a job name is arbitrary user-supplied text and
-// must be made safe as a filename component either way). Distinct job
-// names get distinct lock files, so distinct jobs are never blocked by
-// each other - only two runs of one job are.
+// syncLockPath returns the default-state-directory lock path for a
+// rootPairKey, using the same naming scheme as runtime.ResolvePaths.
 func syncLockPath(jobName string) (string, error) {
 	dir, err := syncdStateDir()
 	if err != nil {

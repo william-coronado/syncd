@@ -159,31 +159,18 @@ watcher's startup-fixed ignore rules, and directory operations missing
 from the `--hash` summary), along with #22 from the second pass (summaries enumerating a
 fixed list of types). See the git history for that date.
 
-### 30. Two watch tests fail under `-race` on macOS (test-only race with fsnotify)
-
-`internal/watch/overflow_test.go` — `TestWatcher_ForwardsFsnotifyErrors` and
-`TestRun_OverflowTriggersFullRescan` inject an error by sending on fsnotify's
-own `Errors` channel, which races with the kqueue backend goroutine that owns
-that channel. Found 2026-11-14 while adding the delete guard / trash /
-`service` command; it reproduces on the commit before that work, so it is not
-caused by it. Production code is not involved. Done = the tests inject through
-a seam syncd owns (e.g. an indirected error source on `Watcher`) and
-`go test ./... -race` is green on darwin.
+Item #30 (test-only fsnotify channel races on macOS) was resolved in the
+2026-11-15 safety fixes: tests inject errors through an owned channel rather
+than sending on the backend's channel.
 
 Items #31-#35 are the findings from the automated reviews of PR #6 (Codex
 and Sourcery, 2026-11-14) that were judged valid but not worth fixing in that
 PR. The rest of those reviews' findings were fixed there.
 
-### 31. Cross-device trash fallback follows a symlink swapped in mid-delete
-
-`internal/fs/trash.go` — `Remove`/`Preserve` `Lstat` the source, but when the
-rename into the trash fails (tree and state directory on different
-filesystems) they hand the path to `AtomicCopyFile`, which follows symlinks.
-Another local user with write access to the synced tree could swap the file
-for a symlink in that window and get an outside file copied into the trash.
-Needs a hostile local writer and a cross-device layout. Done = the fallback
-copies from a descriptor opened with `O_NOFOLLOW` and checks it is the same
-regular file that was `Lstat`ed.
+Item #31 (cross-device trash copies following a substituted symlink) was
+addressed in the 2026-11-15 safety fixes: trash copies now open sources
+through root-confined descriptors, reject leaf symlinks with `O_NOFOLLOW`,
+and verify the opened source is a regular file.
 
 ### 32. A sync root that contains the state directory syncs syncd's own files
 

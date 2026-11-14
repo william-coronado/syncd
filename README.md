@@ -355,6 +355,20 @@ preview step of any kind — whole-tree directory reconciliation there only
 happens on the `--remote-poll` and `--deep-scan` cycles, not on the
 fsnotify-driven scoped reconcile — see "`syncd watch`" above.
 
+## Filesystem safety
+
+Symlinks and their descendants are excluded from reconciliation. File reads,
+transfers, moves, deletions, and directory operations are confined to the
+configured roots even if a parent is replaced by a symlink during a cycle.
+Robust uploads, downloads, and deletions recheck the destination's full
+modification timestamp and content hash before changing it.
+
+Names that differ only by case, including directory components, stop the
+cycle before any transfers or deletions. This applies on all filesystems so
+pairs remain safe on case-insensitive APFS and SMB destinations. Resolve the
+reported names on both sides before retrying; for a tracked case-only rename,
+use an intermediate distinct name and sync it before the final rename.
+
 ## State directory
 
 By default, state artifacts (SQLite manifest, lock file, JSON log) are
@@ -364,9 +378,9 @@ written under:
 ~/.local/state/syncd/
 ```
 
-- `manifest.db` — `syncd watch`'s manifest
+- `manifest-<pair>.db` — `syncd watch`'s manifest for this ordered root pair
 - `jobs.db` — `syncd sync`'s own job state for fast (mirror/update/two-way)
-  jobs, kept separate from the watch daemon's `manifest.db`
+  jobs, kept separate from the watch daemon's manifest
 - `hash-<id>.db` — one file per `--hash` job, where `<id>` is a sanitized
   form of the job's name (or, for an ad-hoc `--left`/`--right --hash` run,
   the same short hash used as its job name). Each `--hash` job gets its own
@@ -375,8 +389,8 @@ written under:
   across jobs would let two jobs whose trees contain the same relative path
   corrupt each other's three-way baseline. The fast path doesn't need this:
   its `job_state` table is already namespaced per job.
-- `sync.lock`
-- `sync.log`
+- `sync-roots-<pair>.lock` — shared by `sync` and `watch` for the same roots
+- `sync-<pair>.log` — the watch log for this root pair
 - `trash/` — files deleted from local disks (see "Delete safety")
 - `service.out.log`, `service.err.log` — the macOS background service's
   stdout/stderr
@@ -391,8 +405,13 @@ flags** — its db paths under `~/.local/state/syncd/` (`jobs.db`, and each
 `--hash` job's own `hash-<id>.db`) are currently fixed and not
 user-overridable.
 
-`syncd` also maintains an exclusive lockfile so overlapping runs against the
-same state directory can't corrupt each other, and validates a remote canary
+With the default state directory, `sync` and `watch` share an exclusive
+lock for each canonical root pair, regardless of root order or job name.
+Symlinked root aliases use the same lock. Explicit watch state/lock overrides
+must point at the shared lock if one-off sync jobs also use those roots.
+Restart existing watch services after upgrading to adopt the shared lock name.
+
+The robust engine validates a remote canary
 file (`.synclock`) before touching the remote — `syncd init` bootstraps it,
 and every sync/watch cycle re-checks it before making changes, so a network
 mount that vanished mid-run is caught rather than silently writing nowhere

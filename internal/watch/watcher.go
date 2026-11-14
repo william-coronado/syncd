@@ -27,10 +27,11 @@ var fsAdd = func(fsw *fsnotify.Watcher, path string) error {
 // root-relative, NFC-normalized paths. Events within `debounce` of each
 // other are merged into one batch. matcher-ignored paths are dropped.
 type Watcher struct {
-	fsw      *fsnotify.Watcher
-	root     string
-	matcher  *fs.IgnoreMatcher
-	debounce time.Duration
+	fsw         *fsnotify.Watcher
+	errorSource <-chan error
+	root        string
+	matcher     *fs.IgnoreMatcher
+	debounce    time.Duration
 
 	batches   chan map[string]struct{}
 	errs      chan error
@@ -64,6 +65,12 @@ type Watcher struct {
 // literally zero directories could be watched, that IS a real failure and
 // NewWatcher returns an error.
 func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) (*Watcher, error) {
+	return newWatcherWithErrors(root, matcher, debounce, nil)
+}
+
+// Tests inject errors on a channel they own, never on fsnotify's channel
+// (which the backend may close concurrently).
+func newWatcherWithErrors(root string, matcher *fs.IgnoreMatcher, debounce time.Duration, errorSource <-chan error) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -150,6 +157,10 @@ func NewWatcher(root string, matcher *fs.IgnoreMatcher, debounce time.Duration) 
 		maxLatency: maxBatchLatency(debounce),
 	}
 
+	if errorSource == nil {
+		errorSource = fsw.Errors
+	}
+	w.errorSource = errorSource
 	go w.run()
 
 	return w, nil
@@ -257,7 +268,7 @@ func (w *Watcher) run() {
 				timerArmed = true
 			}
 
-		case err, ok := <-w.fsw.Errors:
+		case err, ok := <-w.errorSource:
 			if !ok {
 				return
 			}
