@@ -65,11 +65,11 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate manifest schema: %w", err)
 	}
-	if err := addColumnIfMissing(db, "file_manifest", "remote_size", "INTEGER"); err != nil {
+	if err := addColumnIfMissing(db, "file_manifest", "remote_size", `ALTER TABLE file_manifest ADD COLUMN remote_size INTEGER`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate manifest schema: %w", err)
 	}
-	if err := addColumnIfMissing(db, "file_manifest", "remote_mtime", "INTEGER"); err != nil {
+	if err := addColumnIfMissing(db, "file_manifest", "remote_mtime", `ALTER TABLE file_manifest ADD COLUMN remote_mtime INTEGER`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate manifest schema: %w", err)
 	}
@@ -96,10 +96,13 @@ func Open(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// addColumnIfMissing adds column (nullable, of the given SQL type) to table
-// unless it already exists - SQLite has no ADD COLUMN IF NOT EXISTS, and a
-// manifest created by an older syncd must keep working in place.
-func addColumnIfMissing(db *sql.DB, table, column, sqlType string) error {
+// addColumnIfMissing runs addColumnDDL - a complete, constant ALTER TABLE
+// statement adding column to table - unless column already exists. SQLite
+// has no ADD COLUMN IF NOT EXISTS, and a manifest created by an older syncd
+// must keep working in place. Identifiers can't be bound as parameters, so
+// callers pass the whole statement as a literal rather than this function
+// assembling SQL from pieces.
+func addColumnIfMissing(db *sql.DB, table, column, addColumnDDL string) error {
 	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
 		return fmt.Errorf("inspect %s columns: %w", table, err)
@@ -120,7 +123,7 @@ func addColumnIfMissing(db *sql.DB, table, column, sqlType string) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + sqlType); err != nil {
+	if _, err := db.Exec(addColumnDDL); err != nil {
 		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil

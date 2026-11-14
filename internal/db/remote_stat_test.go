@@ -92,7 +92,7 @@ func TestManifestRepo_LoadPaths(t *testing.T) {
 	ctx := context.Background()
 	var rows []ManifestRow
 	want := map[string]struct{}{}
-	for i := 0; i < manifestLoadChunk*2+7; i++ { // spans several chunks
+	for i := 0; i < 1207; i++ { // well past SQLite's classic 999 host-parameter limit
 		p := filepath.ToSlash(filepath.Join("d", string(rune('a'+i%26)), "f"+strconv.Itoa(i)))
 		rows = append(rows, ManifestRow{Path: p, Size: int64(i), Mtime: 1, Hash: "h"})
 		if i%3 == 0 {
@@ -138,5 +138,45 @@ func TestManifestRepo_LoadPrefixMatchesWholeSegments(t *testing.T) {
 		if _, ok := got[p]; !ok {
 			t.Fatalf("missing %s in %v", p, got)
 		}
+	}
+}
+
+// Paths are bound as data, never spliced into SQL: names full of quotes,
+// brackets and SQL keywords must round-trip exactly and leave the table
+// intact.
+func TestManifestRepo_LoadPathsTreatsHostileNamesAsData(t *testing.T) {
+	repo := openTestDB(t)
+	ctx := context.Background()
+	hostile := []string{
+		`a'); DROP TABLE file_manifest; --`,
+		`b") OR 1=1 --`,
+		`c\"],["x`,
+		`d' OR '1'='1`,
+	}
+	var rows []ManifestRow
+	want := map[string]struct{}{}
+	for _, p := range hostile {
+		rows = append(rows, ManifestRow{Path: p, Size: 1, Mtime: 1, Hash: "h"})
+		want[p] = struct{}{}
+	}
+	rows = append(rows, ManifestRow{Path: "innocent.txt", Size: 1, Mtime: 1, Hash: "h"})
+	if err := repo.ApplyUpdates(ctx, rows, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.LoadPaths(ctx, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(hostile) {
+		t.Fatalf("got %d rows, want exactly the %d requested: %v", len(got), len(hostile), got)
+	}
+	for _, p := range hostile {
+		if _, ok := got[p]; !ok {
+			t.Fatalf("hostile path %q did not round-trip", p)
+		}
+	}
+	all, err := repo.LoadAll(ctx)
+	if err != nil || len(all) != len(rows) {
+		t.Fatalf("table damaged: err=%v rows=%d want %d", err, len(all), len(rows))
 	}
 }
