@@ -38,6 +38,7 @@ type watchFlags struct {
 	maxDelete            string
 	noTrash              bool
 	trashDays            int
+	firstSync            string
 }
 
 var watchOpts watchFlags
@@ -59,6 +60,7 @@ func addWatchFlags(cmd *cobra.Command, o *watchFlags) {
 	f.StringVar(&o.maxDelete, "max-delete", reconcile.DefaultDeleteLimit, maxDeleteUsage+"; a cycle over the limit is skipped until 'syncd approve-deletes' allows it")
 	f.BoolVar(&o.noTrash, "no-trash", false, noTrashUsage)
 	f.IntVar(&o.trashDays, "trash-days", defaultTrashDays, trashDaysUsage)
+	f.StringVar(&o.firstSync, "first-sync", string(app.FirstSyncNewer), "On the pair's very first sync, what to do with files that differ between the two sides: newer (the newer file wins, the other goes to the trash), local or remote (that side wins), or keep-both (the remote version takes the name, the local one is kept beside it as a _conflict_ copy)")
 	_ = cmd.MarkFlagRequired("local")
 	_ = cmd.MarkFlagRequired("remote")
 }
@@ -136,6 +138,10 @@ func (o watchFlags) watchConfig() (app.WatchConfig, error) {
 	if o.trashDays < 0 {
 		return app.WatchConfig{}, fmt.Errorf("--trash-days must be >= 0")
 	}
+	firstSync, err := app.ParseFirstSyncPolicy(o.firstSync)
+	if err != nil {
+		return app.WatchConfig{}, fmt.Errorf("--first-sync: %w", err)
+	}
 	return app.WatchConfig{
 		LocalRoot:     localAbs,
 		RemoteRoot:    remoteAbs,
@@ -152,6 +158,7 @@ func (o watchFlags) watchConfig() (app.WatchConfig, error) {
 		MaxDelete:     maxDelete,
 		NoTrash:       o.noTrash,
 		TrashDays:     o.trashDays,
+		FirstSync:     firstSync,
 	}, nil
 }
 

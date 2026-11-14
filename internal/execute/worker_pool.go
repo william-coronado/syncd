@@ -170,6 +170,11 @@ func runUpload(state SyncState, action reconcile.Action) Result {
 	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
+	if action.PreserveDest {
+		if err := state.Trash.Preserve(state.RemoteRoot, action.Path); err != nil {
+			return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
+		}
+	}
 	if err := fs.AtomicCopyFile(local.AbsPath, dst); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
@@ -192,6 +197,11 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 	scanned, present := state.LocalFiles[action.Path]
 	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
+	}
+	if action.PreserveDest {
+		if err := state.Trash.Preserve(state.LocalRoot, action.Path); err != nil {
+			return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
+		}
 	}
 	if err := fs.AtomicCopyFile(remote.AbsPath, dst); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}

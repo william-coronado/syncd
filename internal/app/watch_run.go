@@ -41,6 +41,9 @@ type WatchConfig struct {
 	// are kept (<= 0: forever).
 	NoTrash   bool
 	TrashDays int
+	// FirstSync is the policy for files that differ on the pair's first
+	// cycle (see FirstSyncPolicy).
+	FirstSync FirstSyncPolicy
 }
 
 // WatchLoopFunc runs the actual event/poll/deep-scan loop (watch.Run) once
@@ -148,8 +151,17 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 		Logger:     logger,
 		MaxDelete:  cfg.MaxDelete,
 		Trash:      trash,
-		ApproveDeletes: func() bool {
-			return runtime.ConsumeDeleteApproval(paths.ApprovePath)
+		FirstSync:  cfg.FirstSync,
+		// One window for the daemon's whole life: the limit is a rolling
+		// total across cycles, not a per-cycle allowance.
+		DeleteWindow: NewDeleteWindow(DefaultDeleteWindow),
+		ApproveDeletes: func(fingerprint string) bool {
+			return runtime.ConsumeDeleteApproval(paths.ApprovePath, fingerprint)
+		},
+		OnDeleteRefused: func(r runtime.DeleteRefusal) {
+			if err := runtime.WriteDeleteRefusal(paths.RefusalPath, r); err != nil {
+				logger.Warn("could not record the refused deletions; 'syncd approve-deletes' will not find them", map[string]any{"error": err.Error()})
+			}
 		},
 	}
 
@@ -206,19 +218,21 @@ func pruneTrashPeriodically(ctx context.Context, dir string, keepDays int, logge
 	}
 }
 
-// ApproveDeletes writes the one-shot token that lets the watch daemon for
-// cfg's root pair run its next cycle even though it exceeds --max-delete
-// (see RobustParams.ApproveDeletes). It resolves the roots and state paths
-// exactly as RunWatch does, so the token lands where that daemon looks, and
-// returns the token's path.
-func ApproveDeletes(cfg WatchConfig) (string, error) {
+// ApproveDeletes approves, once, the cycle the watch daemon for cfg's root
+// pair most recently refused for exceeding --max-delete (see
+// RobustParams.ApproveDeletes), and returns that refusal so the caller can
+// show what was approved. It resolves the roots and state paths exactly as
+// RunWatch does, so it reads the record and writes the token where that
+// daemon does. The approval is bound to the refused plan: if the trees
+// change so that the daemon plans different deletions, it is not honored.
+func ApproveDeletes(cfg WatchConfig) (runtime.DeleteRefusal, error) {
 	resolvedLocal, err := resolveWatchRoot("local", cfg.LocalRoot)
 	if err != nil {
-		return "", err
+		return runtime.DeleteRefusal{}, err
 	}
 	resolvedRemote, err := resolveWatchRoot("remote", cfg.RemoteRoot)
 	if err != nil {
-		return "", err
+		return runtime.DeleteRefusal{}, err
 	}
 	paths, err := runtime.ResolvePaths(runtime.Config{
 		LocalRoot:  resolvedLocal,
@@ -227,9 +241,13 @@ func ApproveDeletes(cfg WatchConfig) (string, error) {
 		LockPath:   cfg.LockPath,
 	})
 	if err != nil {
-		return "", err
+		return runtime.DeleteRefusal{}, err
 	}
-	return paths.ApprovePath, runtime.WriteDeleteApproval(paths.ApprovePath)
+	refusal, err := runtime.ReadDeleteRefusal(paths.RefusalPath)
+	if err != nil {
+		return runtime.DeleteRefusal{}, err
+	}
+	return refusal, runtime.WriteDeleteApproval(paths.ApprovePath, refusal.Fingerprint)
 }
 
 // resolveWatchRoot resolves root's symlinks (filepath.Abs, used to resolve

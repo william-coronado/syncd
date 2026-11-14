@@ -85,7 +85,7 @@ func TestRunRobustOnce_DeleteLimitRefusesMassDelete(t *testing.T) {
 
 	// One approval lets exactly one cycle through.
 	approvals := 1
-	p.ApproveDeletes = func() bool { approvals--; return approvals >= 0 }
+	p.ApproveDeletes = func(string) bool { approvals--; return approvals >= 0 }
 	if _, _, err := RunRobustOnce(ctx, p); err != nil {
 		t.Fatalf("approved cycle: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestRunRobustOnce_LocalDeleteGoesToTrash(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(local, "sub", "keep.txt")); !os.IsNotExist(err) {
 		t.Fatal("local file was not deleted")
 	}
-	trashed := filepath.Join(trashDir, time.Now().Format("2006-01-02"), "proj", "sub", "keep.txt")
+	trashed := filepath.Join(trashDir, time.Now().Format("2006-01-02"), fs.RootFolder(local), "sub", "keep.txt")
 	if got := mustReadFile(t, trashed); got != "precious" {
 		t.Fatalf("trashed copy = %q", got)
 	}
@@ -250,7 +250,7 @@ func TestSyncOnce_MirrorDeleteGoesToTrash(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(right, "extra.txt")); !os.IsNotExist(err) {
 		t.Fatal("mirror did not delete the extra file")
 	}
-	trashed := filepath.Join(trashDir, time.Now().Format("2006-01-02"), "dest", "extra.txt")
+	trashed := filepath.Join(trashDir, time.Now().Format("2006-01-02"), fs.RootFolder(right), "extra.txt")
 	if got := mustReadFile(t, trashed); got != "only here" {
 		t.Fatalf("trashed copy = %q", got)
 	}
@@ -258,30 +258,48 @@ func TestSyncOnce_MirrorDeleteGoesToTrash(t *testing.T) {
 
 func TestRunWatch_WaitsForRemote(t *testing.T) {
 	prev := remoteWaitInterval
-	remoteWaitInterval = 10 * time.Millisecond
+	remoteWaitInterval = 5 * time.Millisecond
 	t.Cleanup(func() { remoteWaitInterval = prev })
 
 	local := t.TempDir()
 	remote := filepath.Join(t.TempDir(), "share") // "not mounted" yet
 	cfg := WatchConfig{LocalRoot: local, RemoteRoot: remote, StateDir: t.TempDir(), WaitForRemote: true, NoTrash: true}
 
+	started := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		time.Sleep(60 * time.Millisecond)
-		_ = os.MkdirAll(remote, 0o755)
-		time.Sleep(60 * time.Millisecond)
-		_, _ = runtime.EnsureRemoteCanary(remote)
+		done <- RunWatch(context.Background(), cfg, func(context.Context, RobustParams, *fs.IgnoreMatcher, WatchConfig) error {
+			close(started)
+			return nil
+		})
 	}()
-
-	loopCalled := false
-	err := RunWatch(context.Background(), cfg, func(context.Context, RobustParams, *fs.IgnoreMatcher, WatchConfig) error {
-		loopCalled = true
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("RunWatch: %v", err)
+	notStarted := func(when string) {
+		t.Helper()
+		select {
+		case <-started:
+			t.Fatalf("loop started %s", when)
+		case <-time.After(60 * time.Millisecond): // a dozen wait intervals
+		}
 	}
-	if !loopCalled {
-		t.Fatal("loop never started once the remote appeared")
+
+	notStarted("with no remote at all")
+	// The mountpoint appearing is not the share being ready: only its
+	// canary is.
+	if err := os.MkdirAll(remote, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notStarted("when the remote directory existed but its canary did not")
+
+	if _, err := runtime.EnsureRemoteCanary(remote); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop never started once the canary appeared")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("RunWatch: %v", err)
 	}
 }
 
@@ -302,32 +320,127 @@ func TestRunWatch_WaitForRemoteStopsCleanlyOnCancel(t *testing.T) {
 	}
 }
 
-// approve-deletes must write its token exactly where the daemon for the
-// same roots consumes it.
-func TestApproveDeletes_ReachesTheDaemonForTheSameRoots(t *testing.T) {
+// approve-deletes must read the refusal, and write its token, exactly
+// where the daemon for the same roots records and consumes them - and the
+// approval must be good for that refused plan only.
+func TestApproveDeletes_ApprovesTheRefusedPlanForTheSameRoots(t *testing.T) {
 	local, remote, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	if _, err := runtime.EnsureRemoteCanary(remote); err != nil {
 		t.Fatal(err)
 	}
 	cfg := WatchConfig{LocalRoot: local, RemoteRoot: remote, StateDir: stateDir, NoTrash: true}
 
-	tokenPath, err := ApproveDeletes(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(tokenPath); err != nil {
-		t.Fatalf("token not written: %v", err)
+	if _, err := ApproveDeletes(cfg); !errors.Is(err, runtime.ErrNoDeleteRefusal) {
+		t.Fatalf("nothing refused yet: got %v, want ErrNoDeleteRefusal", err)
 	}
 
-	var first, second bool
-	err = RunWatch(context.Background(), cfg, func(_ context.Context, p RobustParams, _ *fs.IgnoreMatcher, _ WatchConfig) error {
-		first, second = p.ApproveDeletes(), p.ApproveDeletes()
+	var other, first, second bool
+	var shown runtime.DeleteRefusal
+	err := RunWatch(context.Background(), cfg, func(_ context.Context, p RobustParams, _ *fs.IgnoreMatcher, _ WatchConfig) error {
+		p.OnDeleteRefused(runtime.DeleteRefusal{Fingerprint: "plan-a", Remote: 26, Tracked: 27})
+		var err error
+		if shown, err = ApproveDeletes(cfg); err != nil {
+			return err
+		}
+		other = p.ApproveDeletes("plan-b")
+		first, second = p.ApproveDeletes("plan-a"), p.ApproveDeletes("plan-a")
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if shown.Remote != 26 || shown.Tracked != 27 {
+		t.Fatalf("approve-deletes showed %+v, not the refused plan", shown)
+	}
+	if other {
+		t.Fatal("approval of plan-a was honored for plan-b")
+	}
 	if !first || second {
 		t.Fatalf("approval honored first=%v second=%v, want true then false", first, second)
+	}
+}
+
+// A wipe that reaches the daemon as several fsnotify batches, each under
+// the limit on its own, must be stopped by the rolling total.
+func TestRunRobustScoped_SplitWipeIsStoppedByTheRollingLimit(t *testing.T) {
+	local, remote := t.TempDir(), t.TempDir()
+	writeFiles(t, local, 60)
+	p := newTestRobustParams(t, local, remote)
+	p.MaxDelete = mustLimit(t, "50%")
+	p.DeleteWindow = NewDeleteWindow(DefaultDeleteWindow)
+	var refused []runtime.DeleteRefusal
+	p.OnDeleteRefused = func(r runtime.DeleteRefusal) { refused = append(refused, r) }
+	ctx := context.Background()
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	deleteBatch := func(from, to int) error {
+		batch := make(map[string]struct{})
+		for i := from; i < to; i++ {
+			name := fmt.Sprintf("f%02d.txt", i)
+			os.Remove(filepath.Join(local, name))
+			batch[name] = struct{}{}
+		}
+		_, _, err := RunRobustScoped(ctx, p, batch)
+		return err
+	}
+	// 12 of 60, then 12 of the remaining 48, 12 of 36: each batch is well
+	// under half of what is left, and without the window all would pass.
+	if err := deleteBatch(0, 12); err != nil {
+		t.Fatalf("batch 1: %v", err)
+	}
+	if err := deleteBatch(12, 24); err != nil {
+		t.Fatalf("batch 2: %v", err)
+	}
+	// Third batch: 36 of the original 60 would be gone - over half.
+	if err := deleteBatch(24, 36); !errors.Is(err, reconcile.ErrDeleteLimit) {
+		t.Fatalf("batch 3: got %v, want ErrDeleteLimit", err)
+	}
+	if got := countFiles(t, remote); got != 36 {
+		t.Fatalf("remote has %d files, want 36 (two batches applied, the third refused)", got)
+	}
+	if len(refused) != 1 || refused[0].Remote != 12 || refused[0].Tracked != 60 || len(refused[0].SampleRemote) != 12 {
+		t.Fatalf("refusal record: %+v", refused)
+	}
+
+	// Approving that plan lets it through and clears the window, so an
+	// ordinary delete afterwards is not held against the approved one.
+	p.ApproveDeletes = func(fp string) bool { return fp == refused[0].Fingerprint }
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("approved cycle: %v", err)
+	}
+	p.ApproveDeletes = nil
+	if got := countFiles(t, remote); got != 24 {
+		t.Fatalf("remote has %d files after approval, want 24", got)
+	}
+	if err := deleteBatch(36, 40); err != nil {
+		t.Fatalf("ordinary delete after an approved one: %v", err)
+	}
+}
+
+func TestDeleteWindowForgetsOldDeletions(t *testing.T) {
+	w := NewDeleteWindow(10 * time.Minute)
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return now }
+	w.Add(5, 0)
+	now = now.Add(6 * time.Minute)
+	w.Add(0, 7)
+	if l, r := w.Recent(); l != 5 || r != 7 {
+		t.Fatalf("Recent = %d, %d; want 5, 7", l, r)
+	}
+	now = now.Add(5 * time.Minute) // the first is now 11 minutes old
+	if l, r := w.Recent(); l != 0 || r != 7 {
+		t.Fatalf("Recent = %d, %d; want 0, 7", l, r)
+	}
+	w.Reset()
+	if l, r := w.Recent(); l != 0 || r != 0 {
+		t.Fatalf("after Reset: %d, %d", l, r)
+	}
+	var none *DeleteWindow
+	none.Add(1, 1)
+	none.Reset()
+	if l, r := none.Recent(); l != 0 || r != 0 || none.Span() != 0 {
+		t.Fatal("nil window must remember nothing")
 	}
 }

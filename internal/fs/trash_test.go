@@ -1,8 +1,10 @@
 package fs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,7 +47,7 @@ func TestTrashRemoveMovesLocalFile(t *testing.T) {
 	if lexists(filepath.Join(root, "a/b.txt")) {
 		t.Fatal("original still present")
 	}
-	trashed := filepath.Join(trashDir, "2026-11-14", "proj", "a", "b.txt")
+	trashed := filepath.Join(trashDir, "2026-11-14", RootFolder(root), "a", "b.txt")
 	if got, err := os.ReadFile(trashed); err != nil || string(got) != "one" {
 		t.Fatalf("trashed copy: %q, %v", got, err)
 	}
@@ -163,5 +165,184 @@ func TestPruneTrash(t *testing.T) {
 	}
 	if n, err := PruneTrash(filepath.Join(dir, "missing"), 30); n != 0 || err != nil {
 		t.Fatalf("missing dir: %d, %v", n, err)
+	}
+}
+
+// The trash is shared across processes: many concurrent deletes of the
+// same relative path (from roots that even share a base name) must each
+// keep their own copy.
+func TestTrashRemoveConcurrentDeletesKeepEveryCopy(t *testing.T) {
+	setNetworkFS(t, false)
+	fixTrashClock(t, time.Date(2026, 11, 14, 9, 30, 15, 0, time.UTC))
+	trashDir := filepath.Join(t.TempDir(), "trash")
+	const n = 60
+	base := t.TempDir()
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		// Half the deletes share one root; the rest use distinct roots with
+		// the same base name. Each gets its own Trash, as separate processes would.
+		root := filepath.Join(base, "shared", "proj")
+		if i%2 == 1 {
+			root = filepath.Join(base, fmt.Sprint(i), "proj")
+		}
+		writeTrashFixture(t, filepath.Join(root, fmt.Sprintf("src%d", i), "same.txt"), fmt.Sprint(i))
+		// Move it to the one relative path every delete uses.
+		if err := os.MkdirAll(filepath.Join(root, "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex // serializes only the fixture rename, not the Remove
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			root := filepath.Join(base, "shared", "proj")
+			if i%2 == 1 {
+				root = filepath.Join(base, fmt.Sprint(i), "proj")
+			}
+			rel := fmt.Sprintf("src%d/same.txt", i)
+			if i%2 == 1 {
+				rel = "d/same.txt"
+				mu.Lock()
+				err := os.Rename(filepath.Join(root, fmt.Sprintf("src%d", i), "same.txt"), filepath.Join(root, "d", "same.txt"))
+				mu.Unlock()
+				if err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- NewTrash(trashDir).Remove(root, rel)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := make(map[string]bool)
+	_ = filepath.WalkDir(trashDir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			b, _ := os.ReadFile(p)
+			seen[string(b)] = true
+		}
+		return nil
+	})
+	if len(seen) != n {
+		t.Fatalf("trash holds %d distinct files, want %d", len(seen), n)
+	}
+}
+
+// Same root, same path, same instant: the reservation, not luck, must keep
+// the copies apart.
+func TestTrashReserveIsExclusive(t *testing.T) {
+	fixTrashClock(t, time.Date(2026, 11, 14, 9, 30, 15, 0, time.UTC))
+	tr := NewTrash(filepath.Join(t.TempDir(), "trash"))
+	const n = 50
+	got := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := tr.reserve("/some/root", "a/b.txt")
+			if err != nil {
+				t.Error(err)
+			}
+			got <- p
+		}()
+	}
+	wg.Wait()
+	close(got)
+	seen := make(map[string]bool)
+	for p := range got {
+		if seen[p] {
+			t.Fatalf("destination %s handed out twice", p)
+		}
+		seen[p] = true
+	}
+}
+
+func TestTrashIsPrivateAndPerRoot(t *testing.T) {
+	setNetworkFS(t, false)
+	trashDir := filepath.Join(t.TempDir(), "trash")
+	rootA := filepath.Join(t.TempDir(), "dev")
+	rootB := filepath.Join(t.TempDir(), "dev")
+	// A file in one root, a directory of the same name in the other: with a
+	// shared folder the second delete could not create its parent.
+	writeTrashFixture(t, filepath.Join(rootA, "notes"), "a file")
+	writeTrashFixture(t, filepath.Join(rootB, "notes", "inner.txt"), "in a dir")
+	tr := NewTrash(trashDir)
+	if err := tr.Remove(rootA, "notes"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Remove(rootB, "notes/inner.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if RootFolder(rootA) == RootFolder(rootB) {
+		t.Fatal("two roots with the same base name share a trash folder")
+	}
+	_ = filepath.WalkDir(trashDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, _ := d.Info()
+		if perm := info.Mode().Perm(); perm&0o077 != 0 && d.IsDir() {
+			t.Errorf("%s is accessible to others (%o)", p, perm)
+		}
+		return nil
+	})
+}
+
+func TestTrashPreserveKeepsOriginalAndCopies(t *testing.T) {
+	setNetworkFS(t, true) // even on a network filesystem
+	root := filepath.Join(t.TempDir(), "share")
+	trashDir := filepath.Join(t.TempDir(), "trash")
+	writeTrashFixture(t, filepath.Join(root, "a.txt"), "old version")
+	tr := NewTrash(trashDir)
+	if err := tr.Preserve(root, "a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "a.txt")); string(b) != "old version" {
+		t.Fatal("Preserve disturbed the original")
+	}
+	kept := filepath.Join(trashDir, trashNow().Format(trashDayLayout), RootFolder(root), "a.txt")
+	if b, err := os.ReadFile(kept); err != nil || string(b) != "old version" {
+		t.Fatalf("kept copy: %q, %v", b, err)
+	}
+	if err := tr.Preserve(root, "missing.txt"); err != nil {
+		t.Fatalf("missing source: %v", err)
+	}
+	var none *Trash
+	if err := none.Preserve(root, "a.txt"); err != nil {
+		t.Fatalf("nil trash: %v", err)
+	}
+}
+
+// A root may contain a mount of another kind: classify the file's own
+// directory.
+func TestTrashClassifiesTheFilesDirectory(t *testing.T) {
+	root := t.TempDir()
+	prev := isNetworkFS
+	isNetworkFS = func(dir string) bool { return filepath.Base(dir) == "nas" }
+	t.Cleanup(func() { isNetworkFS = prev })
+	trashDir := filepath.Join(t.TempDir(), "trash")
+	writeTrashFixture(t, filepath.Join(root, "local.txt"), "l")
+	writeTrashFixture(t, filepath.Join(root, "nas", "remote.txt"), "r")
+	tr := NewTrash(trashDir)
+	if err := tr.Remove(root, "local.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Remove(root, "nas/remote.txt"); err != nil {
+		t.Fatal(err)
+	}
+	day := filepath.Join(trashDir, trashNow().Format(trashDayLayout), RootFolder(root))
+	if !lexists(filepath.Join(day, "local.txt")) {
+		t.Error("file on the local part of the root was not trashed")
+	}
+	if lexists(filepath.Join(day, "nas", "remote.txt")) {
+		t.Error("file on the nested network mount was trashed")
 	}
 }

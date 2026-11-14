@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,48 +44,127 @@ type RobustParams struct {
 	// either side; a cycle over it returns reconcile.ErrDeleteLimit having
 	// changed nothing. The zero value imposes no limit.
 	MaxDelete reconcile.DeleteLimit
-	// ApproveDeletes, if set, is asked when a cycle exceeds MaxDelete and
-	// may let that one cycle run anyway (`syncd approve-deletes`).
-	ApproveDeletes func() bool
+	// DeleteWindow, if set, makes MaxDelete a rolling limit: deletions the
+	// window's recent cycles already made count toward this one's. nil
+	// judges each cycle alone.
+	DeleteWindow *DeleteWindow
+	// ApproveDeletes, if set, is asked when a cycle exceeds MaxDelete, with
+	// a fingerprint of the deletions it plans, and may let that cycle run
+	// anyway (`syncd approve-deletes`).
+	ApproveDeletes func(fingerprint string) bool
+	// OnDeleteRefused, if set, is told about a cycle refused for exceeding
+	// MaxDelete, so the refusal can be shown to whoever approves it.
+	OnDeleteRefused func(runtime.DeleteRefusal)
 	// Trash receives deleted files that live on a local disk; nil removes
 	// them outright.
 	Trash *fs.Trash
+	// FirstSync decides what a pair's first cycle does with files that
+	// differ between the two sides (see FirstSyncPolicy). The zero value
+	// keeps both.
+	FirstSync FirstSyncPolicy
 }
 
-// checkDeleteLimit enforces p.MaxDelete against the deletes in actions.
-// total (the number of tracked files, the denominator for a percentage
-// limit) is only fetched when there is something to check.
-func (p RobustParams) checkDeleteLimit(actions []reconcile.Action, total func() (int, error)) error {
-	if p.MaxDelete.Unlimited() {
-		return nil
+// refusalSampleSize caps the paths listed in a DeleteRefusal.
+const refusalSampleSize = 20
+
+// deleteFingerprint identifies a set of planned deletions.
+func deleteFingerprint(local, remote []string) string {
+	h := sha256.New()
+	for _, p := range local {
+		fmt.Fprintf(h, "L\x00%s\n", p)
 	}
-	var local, remote int
+	for _, p := range remote {
+		fmt.Fprintf(h, "R\x00%s\n", p)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// checkDeleteLimit enforces p.MaxDelete against the deletes in actions plus
+// those p.DeleteWindow's recent cycles already made. tracked (the number of
+// tracked files, the denominator for a percentage limit) is only fetched
+// when there is something to check. approved reports that the plan was over
+// the limit but let through by p.ApproveDeletes.
+func (p RobustParams) checkDeleteLimit(actions []reconcile.Action, tracked func() (int, error)) (approved bool, err error) {
+	if p.MaxDelete.Unlimited() {
+		return false, nil
+	}
+	var local, remote []string
 	for _, a := range actions {
 		switch a.Type {
+		case reconcile.ActionDeleteLocal:
+			local = append(local, a.Path)
+		case reconcile.ActionDeleteRemote:
+			remote = append(remote, a.Path)
+		}
+	}
+	if len(local) == 0 && len(remote) == 0 {
+		return false, nil
+	}
+	n, err := tracked()
+	if err != nil {
+		return false, err
+	}
+	// The files recent cycles deleted are gone from the manifest too, so
+	// they are added back to the denominator: the limit is judged against
+	// the tree as it stood when the window opened.
+	recentLocal, recentRemote := p.DeleteWindow.Recent()
+	total := n + recentLocal + recentRemote
+	if len(local) > 0 {
+		err = p.MaxDelete.Check("local", len(local)+recentLocal, total)
+	}
+	if err == nil && len(remote) > 0 {
+		err = p.MaxDelete.Check("remote", len(remote)+recentRemote, total)
+	}
+	if err == nil {
+		return false, nil
+	}
+	if recentLocal+recentRemote > 0 {
+		err = fmt.Errorf("%w (counting %d local and %d remote deletion(s) already made in the last %s)", err, recentLocal, recentRemote, p.DeleteWindow.Span())
+	}
+	fingerprint := deleteFingerprint(local, remote)
+	if p.ApproveDeletes != nil && p.ApproveDeletes(fingerprint) {
+		p.Logger.Warn("delete limit exceeded, but this cycle was approved; proceeding", map[string]any{
+			"delete_local": len(local), "delete_remote": len(remote), "tracked": total,
+		})
+		p.DeleteWindow.Reset()
+		return true, nil
+	}
+	if p.OnDeleteRefused != nil {
+		p.OnDeleteRefused(runtime.DeleteRefusal{
+			Time: time.Now().UTC(), Fingerprint: fingerprint,
+			Local: len(local), Remote: len(remote), Tracked: total,
+			SampleLocal: firstN(local, refusalSampleSize), SampleRemote: firstN(remote, refusalSampleSize),
+		})
+	}
+	return false, err
+}
+
+func firstN(s []string, n int) []string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+// recordDeletes adds the deletions results carried out to p.DeleteWindow.
+// An approved cycle is not recorded: it was let through as a whole.
+func (p RobustParams) recordDeletes(results []execute.Result, approved bool) {
+	if p.DeleteWindow == nil || approved {
+		return
+	}
+	var local, remote int
+	for _, res := range results {
+		if res.Error != nil {
+			continue
+		}
+		switch res.Action.Type {
 		case reconcile.ActionDeleteLocal:
 			local++
 		case reconcile.ActionDeleteRemote:
 			remote++
 		}
 	}
-	if local == 0 && remote == 0 {
-		return nil
-	}
-	n, err := total()
-	if err != nil {
-		return err
-	}
-	err = p.MaxDelete.Check("local", local, n)
-	if err == nil {
-		err = p.MaxDelete.Check("remote", remote, n)
-	}
-	if err != nil && p.ApproveDeletes != nil && p.ApproveDeletes() {
-		p.Logger.Warn("delete limit exceeded, but this cycle was approved; proceeding", map[string]any{
-			"delete_local": local, "delete_remote": remote, "tracked": n,
-		})
-		return nil
-	}
-	return err
+	p.DeleteWindow.Add(local, remote)
 }
 
 // robustHardError marks an error from RunRobustOnce that happened before -
@@ -137,6 +218,9 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	localFiles, remoteFiles := scans.Local.Files, scans.Remote.Files
 	skipped := mergeSkipSet(scans.Local, scans.Remote)
 	plan := reconcile.BuildPlan(localFiles, remoteFiles, manifest, skipped)
+	if _, err := p.applyFirstSync(&plan, localFiles, remoteFiles, manifest, func() (bool, error) { return len(manifest) == 0, nil }); err != nil {
+		return reconcile.Plan{}, 0, err
+	}
 
 	execActions := make([]reconcile.Action, 0, len(plan.Actions))
 	for _, action := range plan.Actions {
@@ -149,7 +233,8 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	// same scan-time view the apply step always used), so the confirm can
 	// show directory operations too.
 	dirOps := planDirectories(scans.Local.Dirs, scans.Remote.Dirs, dirBaseline, skipped)
-	if err := p.checkDeleteLimit(execActions, func() (int, error) { return len(manifest), nil }); err != nil {
+	approved, err := p.checkDeleteLimit(execActions, func() (int, error) { return len(manifest), nil })
+	if err != nil {
 		return plan, 0, err
 	}
 	if p.ConfirmPlan != nil && !p.ConfirmPlan(execActions, visibleDirOps(dirOps)) {
@@ -167,6 +252,7 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	// results may be partial, but whatever did complete should still be
 	// committed to the manifest below before we report failure.
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
+	p.recordDeletes(results, approved)
 
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 
@@ -385,10 +471,17 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	logScanIssues(p.Logger, "remote", remoteScan.Issues)
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
+	if _, err := p.applyFirstSync(&plan, localScan.Files, remoteScan.Files, scopedManifest, func() (bool, error) {
+		n, err := p.Repo.Count(ctx)
+		return n == 0, err
+	}); err != nil {
+		return reconcile.Plan{}, 0, err
+	}
 	execActions := nonNoOpActions(plan)
 	// The scoped manifest holds only this batch's rows, so a percentage
 	// limit is measured against the whole manifest's size.
-	if err := p.checkDeleteLimit(execActions, func() (int, error) { return p.Repo.Count(ctx) }); err != nil {
+	approved, err := p.checkDeleteLimit(execActions, func() (int, error) { return p.Repo.Count(ctx) })
+	if err != nil {
 		return plan, 0, err
 	}
 
@@ -406,6 +499,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 
 	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files, Trash: p.Trash}
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
+	p.recordDeletes(results, approved)
 	scopedActionsDone()
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 

@@ -197,6 +197,18 @@ func TestInstallLinuxReportsSystemctlFailure(t *testing.T) {
 	}
 }
 
+// stoppedReply answers like a service manager whose service is not
+// running: launchctl print fails, systemctl is-active says inactive.
+func stoppedReply(c call) (string, error) {
+	if c.name == "launchctl" && c.args[0] == "print" {
+		return "Could not find service", errors.New("exit status 113")
+	}
+	if c.name == "systemctl" && len(c.args) > 1 && c.args[1] == "is-active" {
+		return "inactive", errors.New("exit status 3")
+	}
+	return "", nil
+}
+
 func TestUninstall(t *testing.T) {
 	for _, goos := range []string{"darwin", "linux"} {
 		t.Run(goos, func(t *testing.T) {
@@ -205,7 +217,7 @@ func TestUninstall(t *testing.T) {
 			t.Cleanup(func() { bootstrapRetryDelay = prev })
 
 			home := t.TempDir()
-			rec := &recorder{}
+			rec := &recorder{reply: stoppedReply}
 			m := Manager{GOOS: goos, Home: home, UID: 501, Run: rec.run}
 			res, err := m.Install(testSpec(filepath.Join(home, "state")))
 			if err != nil {
@@ -232,6 +244,42 @@ func TestUninstall(t *testing.T) {
 			installed, err = m.Uninstall("")
 			if err != nil || installed {
 				t.Fatalf("second Uninstall: installed=%v err=%v", installed, err)
+			}
+		})
+	}
+}
+
+// If the service manager could not stop the daemon, uninstall must say so
+// and keep the definition, not report a removal while it keeps syncing.
+func TestUninstallFailsWhenServiceKeepsRunning(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			prev := bootstrapRetryDelay
+			bootstrapRetryDelay = 0
+			t.Cleanup(func() { bootstrapRetryDelay = prev })
+
+			home := t.TempDir()
+			rec := &recorder{reply: func(c call) (string, error) {
+				switch {
+				case c.name == "launchctl" && c.args[0] == "bootout":
+					return "Boot-out failed: 150: Operation not permitted", errors.New("exit status 150")
+				case c.name == "systemctl" && c.args[1] == "disable":
+					return "Failed to stop unit", errors.New("exit status 1")
+				case c.name == "systemctl" && c.args[1] == "is-active":
+					return "active", nil
+				}
+				return "", nil // launchctl print succeeds: still loaded
+			}}
+			m := Manager{GOOS: goos, Home: home, UID: 501, Run: rec.run}
+			res, err := m.Install(testSpec(filepath.Join(home, "state")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.Uninstall(""); err == nil || !strings.Contains(err.Error(), "still running") {
+				t.Fatalf("got %v, want a still-running error", err)
+			}
+			if _, err := os.Stat(res.Path); err != nil {
+				t.Fatal("definition was removed even though the service kept running")
 			}
 		})
 	}

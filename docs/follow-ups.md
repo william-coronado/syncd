@@ -169,3 +169,50 @@ that channel. Found 2026-11-14 while adding the delete guard / trash /
 caused by it. Production code is not involved. Done = the tests inject through
 a seam syncd owns (e.g. an indirected error source on `Watcher`) and
 `go test ./... -race` is green on darwin.
+
+Items #31-#35 are the findings from the automated reviews of PR #6 (Codex
+and Sourcery, 2026-11-14) that were judged valid but not worth fixing in that
+PR. The rest of those reviews' findings were fixed there.
+
+### 31. Cross-device trash fallback follows a symlink swapped in mid-delete
+
+`internal/fs/trash.go` — `Remove`/`Preserve` `Lstat` the source, but when the
+rename into the trash fails (tree and state directory on different
+filesystems) they hand the path to `AtomicCopyFile`, which follows symlinks.
+Another local user with write access to the synced tree could swap the file
+for a symlink in that window and get an outside file copied into the trash.
+Needs a hostile local writer and a cross-device layout. Done = the fallback
+copies from a descriptor opened with `O_NOFOLLOW` and checks it is the same
+regular file that was `Lstat`ed.
+
+### 32. A sync root that contains the state directory syncs syncd's own files
+
+`internal/app/watch_run.go`, `internal/cli/sync_cmd.go` — if a root contains
+`~/.local/state/syncd` (e.g. syncing the whole home directory), the trash -
+like the manifest and logs already did before the trash existed - is scanned
+and copied to the other side. Done = `RunWatch`/`SyncOnce` refuse to start
+when the state directory lies inside either root (or the scanner ignores it).
+
+### 33. A failed reinstall on macOS leaves the previous service stopped
+
+`internal/service/service.go` — `Install` overwrites the plist and boots the
+old instance out before bootstrapping the new one; if that bootstrap fails
+for good, nothing is running and the old definition is gone. Done = keep the
+previous plist, and restore and reload it when the new one fails to load.
+
+### 34. `ConsumeDeleteApproval` can lose a token replaced while it is being read
+
+`internal/runtime/approval.go` — stat, read and remove are separate steps, so
+an approval rewritten in the microseconds between them could be removed
+unread. It needs two approvals racing a daemon cycle; the cost is running
+`approve-deletes` again. Done = claim the token by renaming it to a unique
+name before reading it.
+
+### 35. `--wait-for-remote` waits forever on a permanent error
+
+`internal/app/watch_run.go` — by design: on a network mount a permission or
+I/O error is often temporary, so every canary failure is waited out, with the
+reason written to stderr each time it changes. A truly permanent error
+(wrong credentials) therefore leaves the service "running" but idle. Revisit
+if that turns out to be confusing in practice - e.g. surface the wait reason
+in `syncd service status`.

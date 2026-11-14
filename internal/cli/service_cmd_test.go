@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -56,7 +57,7 @@ func TestServiceWatchArgs(t *testing.T) {
 }
 
 func TestWatchConfigRejectsBadSafetyFlags(t *testing.T) {
-	base := watchFlags{local: "/a", remote: "/b", workers: 1, remotePoll: 1, deepScan: 1, maxDelete: "50%", trashDays: 30}
+	base := watchFlags{local: "/a", remote: "/b", workers: 1, remotePoll: 1, deepScan: 1, maxDelete: "50%", trashDays: 30, firstSync: "newer"}
 	if _, err := base.watchConfig(); err != nil {
 		t.Fatalf("valid flags: %v", err)
 	}
@@ -64,6 +65,11 @@ func TestWatchConfigRejectsBadSafetyFlags(t *testing.T) {
 	bad.maxDelete = "many"
 	if _, err := bad.watchConfig(); err == nil || !strings.Contains(err.Error(), "--max-delete") {
 		t.Errorf("bad --max-delete: %v", err)
+	}
+	bad = base
+	bad.firstSync = "whatever"
+	if _, err := bad.watchConfig(); err == nil || !strings.Contains(err.Error(), "--first-sync") {
+		t.Errorf("bad --first-sync: %v", err)
 	}
 	bad = base
 	bad.trashDays = -1
@@ -75,7 +81,17 @@ func TestWatchConfigRejectsBadSafetyFlags(t *testing.T) {
 func TestCheckServiceRoots(t *testing.T) {
 	local, remote := t.TempDir(), t.TempDir()
 
-	// Mounted but never initialized: refuse, and say how to fix it.
+	// An existing but empty mountpoint is an unmounted share, not an
+	// uninitialized one: install, and let the daemon wait.
+	if notes, err := checkServiceRoots(app.WatchConfig{LocalRoot: local, RemoteRoot: remote}); err != nil || len(notes) != 1 {
+		t.Fatalf("empty mountpoint: notes=%v err=%v", notes, err)
+	}
+
+	// Mounted (it has content) but never initialized: refuse, and say how
+	// to fix it.
+	if err := os.WriteFile(filepath.Join(remote, "existing.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	_, err := checkServiceRoots(app.WatchConfig{LocalRoot: local, RemoteRoot: remote})
 	if err == nil || !strings.Contains(err.Error(), "syncd init") {
 		t.Fatalf("uninitialized remote: %v", err)

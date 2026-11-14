@@ -147,6 +147,29 @@ Other flags: `--silent` (structured JSON logs only, no stdout), `--workers`,
   lets the daemon be started at login, before the share is mounted;
   `syncd service install` always sets it.
 - `--max-delete`, `--no-trash`, `--trash-days` — see "Delete safety" below.
+- `--first-sync` — see "First sync" below.
+
+#### First sync
+
+The first time `watch` runs for a pair it has no history, so for a file that
+exists on both sides with different content it cannot tell which side
+changed. `--first-sync` decides what happens to those files, on that first
+cycle only:
+
+- `newer` (default) — the version with the later modification time takes
+  the file's name on both sides; the other version is saved to the trash
+  (see "Delete safety"), so nothing is lost and no extra files appear in
+  either tree. Files whose times are equal fall back to `keep-both`, as does
+  everything when `--no-trash` is set.
+- `local` / `remote` — that side's version wins for every such file; the
+  other version goes to the trash (or is overwritten with `--no-trash`).
+- `keep-both` — the remote version takes the name and the local version is
+  kept next to it as `name_conflict_<timestamp>.ext`, on both sides.
+
+Files that exist on only one side are simply copied across, and identical
+files are left alone, whatever the setting. Once the pair has history, a
+file changed on both sides is always handled as a conflict (see "Conflict
+strategy").
 
 ### `syncd service` — run `watch` in the background
 
@@ -254,16 +277,18 @@ built-in defaults apply until the first run pulls the file down.
 Two independent protections apply to deletions syncd makes on your behalf.
 
 **Trash.** A file syncd deletes from a **local disk** is moved to
-`~/.local/state/syncd/trash/<YYYY-MM-DD>/<root folder name>/<relative path>`
+`~/.local/state/syncd/trash/<YYYY-MM-DD>/<root folder name>-<id>/<relative path>`
 instead of being removed, so a delete propagated from the other side (or by
-a `mirror`) can be undone by copying the file back. Trash older than
-`--trash-days` (default 30; 0 keeps it forever) is pruned at startup, and
-daily by `watch`. A file deleted from a **network** filesystem (SMB/NFS) is
-removed outright — trashing it would mean downloading everything that gets
-deleted — so the recovery path there is the server's own recycle bin (e.g.
-Synology's `#recycle`). If a file can't be moved to the trash, the delete
-fails and is retried next run rather than made unrecoverable. `--no-trash`
-turns this off.
+a `mirror`) can be undone by copying the file back. (`<id>` is a short hash
+of the root's full path, so two roots with the same folder name stay
+apart.) Trash older than `--trash-days` (default 30; 0 keeps it forever) is
+pruned at startup, and daily by `watch`. A file deleted from a **network**
+filesystem (SMB/NFS) is removed outright — trashing it would mean
+downloading everything that gets deleted — so the recovery path there is
+the server's own recycle bin (e.g. Synology's `#recycle`). If a file can't
+be moved to the trash, the delete fails and is retried next run rather than
+made unrecoverable. The trash is readable only by you. `--no-trash` turns
+it off.
 
 **`--max-delete`.** An unattended run that plans to delete more files from
 one side than the limit allows stops before changing anything. The value is
@@ -276,17 +301,22 @@ the wrong share behind the mount point, looks like.
   review the deletions, or raise the limit. Without `--yes` the limit does
   not apply: the confirmation prompt, which lists deletions first, is the
   gate.
-- `syncd watch` skips the cycle, logs an error, and keeps skipping it (the
-  rest of that cycle's changes wait too). If the deletions are intended,
-  approve them once:
+- `syncd watch` applies the limit as a **rolling total over the last 10
+  minutes**, not per cycle, so a large delete that reaches it in several
+  small batches is still caught. A cycle that would go over is skipped and
+  logged, and keeps being skipped (the rest of that cycle's changes wait
+  too). If the deletions are intended, approve them:
 
   ```bash
   syncd approve-deletes --local ~/dev --remote /Volumes/dev
   ```
 
-  The daemon's next over-limit cycle then runs. The approval is single-use
-  and expires after an hour. Pass the daemon's `--state-dir`/`--lock-path`
-  too if it was given them.
+  It lists the deletions the daemon refused and approves exactly those. The
+  daemon then carries them out on its next cycle. If the trees change in
+  the meantime so that it plans something different, the approval is not
+  used and you approve again. An approval is single-use and expires after
+  an hour. Pass the daemon's `--state-dir`/`--lock-path` too if it was
+  given them.
 
 ## Conflict strategy
 

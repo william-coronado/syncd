@@ -117,14 +117,38 @@ remote view via `db.RemoteStatView`.
   enforced for unattended runs only — `watch` cycles and `sync --yes` — and
   always *before* anything is executed or the manifest is touched, so a
   refused cycle is re-planned identically next time. Interactive `sync` is
-  gated by its confirm prompt instead. The scoped cycle measures a percentage
-  against `ManifestRepo.Count`, not its batch-sized manifest. A zero
-  `DeleteLimit` means unlimited (what tests and library callers get).
+  gated by its confirm prompt instead. A zero `DeleteLimit` means unlimited
+  (what tests and library callers get). In `watch` the limit is a **rolling
+  total** (`app.DeleteWindow`, 10 min, one instance for the daemon's life):
+  each cycle is judged as planned + recently executed deletes against
+  tracked + recently deleted files. Do not make it per-cycle again — a wipe
+  split across fsnotify batches then passes piece by piece. The scoped cycle
+  takes its denominator from `ManifestRepo.Count`, not its batch-sized
+  manifest.
+- **Delete approval is bound to the refused plan**: a refusal is recorded
+  (`runtime.DeleteRefusal`, `<pair>.refused-deletes`) with a fingerprint of
+  its deletions; `approve-deletes` writes that fingerprint as the token, and
+  `ConsumeDeleteApproval` honors it only for a cycle with the same
+  fingerprint, only if unexpired, and only if the token file could be
+  removed. A non-matching token is left for the cycle it belongs to.
 - **Trash** (`fs.Trash`): every sync-driven file delete goes through
-  `Trash.Remove`. Files on a local disk move to `<state-dir>/trash/<day>/`;
-  files on a network filesystem (`isNetworkFilesystem`, per-OS statfs) are
-  removed outright. A nil `*Trash` is valid and removes. It must never fall
-  back to deleting when the move to trash fails.
+  `Trash.Remove`. Files on a local disk move to
+  `<state-dir>/trash/<day>/<root name>-<hash>/`; files on a network
+  filesystem (`isNetworkFilesystem`, per-OS statfs, judged by the file's own
+  directory) are removed outright. A nil `*Trash` is valid and removes. It
+  must never fall back to deleting when the move to trash fails. The trash
+  is shared by every syncd process, so destinations are claimed with
+  `O_EXCL` (`Trash.reserve`) before a file is moved onto them — never
+  check-then-rename — and directories are created `0700`.
+- **First sync** (`app.FirstSyncPolicy`, `watch --first-sync`, default
+  `newer`): applies only while the manifest is empty, and only to files
+  present on both sides with different content. It rewrites those
+  baseline-less conflicts into an upload/download with `PreserveDest`, which
+  makes the executor copy the version about to be overwritten into the trash
+  first (`Trash.Preserve`, network side included). `newer` without a trash,
+  or with equal mtimes, must fall back to keep-both rather than overwrite a
+  version it cannot keep. `sync --hash` leaves it at the zero value
+  (keep-both).
 - `watch --wait-for-remote` waits *before* roots are resolved or the lock is
   taken; `syncd service install` always passes it. The generated service
   definitions carry no mount dependency on purpose.

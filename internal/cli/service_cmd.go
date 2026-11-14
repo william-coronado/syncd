@@ -161,19 +161,26 @@ func runServiceInstall(cmd *cobra.Command, _ []string) error {
 // checkServiceRoots catches, at install time, the setup mistakes that would
 // otherwise only show up in a background service's log: a local root that
 // isn't there, or a mounted share that was never initialized. A share that
-// is simply not mounted right now is fine - the daemon waits for it.
+// is simply not mounted right now is fine - the daemon waits for it - and
+// that includes a mountpoint whose directory exists but is empty, which is
+// what an unmounted share usually leaves behind on Linux.
 func checkServiceRoots(cfg app.WatchConfig) (notes []string, err error) {
 	info, err := os.Stat(cfg.LocalRoot)
 	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("--local %s is not an existing directory (run 'syncd init' first)", cfg.LocalRoot)
 	}
+	waiting := []string{fmt.Sprintf("%s is not available right now; the service will wait for it", cfg.RemoteRoot)}
 	if _, err := os.Stat(cfg.RemoteRoot); err != nil {
-		return []string{fmt.Sprintf("%s is not available right now; the service will wait for it", cfg.RemoteRoot)}, nil
+		return waiting, nil
 	}
-	if err := runtime.CheckRemoteCanary(cfg.RemoteRoot); err != nil {
-		return nil, fmt.Errorf("%w; run 'syncd init --local %s --remote %s' first", err, cfg.LocalRoot, cfg.RemoteRoot)
+	canaryErr := runtime.CheckRemoteCanary(cfg.RemoteRoot)
+	if canaryErr == nil {
+		return nil, nil
 	}
-	return nil, nil
+	if entries, err := os.ReadDir(cfg.RemoteRoot); err == nil && len(entries) == 0 {
+		return waiting, nil
+	}
+	return nil, fmt.Errorf("%w; run 'syncd init --local %s --remote %s' first", canaryErr, cfg.LocalRoot, cfg.RemoteRoot)
 }
 
 // serviceWatchArgs builds the `syncd watch` command line the service runs:

@@ -5,6 +5,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,9 +34,21 @@ type Spec struct {
 // Runner runs an external command and returns its combined output.
 type Runner func(name string, args ...string) (string, error)
 
-// ExecRunner is the Runner that really runs commands.
+// commandTimeout bounds every service-manager command: a launchctl or
+// systemctl that hangs must not hang syncd with it.
+const commandTimeout = 30 * time.Second
+
+// ExecRunner is the Runner that really runs commands. Every caller in this
+// package passes a literal program name (launchctl, systemctl, loginctl);
+// the only user-supplied text in the arguments is a service name already
+// restricted by validateName.
 func ExecRunner(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return strings.TrimSpace(string(out)), fmt.Errorf("%s did not finish within %s", name, commandTimeout)
+	}
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -178,7 +191,10 @@ func (m Manager) bootstrap(domain, plist string) error {
 }
 
 // Uninstall stops the service and removes its definition. It reports
-// whether there was a definition to remove.
+// whether there was a definition to remove. If the service is still running
+// after being told to stop, the definition is kept and an error returned:
+// reporting "removed" while the daemon keeps syncing would be worse than
+// failing.
 func (m Manager) Uninstall(name string) (bool, error) {
 	if err := validateName(name); err != nil {
 		return false, err
@@ -191,11 +207,16 @@ func (m Manager) Uninstall(name string) (bool, error) {
 	installed := statErr == nil
 
 	// Stop it even if the definition is already gone: a loaded service
-	// outlives its file. Failure here just means it was not loaded.
+	// outlives its file. The stop command failing is normal when the
+	// service was not loaded, so what is checked is the outcome.
+	var stopOut string
 	if m.GOOS == "darwin" {
-		_, _ = m.Run("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", m.UID, Label(name)))
+		stopOut, _ = m.Run("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", m.UID, Label(name)))
 	} else {
-		_, _ = m.Run("systemctl", "--user", "disable", "--now", UnitName(name))
+		stopOut, _ = m.Run("systemctl", "--user", "disable", "--now", UnitName(name))
+	}
+	if m.stillRunning(name) {
+		return installed, fmt.Errorf("the service is still running after being told to stop; its definition was left in place: %s", stopOut)
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return installed, fmt.Errorf("remove service definition: %w", err)
@@ -204,6 +225,27 @@ func (m Manager) Uninstall(name string) (bool, error) {
 		_, _ = m.Run("systemctl", "--user", "daemon-reload")
 	}
 	return installed, nil
+}
+
+// stillRunning reports whether the service is loaded (macOS) or active
+// (Linux), allowing a moment for a stop that is still in progress.
+func (m Manager) stillRunning(name string) bool {
+	for attempt := 0; attempt < 10; attempt++ {
+		var running bool
+		if m.GOOS == "darwin" {
+			_, err := m.Run("launchctl", "print", fmt.Sprintf("gui/%d/%s", m.UID, Label(name)))
+			running = err == nil
+		} else {
+			out, _ := m.Run("systemctl", "--user", "is-active", UnitName(name))
+			state := strings.TrimSpace(out)
+			running = state == "active" || state == "activating" || state == "deactivating"
+		}
+		if !running {
+			return false
+		}
+		time.Sleep(bootstrapRetryDelay)
+	}
+	return true
 }
 
 // Status describes the service name in a few lines.

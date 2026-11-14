@@ -23,6 +23,9 @@ type RuntimePaths struct {
 	// ApprovePath is the one-shot token `syncd approve-deletes` writes to
 	// let this root pair's next over-limit cycle run (see DeleteApproval).
 	ApprovePath string
+	// RefusalPath is where the watch daemon records the cycle it most
+	// recently refused for exceeding its delete limit (see DeleteRefusal).
+	RefusalPath string
 }
 
 func ResolvePaths(cfg Config) (RuntimePaths, error) {
@@ -60,6 +63,7 @@ func ResolvePaths(cfg Config) (RuntimePaths, error) {
 		TrashDir: filepath.Join(stateDir, trashDirName),
 		// Named after the lock, so it is per root pair exactly as the lock is.
 		ApprovePath: strings.TrimSuffix(lockPath, ".lock") + ".approve-deletes",
+		RefusalPath: strings.TrimSuffix(lockPath, ".lock") + ".refused-deletes",
 	}, nil
 }
 

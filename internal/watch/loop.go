@@ -130,7 +130,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			if errors.Is(err, reconcile.ErrDeleteLimit) {
 				// Not a failure to retry blindly: every cycle will be
 				// refused the same way until someone looks, so say how.
-				p.Logger.Error("watch: cycle skipped, it would delete more than --max-delete allows; check both trees, then run 'syncd approve-deletes' with this --local/--remote to let it through once", map[string]any{
+				p.Logger.Error("watch: cycle skipped, it would delete more than --max-delete allows; check both trees, then run 'syncd approve-deletes' with this --local/--remote to see the refused deletions and let exactly those through once", map[string]any{
 					"error": err.Error(), "local": p.LocalRoot, "remote": p.RemoteRoot,
 				})
 				return
