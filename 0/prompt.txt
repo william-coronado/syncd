@@ -1,0 +1,25 @@
+recommend me what enhancements or improvements can be done to this tool. I normally use it with macOS and Ubuntu (william@192.168.50.44), and the remote folder normally is /Volumes/dev
+
+---
+
+go ahead with 1 and 2
+
+---
+
+Do Ubuntu as suggested
+
+---
+
+how would be the syntax if my Mac local folder is /Users/william/dev/?
+
+---
+
+what is the syntax for ubuntu if the locval folder there is /home/william/remote/dev?
+
+---
+
+commit, push and create PR
+
+---
+
+change it to Fable 5.2 and amend the commit
