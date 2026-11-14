@@ -64,7 +64,9 @@ func TestOpen_DegradesWhenWALUnavailable(t *testing.T) {
 			size INTEGER NOT NULL,
 			mtime INTEGER NOT NULL,
 			hash TEXT NOT NULL,
-			last_synced INTEGER NOT NULL
+			last_synced INTEGER NOT NULL,
+			remote_size INTEGER,
+			remote_mtime INTEGER
 		);
 	`); err != nil {
 		t.Fatalf("seed create file_manifest: %v", err)

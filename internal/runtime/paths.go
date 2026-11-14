@@ -6,13 +6,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// trashDirName must match fs.TrashDirName (runtime is a leaf package and
+// cannot import fs).
+const trashDirName = "trash"
 
 type RuntimePaths struct {
 	StateDir string
 	DBPath   string
 	LogPath  string
 	LockPath string
+	// TrashDir is where deleted local files are moved (see fs.Trash).
+	TrashDir string
+	// ApprovePath is the one-shot token `syncd approve-deletes` writes to
+	// let this root pair's next over-limit cycle run (see DeleteApproval).
+	ApprovePath string
+	// RefusalPath is where the watch daemon records the cycle it most
+	// recently refused for exceeding its delete limit (see DeleteRefusal).
+	RefusalPath string
 }
 
 func ResolvePaths(cfg Config) (RuntimePaths, error) {
@@ -47,6 +60,10 @@ func ResolvePaths(cfg Config) (RuntimePaths, error) {
 		DBPath:   dbPath,
 		LogPath:  logPath,
 		LockPath: lockPath,
+		TrashDir: filepath.Join(stateDir, trashDirName),
+		// Named after the lock, so it is per root pair exactly as the lock is.
+		ApprovePath: strings.TrimSuffix(lockPath, ".lock") + ".approve-deletes",
+		RefusalPath: strings.TrimSuffix(lockPath, ".lock") + ".refused-deletes",
 	}, nil
 }
 

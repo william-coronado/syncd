@@ -90,6 +90,15 @@ func (r *ManifestRepo) LoadAll(ctx context.Context) (map[string]ManifestRow, err
 // through unchanged by fs.NormalizeRelativePath) matches its row byte for
 // byte - packing the paths into a JSON array would rewrite such bytes to
 // U+FFFD and silently miss the row. Each lookup is a primary-key probe.
+// Count returns the number of tracked files (manifest rows).
+func (r *ManifestRepo) Count(ctx context.Context) (int, error) {
+	var n int
+	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_manifest`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count manifest rows: %w", err)
+	}
+	return n, nil
+}
+
 func (r *ManifestRepo) LoadPaths(ctx context.Context, paths map[string]struct{}) (map[string]ManifestRow, error) {
 	out := make(map[string]ManifestRow, len(paths))
 	if len(paths) == 0 {

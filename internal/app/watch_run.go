@@ -9,6 +9,7 @@ import (
 
 	"syncd/internal/db"
 	"syncd/internal/fs"
+	"syncd/internal/reconcile"
 	"syncd/internal/runtime"
 )
 
@@ -27,6 +28,22 @@ type WatchConfig struct {
 	LockPath   string
 
 	RemotePoll, DeepScan, Debounce time.Duration
+
+	// WaitForRemote makes RunWatch wait for the remote root and its canary
+	// to appear instead of failing when they are missing at startup - what a
+	// service started at login/boot, before the share is mounted, needs.
+	WaitForRemote bool
+	// MaxDelete caps the deletes one cycle may make (see
+	// RobustParams.MaxDelete); the zero value imposes no limit.
+	MaxDelete reconcile.DeleteLimit
+	// NoTrash removes deleted local files outright instead of moving them
+	// to the state directory's trash. TrashDays is how long trashed files
+	// are kept (<= 0: forever).
+	NoTrash   bool
+	TrashDays int
+	// FirstSync is the policy for files that differ on the pair's first
+	// cycle (see FirstSyncPolicy).
+	FirstSync FirstSyncPolicy
 }
 
 // WatchLoopFunc runs the actual event/poll/deep-scan loop (watch.Run) once
@@ -53,6 +70,11 @@ type WatchLoopFunc func(ctx context.Context, p RobustParams, matcher *fs.IgnoreM
 // matcher, and then hands off to runLoop (watch.Run in production), which
 // blocks until ctx is cancelled.
 func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error {
+	if cfg.WaitForRemote {
+		if !waitForRemote(ctx, cfg.RemoteRoot) {
+			return nil // cancelled while waiting: a clean shutdown
+		}
+	}
 	resolvedLocal, err := resolveWatchRoot("local", cfg.LocalRoot)
 	if err != nil {
 		return err
@@ -114,6 +136,12 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 		return err
 	}
 
+	var trash *fs.Trash
+	if !cfg.NoTrash {
+		trash = fs.NewTrash(paths.TrashDir)
+		go pruneTrashPeriodically(ctx, paths.TrashDir, cfg.TrashDays, logger)
+	}
+
 	p := RobustParams{
 		LocalRoot:  cfg.LocalRoot,
 		RemoteRoot: cfg.RemoteRoot,
@@ -121,9 +149,105 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 		Repo:       repo,
 		DB:         sqlDB,
 		Logger:     logger,
+		MaxDelete:  cfg.MaxDelete,
+		Trash:      trash,
+		FirstSync:  cfg.FirstSync,
+		// One window for the daemon's whole life: the limit is a rolling
+		// total across cycles, not a per-cycle allowance.
+		DeleteWindow: NewDeleteWindow(DefaultDeleteWindow),
+		ApproveDeletes: func(fingerprint string) bool {
+			return runtime.ConsumeDeleteApproval(paths.ApprovePath, fingerprint)
+		},
+		OnDeleteRefused: func(r runtime.DeleteRefusal) {
+			if err := runtime.WriteDeleteRefusal(paths.RefusalPath, r); err != nil {
+				logger.Warn("could not record the refused deletions; 'syncd approve-deletes' will not find them", map[string]any{"error": err.Error()})
+			}
+		},
 	}
 
 	return runLoop(ctx, p, matcher, cfg)
+}
+
+// remoteWaitInterval is how often waitForRemote re-checks; a variable so
+// tests don't have to wait out the real interval.
+var remoteWaitInterval = 10 * time.Second
+
+// waitForRemote blocks until remoteRoot's canary is readable, reporting
+// false if ctx is cancelled first. It runs before the logger exists (the
+// log is named after the resolved roots, and an unmounted root can't be
+// resolved), so it reports to stderr - once per distinct reason, not once
+// per attempt.
+func waitForRemote(ctx context.Context, remoteRoot string) bool {
+	var lastReason string
+	for {
+		err := runtime.CheckRemoteCanary(remoteRoot)
+		if err == nil {
+			if lastReason != "" {
+				fmt.Fprintf(os.Stderr, "syncd watch: remote %s is available\n", remoteRoot)
+			}
+			return true
+		}
+		if reason := err.Error(); reason != lastReason {
+			fmt.Fprintf(os.Stderr, "syncd watch: waiting for remote %s (%s); if the share is mounted and has never been set up, run 'syncd init'\n", remoteRoot, reason)
+			lastReason = reason
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(remoteWaitInterval):
+		}
+	}
+}
+
+// pruneTrashPeriodically expires old trash at startup and daily after that,
+// until ctx is cancelled.
+func pruneTrashPeriodically(ctx context.Context, dir string, keepDays int, logger *runtime.Logger) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		if n, err := fs.PruneTrash(dir, keepDays); err != nil {
+			logger.Warn("could not prune trash", map[string]any{"dir": dir, "error": err.Error()})
+		} else if n > 0 {
+			logger.Printf("pruned %d day(s) of trash older than %d days from %s", n, keepDays, dir)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// ApproveDeletes approves, once, the cycle the watch daemon for cfg's root
+// pair most recently refused for exceeding --max-delete (see
+// RobustParams.ApproveDeletes), and returns that refusal so the caller can
+// show what was approved. It resolves the roots and state paths exactly as
+// RunWatch does, so it reads the record and writes the token where that
+// daemon does. The approval is bound to the refused plan: if the trees
+// change so that the daemon plans different deletions, it is not honored.
+func ApproveDeletes(cfg WatchConfig) (runtime.DeleteRefusal, error) {
+	resolvedLocal, err := resolveWatchRoot("local", cfg.LocalRoot)
+	if err != nil {
+		return runtime.DeleteRefusal{}, err
+	}
+	resolvedRemote, err := resolveWatchRoot("remote", cfg.RemoteRoot)
+	if err != nil {
+		return runtime.DeleteRefusal{}, err
+	}
+	paths, err := runtime.ResolvePaths(runtime.Config{
+		LocalRoot:  resolvedLocal,
+		RemoteRoot: resolvedRemote,
+		StateDir:   cfg.StateDir,
+		LockPath:   cfg.LockPath,
+	})
+	if err != nil {
+		return runtime.DeleteRefusal{}, err
+	}
+	refusal, err := runtime.ReadDeleteRefusal(paths.RefusalPath)
+	if err != nil {
+		return runtime.DeleteRefusal{}, err
+	}
+	return refusal, runtime.WriteDeleteApproval(paths.ApprovePath, refusal.Fingerprint)
 }
 
 // resolveWatchRoot resolves root's symlinks (filepath.Abs, used to resolve

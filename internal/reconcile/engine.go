@@ -22,6 +22,11 @@ type Action struct {
 	Type   ActionType `json:"type"`
 	Path   string     `json:"path"`
 	Reason string     `json:"reason"`
+	// PreserveDest asks the executor to save the destination's current
+	// version to the trash before an Upload/Download overwrites it. The
+	// engine never sets it (it only overwrites a version it knows is
+	// unchanged since the last sync); the first-sync policy does.
+	PreserveDest bool `json:"preserve_dest,omitempty"`
 }
 
 type Plan struct {

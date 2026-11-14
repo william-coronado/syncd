@@ -65,6 +65,8 @@ Flags:
   `syncd watch`) instead of the fast size+mtime reconciler for this run
 - `--yes` — skip the interactive confirmation prompt (needed for unattended/
   scripted runs)
+- `--dry-run` — print the summary and exit without changing anything
+- `--max-delete`, `--no-trash`, `--trash-days` — see "Delete safety" below
 
 #### Batch config file (`~/.syncd.yaml`)
 
@@ -140,6 +142,68 @@ Other flags: `--silent` (structured JSON logs only, no stdout), `--workers`,
 `--state-dir`/`--db-path`/`--log-path`/`--lock-path` overrides (see
 "State directory" below).
 
+- `--wait-for-remote` — if the remote root or its canary is missing at
+  startup, wait for it (checking every 10s) instead of exiting. This is what
+  lets the daemon be started at login, before the share is mounted;
+  `syncd service install` always sets it.
+- `--max-delete`, `--no-trash`, `--trash-days` — see "Delete safety" below.
+- `--first-sync` — see "First sync" below.
+
+#### First sync
+
+The first time `watch` runs for a pair it has no history, so for a file that
+exists on both sides with different content it cannot tell which side
+changed. `--first-sync` decides what happens to those files, on that first
+cycle only:
+
+- `newer` (default) — the version with the later modification time takes
+  the file's name on both sides; the other version is saved to the trash
+  (see "Delete safety"), so nothing is lost and no extra files appear in
+  either tree. Files whose times are equal fall back to `keep-both`, as does
+  everything when `--no-trash` is set.
+- `local` / `remote` — that side's version wins for every such file; the
+  other version goes to the trash (or is overwritten with `--no-trash`).
+- `keep-both` — the remote version takes the name and the local version is
+  kept next to it as `name_conflict_<timestamp>.ext`, on both sides.
+
+Files that exist on only one side are simply copied across, and identical
+files are left alone, whatever the setting. Once the pair has history, a
+file changed on both sides is always handled as a conflict (see "Conflict
+strategy").
+
+### `syncd service` — run `watch` in the background
+
+```bash
+syncd init --local ~/dev --remote /Volumes/dev        # once per pair
+syncd service install --local ~/dev --remote /Volumes/dev
+syncd service status
+syncd service uninstall
+```
+
+`service install` runs `syncd watch` as a per-user background service that
+starts at login and is restarted if it exits — a launchd agent on macOS
+(`~/Library/LaunchAgents/com.syncd.watch.plist`), a systemd user unit on
+Linux (`~/.config/systemd/user/syncd-watch.service`). No root is needed.
+
+- It accepts every `syncd watch` flag and passes the ones you give through
+  to the daemon; `--silent` and `--wait-for-remote` are always on.
+- Running it again replaces the settings and restarts the service.
+- `--name NAME` (on all three subcommands) runs an additional, separately
+  named service — one per local/remote pair.
+- `--bin PATH` selects the executable the service runs (default: the `syncd`
+  that ran `service install`, so install from wherever the binary lives
+  permanently).
+- It refuses to install against a mounted share that has no `.synclock`
+  (run `syncd init`); a share that simply isn't mounted right now is fine.
+
+On macOS the service's stdout/stderr go to
+`~/.local/state/syncd/service.{out,err}.log`; on Linux they go to the user
+journal (`journalctl --user -u syncd-watch -f`). On Linux the service only
+runs while you are logged in unless lingering is enabled
+(`sudo loginctl enable-linger $USER`); `service install` says so when it
+isn't. The first time the macOS service touches a network volume, macOS may
+ask whether to allow it.
+
 ### Choosing a mode
 
 Run `syncd watch` as your primary, continuous sync (via systemd/launchd —
@@ -208,6 +272,52 @@ syncs like anything else, so once it's synced once, both machines share the
 same rules. On a brand-new local root with nothing synced yet, only the
 built-in defaults apply until the first run pulls the file down.
 
+## Delete safety
+
+Two independent protections apply to deletions syncd makes on your behalf.
+
+**Trash.** A file syncd deletes from a **local disk** is moved to
+`~/.local/state/syncd/trash/<YYYY-MM-DD>/<root folder name>-<id>/<relative path>`
+instead of being removed, so a delete propagated from the other side (or by
+a `mirror`) can be undone by copying the file back. (`<id>` is a short hash
+of the root's full path, so two roots with the same folder name stay
+apart.) Trash older than `--trash-days` (default 30; 0 keeps it forever) is
+pruned at startup, and daily by `watch`. A file deleted from a **network**
+filesystem (SMB/NFS) is removed outright — trashing it would mean
+downloading everything that gets deleted — so the recovery path there is
+the server's own recycle bin (e.g. Synology's `#recycle`). If a file can't
+be moved to the trash, the delete fails and is retried next run rather than
+made unrecoverable. The trash is readable only by you. `--no-trash` turns
+it off.
+
+**`--max-delete`.** An unattended run that plans to delete more files from
+one side than the limit allows stops before changing anything. The value is
+a count (`100`; `0` forbids deleting), a percentage of the files on that
+side (`50%`, the default — a percentage never trips on 10 or fewer
+deletions), or `off`. A sudden mass delete is what a wiped local tree, or
+the wrong share behind the mount point, looks like.
+
+- `syncd sync --yes` fails the job with an error. Rerun without `--yes` to
+  review the deletions, or raise the limit. Without `--yes` the limit does
+  not apply: the confirmation prompt, which lists deletions first, is the
+  gate.
+- `syncd watch` applies the limit as a **rolling total over the last 10
+  minutes**, not per cycle, so a large delete that reaches it in several
+  small batches is still caught. A cycle that would go over is skipped and
+  logged, and keeps being skipped (the rest of that cycle's changes wait
+  too). If the deletions are intended, approve them:
+
+  ```bash
+  syncd approve-deletes --local ~/dev --remote /Volumes/dev
+  ```
+
+  It lists the deletions the daemon refused and approves exactly those. The
+  daemon then carries them out on its next cycle. If the trees change in
+  the meantime so that it plans something different, the approval is not
+  used and you approve again. An approval is single-use and expires after
+  an hour. Pass the daemon's `--state-dir`/`--lock-path` too if it was
+  given them.
+
 ## Conflict strategy
 
 When both sides changed since the last manifest record and their content
@@ -267,6 +377,9 @@ written under:
   its `job_state` table is already namespaced per job.
 - `sync.lock`
 - `sync.log`
+- `trash/` — files deleted from local disks (see "Delete safety")
+- `service.out.log`, `service.err.log` — the macOS background service's
+  stdout/stderr
 
 `sync.log` is capped at 20MB; once it hits that size, the existing log is
 rotated to `sync.log.old` (overwriting any previous one) before the next
@@ -304,22 +417,17 @@ GOOS=linux  GOARCH=amd64 go build -o dist/syncd-linux-amd64  ./cmd/syncd
 
 ## Deployment
 
-Boilerplate service definitions are included in:
+Use `syncd service install` (see above) — it writes and loads the right
+service definition for the machine it runs on.
 
-- `deploy/systemd/syncd.service` — the primary always-on mode: a long-lived
-  `syncd watch` daemon (`Type=simple`, `Restart=on-failure`).
+`deploy/` holds hand-editable templates for setups it doesn't cover:
+
+- `deploy/systemd/syncd.service` — a **system-wide** systemd unit for
+  `syncd watch` (`service install` creates a per-user unit instead).
 - `deploy/systemd/syncd.timer` + `deploy/systemd/syncd-verify.service` —
-  **optional**, install both together: the timer periodically triggers the
-  oneshot `syncd-verify.service`, which runs a `syncd sync --hash`
-  verification pass. This is an independent integrity check on top of the
-  watch daemon's own periodic deep scan; it is not required for normal
-  operation.
-- `deploy/launchd/com.user.syncd.plist` — the macOS launchd equivalent of
-  `syncd.service`: `KeepAlive=true` keeps the `syncd watch` daemon running
-  continuously, restarting it if it exits.
-
-Fill in the real `--local`/`--remote` paths (marked as placeholders) for
-each machine before installing.
+  **optional**, install both together: a periodic `syncd sync --hash`
+  verification pass, independent of the watch daemon's own deep scan.
+- `deploy/launchd/com.user.syncd.plist` — a launchd agent template.
 
 ## Build
 

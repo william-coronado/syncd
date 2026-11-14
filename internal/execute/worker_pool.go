@@ -19,6 +19,9 @@ type SyncState struct {
 	RemoteRoot  string
 	LocalFiles  map[string]fs.FileEntry
 	RemoteFiles map[string]fs.FileEntry
+	// Trash, if set, receives deleted files that live on a local disk
+	// instead of their being removed outright (see fs.Trash). nil removes.
+	Trash *fs.Trash
 }
 
 type ManifestUpdate struct {
@@ -167,6 +170,11 @@ func runUpload(state SyncState, action reconcile.Action) Result {
 	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
+	if action.PreserveDest {
+		if err := state.Trash.Preserve(state.RemoteRoot, action.Path); err != nil {
+			return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
+		}
+	}
 	if err := fs.AtomicCopyFile(local.AbsPath, dst); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
@@ -189,6 +197,11 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 	scanned, present := state.LocalFiles[action.Path]
 	if err := verifyDestinationUnchanged(dst, scanned, present, false); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
+	}
+	if action.PreserveDest {
+		if err := state.Trash.Preserve(state.LocalRoot, action.Path); err != nil {
+			return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
+		}
 	}
 	if err := fs.AtomicCopyFile(remote.AbsPath, dst); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
@@ -216,7 +229,7 @@ func runDelete(state SyncState, action reconcile.Action, deleteLocal bool) Resul
 	if err := verifyDestinationUnchanged(targetPath, scanned, present, true); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
 	}
-	if err := removeIfExists(targetPath); err != nil {
+	if err := state.Trash.Remove(targetRoot, action.Path); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
 	}
 	return Result{
@@ -225,11 +238,4 @@ func runDelete(state SyncState, action reconcile.Action, deleteLocal bool) Resul
 			{Path: action.Path, Delete: true},
 		},
 	}
-}
-
-func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
 }

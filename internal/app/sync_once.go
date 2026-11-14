@@ -47,6 +47,15 @@ type SyncOptions struct {
 	// confirm/dry-run summary (the CLI passes a terminal color when stdout
 	// is a TTY). nil => plain text.
 	HighlightPath func(string) string
+	// MaxDelete caps how many files an unattended (Assume) run may delete
+	// from either side; over it, the run fails with reconcile.ErrDeleteLimit
+	// before changing anything. An interactive run is not limited - its
+	// confirm prompt, which lists the deletes first, is the gate. The zero
+	// value imposes no limit.
+	MaxDelete reconcile.DeleteLimit
+	// Trash receives deleted files that live on a local disk; nil removes
+	// them outright.
+	Trash *fs.Trash
 }
 
 // SyncOnce runs a single fast job (mirror/update/two-way). If opts.UseHash
@@ -227,11 +236,25 @@ func rootsOverlap(a, b string) (bool, error) {
 // when p exists, or p unchanged (already filepath.Abs'd by the caller) when
 // it doesn't - a path that isn't there yet has nothing to resolve, and that
 // is not an error condition here (two-way legitimately auto-creates roots).
+//
+// For a path that doesn't exist, its nearest existing ancestor is resolved
+// and the missing remainder re-appended. Otherwise a not-yet-created
+// directory under a symlinked parent (on macOS every temp dir, and /tmp
+// itself, is one) keeps its unresolved spelling while its existing
+// counterpart gets the resolved one, and the two no longer look nested.
 func resolveIfExists(p string) string {
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return resolved
+	rest := ""
+	for cur := p; ; {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(resolved, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
 	}
-	return p
 }
 
 // pathContainsOrEquals reports whether child is parent itself, or a
@@ -338,8 +361,10 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 			if !confirmOrDefault(opts.Confirm)(fastSummary(opts, res.Tasks)) {
 				return ErrAborted
 			}
+		} else if err := checkFastDeleteLimit(opts.MaxDelete, res.Tasks, len(left), len(right)); err != nil {
+			return unattendedDeleteLimitError(err)
 		}
-		if err := execute.RunFastTasks(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress); err != nil {
+		if err := execute.RunFastTasksWithTrash(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress, opts.Trash); err != nil {
 			return fmt.Errorf("run fast tasks: %w", err)
 		}
 	}
@@ -350,6 +375,30 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		}
 	}
 	return nil
+}
+
+// unattendedDeleteLimitError adds what to do about a --yes run refused by
+// its delete limit.
+func unattendedDeleteLimitError(err error) error {
+	return fmt.Errorf("%w; rerun without --yes to review the deletions, or raise --max-delete", err)
+}
+
+// checkFastDeleteLimit enforces limit against the deletes in tasks, each
+// side measured against the number of files scanned on it.
+func checkFastDeleteLimit(limit reconcile.DeleteLimit, tasks []reconcile.FastTask, leftFiles, rightFiles int) error {
+	var delL, delR int
+	for _, t := range tasks {
+		switch t.Type {
+		case reconcile.DeleteL:
+			delL++
+		case reconcile.DeleteR:
+			delR++
+		}
+	}
+	if err := limit.Check("left", delL, leftFiles); err != nil {
+		return err
+	}
+	return limit.Check("right", delR, rightFiles)
 }
 
 // scanPairForOpts scans opts.Left/opts.Right, exactly via fs.ScanPair,
@@ -631,7 +680,15 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	}
 	defer logger.Close()
 
+	// As in the fast path, the limit applies to unattended runs only.
+	var maxDelete reconcile.DeleteLimit
+	if opts.Assume {
+		maxDelete = opts.MaxDelete
+	}
+
 	_, failures, runErr := RunRobustOnce(ctx, RobustParams{
+		MaxDelete:   maxDelete,
+		Trash:       opts.Trash,
 		LocalRoot:   opts.Left,
 		RemoteRoot:  opts.Right,
 		Workers:     opts.Workers,
@@ -643,6 +700,9 @@ func runRobustOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 	})
 	if errors.Is(runErr, ErrAborted) {
 		return ErrAborted
+	}
+	if errors.Is(runErr, reconcile.ErrDeleteLimit) {
+		return unattendedDeleteLimitError(runErr)
 	}
 	// A hard failure (manifest LoadAll, ScanPair, or ApplyUpdates) is
 	// reported with this call site's own original per-stage wrapping,
