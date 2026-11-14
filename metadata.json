@@ -1,0 +1,69 @@
+{
+  "cli_version": "0.13.4",
+  "checkpoint_id": "01M7CKS9QPYTJCJ99S3X5F0VEP",
+  "strategy": "manual-commit",
+  "branch": "feat/service-and-delete-safety",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "CLAUDE.md",
+    "README.md",
+    "docs/follow-ups.md",
+    "internal/app/delete_safety_test.go",
+    "internal/app/sync_loop.go",
+    "internal/app/sync_once.go",
+    "internal/app/watch_run.go",
+    "internal/cli/approve_cmd.go",
+    "internal/cli/service_cmd.go",
+    "internal/cli/service_cmd_test.go",
+    "internal/cli/sync_cmd.go",
+    "internal/cli/watch_cmd.go",
+    "internal/db/manifest_repo.go",
+    "internal/db/sqlite_test.go",
+    "internal/execute/fast_exec.go",
+    "internal/execute/fast_exec_test.go",
+    "internal/execute/worker_pool.go",
+    "internal/fs/netfs_darwin.go",
+    "internal/fs/netfs_linux.go",
+    "internal/fs/trash.go",
+    "internal/fs/trash_test.go",
+    "internal/reconcile/delete_limit.go",
+    "internal/reconcile/delete_limit_test.go",
+    "internal/runtime/approval.go",
+    "internal/runtime/approval_test.go",
+    "internal/runtime/paths.go",
+    "internal/service/render.go",
+    "internal/service/service.go",
+    "internal/service/service_test.go",
+    "internal/watch/loop.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 100,
+    "cache_creation_tokens": 235177,
+    "cache_read_tokens": 8381914,
+    "output_tokens": 83302,
+    "api_call_count": 45
+  },
+  "redaction": {
+    "replacements": 24,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 30,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
