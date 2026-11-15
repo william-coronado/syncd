@@ -1,0 +1,48 @@
+{
+  "cli_version": "0.13.4",
+  "checkpoint_id": "01M7EDBFZH62AE253VX9KMV00J",
+  "strategy": "manual-commit",
+  "branch": "codex/fix-sync-safety",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "README.md",
+    "internal/app/safety_test.go",
+    "internal/app/sync_loop.go",
+    "internal/fs/aliases.go",
+    "internal/fs/aliases_test.go",
+    "internal/fs/atomic_copy.go",
+    "internal/fs/claim.go",
+    "internal/fs/review_test.go",
+    "internal/fs/scanner.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 78,
+    "cache_creation_tokens": 181090,
+    "cache_read_tokens": 6228538,
+    "output_tokens": 57968,
+    "api_call_count": 38
+  },
+  "redaction": {
+    "replacements": 3,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 0,
+      "key_context": 3,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
