@@ -264,3 +264,42 @@ func TestRunLogsWatcherAddErrorsOnce(t *testing.T) {
 		t.Errorf("expected the watcher's add errors to be logged, got log contents:\n%s", data)
 	}
 }
+
+// The first successful whole-tree cycle is announced exactly once, and a
+// cycle that cannot run (no canary) announces nothing.
+func TestRunLogsFirstFullCycleOnce(t *testing.T) {
+	for _, withCanary := range []bool{true, false} {
+		t.Run(fmt.Sprintf("canary=%v", withCanary), func(t *testing.T) {
+			local, remote := t.TempDir(), t.TempDir()
+			if withCanary {
+				os.WriteFile(filepath.Join(remote, ".synclock"), []byte("x"), 0o644)
+			}
+			os.WriteFile(filepath.Join(local, "f"), []byte("data"), 0o644)
+			dbh, _ := db.Open(filepath.Join(t.TempDir(), "m.db"))
+			defer dbh.Close()
+			logPath := filepath.Join(t.TempDir(), "l.log")
+			logger, _ := runtime.NewLogger(true, logPath)
+			defer logger.Close()
+			m, _ := fs.LoadIgnoreMatcher(local)
+			p := app.RobustParams{LocalRoot: local, RemoteRoot: remote, Workers: 1, Repo: db.NewManifestRepo(dbh), DB: dbh, Logger: logger}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+			defer cancel()
+			if err := Run(ctx, p, m, LoopConfig{RemotePoll: 40 * time.Millisecond, DeepScan: time.Hour, Debounce: 10 * time.Millisecond}); err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			data, _ := os.ReadFile(logPath)
+			got := strings.Count(string(data), FirstFullCycleMessage)
+			want := 0
+			if withCanary {
+				want = 1
+				if strings.Count(string(data), "scan remote: done") < 2 {
+					t.Fatalf("expected several polls to run, log:\n%s", data)
+				}
+			}
+			if got != want {
+				t.Fatalf("%q logged %d times, want %d; log:\n%s", FirstFullCycleMessage, got, want, data)
+			}
+		})
+	}
+}
