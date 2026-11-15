@@ -103,7 +103,7 @@ func TestRunConflict_SecondConflictWithinSameSecondDoesNotOverwriteFirst(t *test
 		LocalFiles:  map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: int64(len("first-local"))}},
 		RemoteFiles: map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: int64(len("first-remote"))}},
 	}
-	res1 := runConflict(state, action)
+	res1 := runOne(t, state, action)
 	if res1.Error != nil {
 		t.Fatalf("first runConflict: %v", res1.Error)
 	}
@@ -118,7 +118,7 @@ func TestRunConflict_SecondConflictWithinSameSecondDoesNotOverwriteFirst(t *test
 		LocalFiles:  map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: int64(len("second-local"))}},
 		RemoteFiles: map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: int64(len("second-remote"))}},
 	}
-	res2 := runConflict(state2, action)
+	res2 := runOne(t, state2, action)
 	if res2.Error != nil {
 		t.Fatalf("second runConflict: %v", res2.Error)
 	}
@@ -193,7 +193,7 @@ func TestRunConflict_RollsBackLocalRenameWhenDownloadFails(t *testing.T) {
 		RemoteFiles: map[string]fs.FileEntry{"a.txt": {Path: "a.txt", Size: 5}},
 	}
 
-	res := runConflict(state, action)
+	res := runOne(t, state, action)
 	if res.Error == nil {
 		t.Fatal("expected an error since remote's a.txt is missing from disk")
 	}

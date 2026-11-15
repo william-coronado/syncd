@@ -22,7 +22,7 @@ func scannedEntry(t *testing.T, root, rel string) fs.FileEntry {
 	if err != nil {
 		t.Fatalf("stat %s: %v", abs, err)
 	}
-	return fs.FileEntry{Path: rel, AbsPath: abs, Size: info.Size(), Mtime: info.ModTime().Unix()}
+	return fs.FileEntry{Path: rel, AbsPath: abs, Size: info.Size(), Mtime: info.ModTime().Unix(), ModTime: info.ModTime()}
 }
 
 func writeAt(t *testing.T, path, content string, mtime time.Time) {

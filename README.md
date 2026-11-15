@@ -355,6 +355,36 @@ preview step of any kind — whole-tree directory reconciliation there only
 happens on the `--remote-poll` and `--deep-scan` cycles, not on the
 fsnotify-driven scoped reconcile — see "`syncd watch`" above.
 
+## Filesystem safety
+
+Symlinks and their descendants are excluded from reconciliation. File reads,
+transfers, moves, deletions, and directory operations are confined to the
+configured roots even if a parent is replaced by a symlink during a cycle.
+Robust overwrites and deletes first rename the current entry to a private
+`.syncd-hold-...` name beside it, then check its identity, size and full
+modification timestamp, and its content hash once. Later re-checks of that
+held entry compare metadata only. Transfers publish without replacing any
+new entry at the destination name. A process that already has the old file
+open can still write to that file after the check.
+
+`.syncd-hold-...` entries are never reconciled. One that exists only
+briefly is another syncd's operation in flight on a shared remote. One that
+persists (after a crash or a concurrent recreation) is a retained original:
+every scan reports it as a scan issue in the log. Inspect and recover it,
+then remove it. If the share
+supports neither exclusive rename nor hard links, publication falls back to
+check-then-rename, so a name created by another writer in that brief window
+can still be replaced.
+
+Names that differ only by case, including directory components, stop the
+cycle before any transfers or deletions. This applies on all filesystems so
+pairs remain safe on case-insensitive APFS and SMB destinations. One case is
+handled: `watch` (and `sync --hash`) propagate a case-only rename of a
+tracked, unchanged file made on one side. On a case-insensitive destination
+this can take two cycles. Otherwise, resolve the reported names by giving
+them distinct names, or the same spelling on both sides, before retrying.
+A directory case rename needs the same rename made on the other side.
+
 ## State directory
 
 By default, state artifacts (SQLite manifest, lock file, JSON log) are
@@ -364,9 +394,9 @@ written under:
 ~/.local/state/syncd/
 ```
 
-- `manifest.db` — `syncd watch`'s manifest
+- `manifest-<pair>.db` — `syncd watch`'s manifest for this ordered root pair
 - `jobs.db` — `syncd sync`'s own job state for fast (mirror/update/two-way)
-  jobs, kept separate from the watch daemon's `manifest.db`
+  jobs, kept separate from the watch daemon's manifest
 - `hash-<id>.db` — one file per `--hash` job, where `<id>` is a sanitized
   form of the job's name (or, for an ad-hoc `--left`/`--right --hash` run,
   the same short hash used as its job name). Each `--hash` job gets its own
@@ -375,8 +405,8 @@ written under:
   across jobs would let two jobs whose trees contain the same relative path
   corrupt each other's three-way baseline. The fast path doesn't need this:
   its `job_state` table is already namespaced per job.
-- `sync.lock`
-- `sync.log`
+- `sync-roots-<pair>.lock` — shared by `sync` and `watch` for the same roots
+- `sync-<pair>.log` — the watch log for this root pair
 - `trash/` — files deleted from local disks (see "Delete safety")
 - `service.out.log`, `service.err.log` — the macOS background service's
   stdout/stderr
@@ -391,8 +421,14 @@ flags** — its db paths under `~/.local/state/syncd/` (`jobs.db`, and each
 `--hash` job's own `hash-<id>.db`) are currently fixed and not
 user-overridable.
 
-`syncd` also maintains an exclusive lockfile so overlapping runs against the
-same state directory can't corrupt each other, and validates a remote canary
+`sync` and `watch` share a lock for each resolved root pair, regardless of
+root order, casing, or job name. Compatibility locks cover the former names
+for the configured roots during upgrades. Stop older processes before
+upgrading if they use different path spellings or custom watch state
+locations. Watch still honors its explicit lock path in addition to the
+shared lock.
+
+The robust engine validates a remote canary
 file (`.synclock`) before touching the remote — `syncd init` bootstraps it,
 and every sync/watch cycle re-checks it before making changes, so a network
 mount that vanished mid-run is caught rather than silently writing nowhere

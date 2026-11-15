@@ -92,6 +92,7 @@ func TestRunWatch_RejectsIdenticalRoots(t *testing.T) {
 // paths for everything downstream, not leave NewWatcher's internal
 // resolution as the only place symlinks are handled.
 func TestRunWatch_ResolvesSymlinkedLocalRootBeforeHandingToRunLoop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	realLocal := t.TempDir()
 	symlinkParent := t.TempDir()
 	symlinkLocal := filepath.Join(symlinkParent, "local-link")

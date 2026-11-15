@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -181,4 +183,82 @@ func TestResolvePaths_DefaultLogPathIsPerRootPair(t *testing.T) {
 	if filepath.Base(none.LogPath) != "sync.log" {
 		t.Fatalf("rootless default = %q, want sync.log", none.LogPath)
 	}
+}
+
+func TestRootPairKeyResolvesAliasesAndMissingChildren(t *testing.T) {
+	base, other := t.TempDir(), t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(base, alias); err != nil {
+		t.Fatal(err)
+	}
+	a, err := RootPairKey(filepath.Join(base, "new"), other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := RootPairKey(other, filepath.Join(alias, "new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b {
+		t.Fatalf("aliases differ: %s vs %s", a, b)
+	}
+	if err := os.Mkdir(filepath.Join(base, "new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, err := RootPairKey(other, filepath.Join(alias, "new"))
+	if err != nil || a != c {
+		t.Fatalf("identity changed after creating root: %s vs %s (%v)", a, c, err)
+	}
+}
+
+func TestPairLocksCoverCaseAndLegacyNames(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	state := filepath.Join(home, ".local", "state", "syncd")
+	if err := os.MkdirAll(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	left, right := filepath.Join(home, "Left"), filepath.Join(home, "Right")
+	for _, p := range []string{left, right} {
+		if err := os.Mkdir(p, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	primary, err := defaultLockName(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	variant, err := defaultLockName(filepath.Join(home, "left"), right)
+	if err != nil || primary != variant {
+		t.Fatalf("case variants use different locks: %s %s %v", primary, variant, err)
+	}
+	legacyLeft, err := canonicalLockRoot(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRight, err := canonicalLockRoot(right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(legacyRight + "\x00" + legacyLeft))
+	names := []string{"sync-" + pairKey(left, right) + ".lock", "sync-" + hex.EncodeToString(sum[:6]) + ".lock"}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			lock, err := AcquireLock(filepath.Join(state, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Release()
+			release, err := AcquirePairLocks(filepath.Join(state, primary), state, left, right)
+			if err == nil {
+				release()
+				t.Fatal("acquired locks while legacy process holds a lock")
+			}
+		})
+	}
+	release, err := AcquirePairLocks(filepath.Join(state, primary), state, left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
 }

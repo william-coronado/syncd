@@ -3,6 +3,8 @@ package runtime
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"syscall"
 )
 
@@ -38,4 +40,46 @@ func (l *Lock) Release() error {
 		return fmt.Errorf("close lock file: %w", err)
 	}
 	return nil
+}
+
+// acquireLocks releases all partial claims if any lock is already held.
+func acquireLocks(paths []string) (func(), error) {
+	sort.Strings(paths)
+	var locks []*Lock
+	var identities []os.FileInfo
+	release := func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			_ = locks[i].Release()
+		}
+	}
+	seen := make(map[string]bool)
+	for _, path := range paths {
+		path = filepath.Clean(path)
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		if info, err := os.Stat(path); err == nil {
+			duplicate := false
+			for _, held := range identities {
+				if os.SameFile(info, held) {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+		}
+		lock, err := AcquireLock(path)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		locks = append(locks, lock)
+		if info, err := lock.file.Stat(); err == nil {
+			identities = append(identities, info)
+		}
+	}
+	return release, nil
 }

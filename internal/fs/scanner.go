@@ -21,11 +21,13 @@ type ScanIssue struct {
 }
 
 type FileEntry struct {
+	Info    os.FileInfo // observed identity used by destructive actions
 	Path    string
 	AbsPath string
 	Size    int64
 	Mtime   int64
 	Hash    string
+	ModTime time.Time // full-resolution scan timestamp for execution preconditions
 }
 
 // ScanResult holds one tree scan's outcome. A per-entry problem — a symlink,
@@ -86,10 +88,24 @@ const (
 )
 
 func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[string]db.ManifestRow, policy HashPolicy, progress ScanPairProgressFunc) (ScanPairResult, error) {
+	local, err := OpenTree(localRoot)
+	if err != nil {
+		return ScanPairResult{}, err
+	}
+	defer local.Close()
+	remote, err := OpenTree(remoteRoot)
+	if err != nil {
+		return ScanPairResult{}, err
+	}
+	defer remote.Close()
+	return ScanTrees(ctx, local, remote, manifest, policy, progress)
+}
+
+func ScanTrees(ctx context.Context, local, remote *Tree, manifest map[string]db.ManifestRow, policy HashPolicy, progress ScanPairProgressFunc) (ScanPairResult, error) {
 	// Ignore rules live in the local root's .syncdignore and are applied
 	// identically to both trees, so a pattern excludes a path regardless of
 	// which side it actually exists on.
-	matcher, err := LoadIgnoreMatcher(localRoot)
+	matcher, err := local.LoadIgnoreMatcher()
 	if err != nil {
 		return ScanPairResult{}, err
 	}
@@ -111,7 +127,7 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		res, err := ScanTree(ctx, localRoot, manifest, true, matcher, policy, localProgress)
+		res, err := local.Scan(ctx, ".", manifest, true, matcher, policy, localProgress)
 		ch <- item{key: "local", res: res, err: err}
 	}()
 	// The remote side's HashIfChanged cache keys off the remote stat
@@ -120,7 +136,7 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 	remoteManifest := db.RemoteStatView(manifest)
 	go func() {
 		defer wg.Done()
-		res, err := ScanTree(ctx, remoteRoot, remoteManifest, false, matcher, policy, remoteProgress)
+		res, err := remote.Scan(ctx, ".", remoteManifest, false, matcher, policy, remoteProgress)
 		ch <- item{key: "remote", res: res, err: err}
 	}()
 	wg.Wait()
@@ -136,6 +152,9 @@ func ScanPair(ctx context.Context, localRoot, remoteRoot string, manifest map[st
 		} else {
 			out.Remote = it.res
 		}
+	}
+	if err := CheckCaseAliases(manifest, out.Local, out.Remote); err != nil {
+		return ScanPairResult{}, err
 	}
 	return out, nil
 }
@@ -154,7 +173,12 @@ const progressReportInterval = 3 * time.Second
 // other file from syncing. Only a WalkDir error on root itself, or ctx
 // cancellation, aborts the whole scan and returns an error.
 func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy, progress ScanProgressFunc) (ScanResult, error) {
-	return scanTreeFrom(ctx, root, root, manifest, validateSMBName, matcher, policy, progress)
+	tree, err := OpenTree(root)
+	if err != nil {
+		return ScanResult{}, err
+	}
+	defer tree.Close()
+	return tree.Scan(ctx, ".", manifest, validateSMBName, matcher, policy, progress)
 }
 
 // ScanSubtree is ScanTree restricted to the directory subRel beneath root:
@@ -167,10 +191,15 @@ func ScanTree(ctx context.Context, root string, manifest map[string]db.ManifestR
 // design, never descends into. Like ScanTree, a failure on the walk's own
 // starting directory (e.g. it vanished) aborts with an error.
 func ScanSubtree(ctx context.Context, root, subRel string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy) (ScanResult, error) {
-	return scanTreeFrom(ctx, root, filepath.Join(root, filepath.FromSlash(subRel)), manifest, validateSMBName, matcher, policy, nil)
+	tree, err := OpenTree(root)
+	if err != nil {
+		return ScanResult{}, err
+	}
+	defer tree.Close()
+	return tree.Scan(ctx, subRel, manifest, validateSMBName, matcher, policy, nil)
 }
 
-func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy, progress ScanProgressFunc) (ScanResult, error) {
+func (tree *Tree) Scan(ctx context.Context, subRel string, manifest map[string]db.ManifestRow, validateSMBName bool, matcher *IgnoreMatcher, policy HashPolicy, progress ScanProgressFunc) (ScanResult, error) {
 	result := ScanResult{
 		Files:       make(map[string]FileEntry),
 		Skipped:     make(map[string]struct{}),
@@ -185,7 +214,17 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 	scanStart := time.Now().Unix()
 	scanned := 0
 	lastReport := time.Now()
-	err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, walkErr error) error {
+	root := tree.Name()
+	walkRel := filepath.ToSlash(filepath.Clean(subRel))
+	if info, err := tree.Lstat(walkRel); err != nil {
+		return ScanResult{}, err
+	} else if !info.IsDir() {
+		return ScanResult{}, fmt.Errorf("scan start is not a directory: %s", walkRel)
+	}
+	sfs := newScanFS(tree)
+	defer sfs.close()
+	err := walkScanTree(sfs, walkRel, func(rel string, d fs.DirEntry, walkErr error) error {
+		path := filepath.Join(root, filepath.FromSlash(rel))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -196,7 +235,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			// vanished mid-scan) is a whole-scan problem, not a per-entry
 			// one: it must abort, not be silently skipped, or a vanished SMB
 			// mount would look like an empty-but-successful scan.
-			if path == walkRoot {
+			if rel == walkRel {
 				return walkErr
 			}
 			relPath, relErr := NormalizeRelativePath(root, path)
@@ -224,24 +263,38 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			}
 			return nil
 		}
-		if path == root {
+		if rel == "." {
 			return nil
 		}
 		relPath, err := NormalizeRelativePath(root, path)
 		if err != nil {
 			return err
 		}
-		if path == walkRoot && !d.IsDir() {
+		if rel == walkRel && !d.IsDir() {
 			// A subtree scan's starting point that isn't (or is no longer)
-			// a real directory - e.g. replaced by a file or symlink since
-			// the caller checked. Nothing to walk; never follow it.
+			// a real directory. Treat this as unknown, since an empty
+			// scan could propagate false deletes to the other side.
+			return fmt.Errorf("scan start changed: %s", path)
+		}
+		if strings.HasPrefix(d.Name(), holdingPrefix) {
+			// A syncd held entry (claimEntry): another process's in-flight
+			// overwrite or delete on a shared remote, or a displaced
+			// original retained after a failed operation. Never reconciled,
+			// and never fatal - aborting here would stall every client of
+			// the share - but reported every scan so a retained original is
+			// not forgotten. Directories cover holding dirs left by earlier
+			// builds.
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "syncd held entry (in-flight or unfinished operation); inspect it if it persists"})
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if d.IsDir() {
 			// For a subtree scan, the starting directory itself is matched
 			// with its ancestors too: ScanTree would never have entered an
 			// ignored ancestor to get here.
-			if (path == walkRoot && matcher.MatchPathOrAncestor(relPath, true)) || matcher.Match(relPath, true) {
+			if (rel == walkRel && matcher.MatchPathOrAncestor(relPath, true)) || matcher.Match(relPath, true) {
 				return filepath.SkipDir
 			}
 			result.Dirs[relPath] = struct{}{}
@@ -259,6 +312,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 		if d.Type()&os.ModeSymlink != 0 {
 			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "symlink not supported"})
 			result.Skipped[relPath] = struct{}{}
+			result.SkippedDirs[relPath] = struct{}{}
 			return nil
 		}
 		// Devices, sockets, and FIFOs are skipped the same way - hashing a
@@ -282,6 +336,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			// Per-entry: e.g. the file vanished between readdir and stat.
 			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("stat file: %s", err)})
 			result.Skipped[relPath] = struct{}{}
+			result.SkippedDirs[relPath] = struct{}{}
 			return nil
 		}
 		size := info.Size()
@@ -292,7 +347,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 		case HashNever:
 			// leave hash empty; reconciler compares on size+mtime
 		case HashAlways:
-			h, hashErr := FileBLAKE3(path)
+			h, hashErr := sfs.hash(rel)
 			if hashErr != nil {
 				result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 				result.Skipped[relPath] = struct{}{}
@@ -303,7 +358,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			if row, ok := manifest[relPath]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
 				hash = row.Hash
 			} else {
-				h, hashErr := FileBLAKE3(path)
+				h, hashErr := sfs.hash(rel)
 				if hashErr != nil {
 					result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 					result.Skipped[relPath] = struct{}{}
@@ -318,6 +373,8 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 			Size:    size,
 			Mtime:   mtime,
 			Hash:    hash,
+			ModTime: info.ModTime(),
+			Info:    info,
 		})
 		scanned++
 		if progress != nil && time.Since(lastReport) >= progressReportInterval {
@@ -327,7 +384,7 @@ func scanTreeFrom(ctx context.Context, root, walkRoot string, manifest map[strin
 		return nil
 	})
 	if err != nil {
-		return ScanResult{}, fmt.Errorf("walk tree %s: %w", walkRoot, err)
+		return ScanResult{}, fmt.Errorf("walk tree %s: %w", filepath.Join(root, walkRel), err)
 	}
 	if progress != nil {
 		progress(scanned, true)
@@ -384,3 +441,5 @@ func EnsureParents(path string) error {
 	parent := filepath.Dir(path)
 	return os.MkdirAll(parent, 0o755)
 }
+
+var walkScanTree = fs.WalkDir

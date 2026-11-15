@@ -257,6 +257,7 @@ func TestSyncOnce_MirrorDeleteGoesToTrash(t *testing.T) {
 }
 
 func TestRunWatch_WaitsForRemote(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	prev := remoteWaitInterval
 	remoteWaitInterval = 5 * time.Millisecond
 	t.Cleanup(func() { remoteWaitInterval = prev })
@@ -304,6 +305,7 @@ func TestRunWatch_WaitsForRemote(t *testing.T) {
 }
 
 func TestRunWatch_WaitForRemoteStopsCleanlyOnCancel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	prev := remoteWaitInterval
 	remoteWaitInterval = 10 * time.Millisecond
 	t.Cleanup(func() { remoteWaitInterval = prev })
@@ -324,6 +326,7 @@ func TestRunWatch_WaitForRemoteStopsCleanlyOnCancel(t *testing.T) {
 // where the daemon for the same roots records and consumes them - and the
 // approval must be good for that refused plan only.
 func TestApproveDeletes_ApprovesTheRefusedPlanForTheSameRoots(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	local, remote, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	if _, err := runtime.EnsureRemoteCanary(remote); err != nil {
 		t.Fatal(err)

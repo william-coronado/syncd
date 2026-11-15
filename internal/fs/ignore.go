@@ -2,6 +2,7 @@ package fs
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -68,16 +69,32 @@ type IgnoreMatcher struct {
 // both the local and remote scans so ignore rules behave symmetrically
 // regardless of which side a matching path actually exists on.
 func LoadIgnoreMatcher(localRoot string) (*IgnoreMatcher, error) {
+	return loadIgnoreMatcher(func() ([]byte, error) { return os.ReadFile(filepath.Join(localRoot, ignoreFileName)) })
+}
+
+func (tree *Tree) LoadIgnoreMatcher() (*IgnoreMatcher, error) {
+	return loadIgnoreMatcher(func() ([]byte, error) {
+		f, err := tree.openRegular(ignoreFileName)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		return io.ReadAll(f)
+	})
+}
+
+func loadIgnoreMatcher(read func() ([]byte, error)) (*IgnoreMatcher, error) {
 	m := &IgnoreMatcher{}
 	for _, p := range defaultIgnorePatterns {
 		if err := m.addPattern(p); err != nil {
 			return nil, fmt.Errorf("internal default ignore pattern %q: %w", p, err)
 		}
 	}
-	patterns, err := readIgnoreFile(filepath.Join(localRoot, ignoreFileName))
-	if err != nil {
-		return nil, err
+	data, err := read()
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read %s: %w", ignoreFileName, err)
 	}
+	patterns := parseIgnoreFile(data)
 	for _, p := range patterns {
 		if err := m.addPattern(p); err != nil {
 			return nil, fmt.Errorf("invalid pattern %q in %s: %w", p, ignoreFileName, err)
@@ -86,14 +103,7 @@ func LoadIgnoreMatcher(localRoot string) (*IgnoreMatcher, error) {
 	return m, nil
 }
 
-func readIgnoreFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
+func parseIgnoreFile(data []byte) []string {
 	var patterns []string
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
@@ -102,7 +112,7 @@ func readIgnoreFile(path string) ([]string, error) {
 		}
 		patterns = append(patterns, line)
 	}
-	return patterns, nil
+	return patterns
 }
 
 // Match reports whether relPath (forward-slash separated and root-relative,

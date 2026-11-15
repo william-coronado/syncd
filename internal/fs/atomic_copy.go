@@ -8,38 +8,68 @@ import (
 	"path/filepath"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
+// AtomicCopyFile is the unscoped convenience API. Sync operations use
+// AtomicCopyFileInRoots so neither side can escape its configured root.
 func AtomicCopyFile(srcPath, dstPath string) error {
-	srcInfo, err := os.Stat(srcPath)
-	if err != nil {
-		return fmt.Errorf("stat source file: %w", err)
-	}
-	if srcInfo.IsDir() {
-		return fmt.Errorf("source is directory: %s", srcPath)
-	}
 	if err := EnsureParents(dstPath); err != nil {
-		return fmt.Errorf("create destination parent: %w", err)
+		return err
 	}
+	return AtomicCopyFileInRoots(filepath.Dir(srcPath), filepath.Base(srcPath), filepath.Dir(dstPath), filepath.Base(dstPath))
+}
 
-	src, err := os.Open(srcPath)
+func AtomicCopyFileInRoots(srcRoot, srcRel, dstRoot, dstRel string) error {
+	source, err := OpenTree(srcRoot)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	dest, err := OpenTree(dstRoot)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+	return CopyBetween(source, srcRel, dest, dstRel)
+}
+
+func CopyBetween(source *Tree, srcRel string, dest *Tree, dstRel string) error {
+	return copyBetween(source, srcRel, dest, dstRel, nil, false, nil)
+}
+
+// CopyChecked stages the incoming data before taking the destination out
+// of circulation. The check sees the actual displaced entry, and an entry
+// created concurrently at the final name is never overwritten. check runs
+// up to three times on the displaced entry (after the claim, after
+// preserve, after publication); a check that reads content should do so
+// only on its first call (see execute.checkObserved).
+func CopyChecked(source *Tree, srcRel string, dest *Tree, dstRel string, present bool, check EntryCheck, preserve func(*Tree, string) error) error {
+	return copyBetween(source, srcRel, dest, dstRel, check, !present, preserve)
+}
+
+func copyBetween(source *Tree, srcRel string, dest *Tree, dstRel string, check EntryCheck, absent bool, preserve func(*Tree, string) error) error {
+	src, err := source.openRegular(srcRel)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
 	defer src.Close()
-
-	tmp, tmpPath, err := createTempSibling(dstPath, srcInfo.Mode().Perm())
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return err
+	}
+	parent, leaf, err := dest.parent(dstRel, 0o755)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	tmp, tmpName, err := createTempSibling(parent, leaf, srcInfo.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
-	tmpClosed := false
-	defer func() {
-		if !tmpClosed {
-			_ = tmp.Close()
-		}
-		_ = os.Remove(tmpPath)
-	}()
-
+	defer tmp.Close()
+	defer unix.Unlinkat(fd(parent), tmpName, 0)
 	if _, err := io.Copy(tmp, src); err != nil {
 		return fmt.Errorf("copy bytes: %w", err)
 	}
@@ -49,15 +79,54 @@ func AtomicCopyFile(srcPath, dstPath string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	tmpClosed = true
-
-	if err := os.Chtimes(tmpPath, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
+	// Only after every byte is flushed and the handle closed: on network
+	// filesystems a later flush can stamp the server's "now" over it.
+	ts := unix.NsecToTimespec(srcInfo.ModTime().UnixNano())
+	if err := unix.UtimesNanoAt(fd(parent), tmpName, []unix.Timespec{ts, ts}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("set temp mtime: %w", err)
 	}
-	if err := os.Rename(tmpPath, dstPath); err != nil {
-		return fmt.Errorf("rename temp into place: %w", err)
+	if err := dest.verifyParent(dstRel, parent); err != nil {
+		return err
 	}
-	return nil
+	if absent {
+		return publishExclusive(parent, tmpName, parent, leaf)
+	}
+	if check == nil {
+		if info, err := statAt(parent, leaf); err == nil && !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing to replace non-regular entry: %s", dstRel)
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return unix.Renameat(fd(parent), tmpName, fd(parent), leaf)
+	}
+	claimed, held, finish, err := claimEntry(parent, leaf)
+	if err != nil {
+		return err
+	}
+	if err := check(claimed, held); err != nil {
+		return finish(err)
+	}
+	if preserve != nil {
+		if err := preserve(claimed, held); err != nil {
+			return finish(err)
+		}
+		if err := check(claimed, held); err != nil {
+			return finish(err)
+		}
+	}
+	if err := publishExclusive(parent, tmpName, parent, leaf); err != nil {
+		return finish(err)
+	}
+	// Detect edits to an already-open displaced file during publication.
+	// Leave it available for recovery if it changed or removal failed.
+	checkErr := check(claimed, held)
+	if checkErr == nil {
+		checkErr = claimed.Remove(held, false)
+	}
+	if checkErr != nil {
+		return fmt.Errorf("replacement published, original retained at %s: %w", filepath.Join(parent.Name(), held), checkErr)
+	}
+	return finish(nil)
 }
 
 // tempFileInfix marks every atomic-write staging filename tempSiblingPath
@@ -121,11 +190,11 @@ const maxTempSiblingAttempts = 5
 // O_TRUNC alone would clobber a stale leftover temp file from a crashed
 // prior run, or the vanishingly rare genuine name collision, instead of
 // failing or picking a different name (review finding, Gemini 3.6).
-func createTempSibling(dstPath string, perm os.FileMode) (*os.File, string, error) {
+func createTempSibling(parent *os.File, dstName string, perm os.FileMode) (*os.File, string, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxTempSiblingAttempts; attempt++ {
-		tmpPath := tempSiblingPathFunc(dstPath)
-		tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+		tmpPath := filepath.Base(tempSiblingPathFunc(filepath.Join(parent.Name(), dstName)))
+		tmp, err := openAt(parent, tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 		if err == nil {
 			return tmp, tmpPath, nil
 		}

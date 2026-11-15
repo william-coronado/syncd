@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"syncd/internal/fs"
 )
 
 // failLstatFor makes scopedLstat return EACCES for exactly path, as if an
@@ -14,11 +16,12 @@ import (
 func failLstatFor(t *testing.T, path string) {
 	t.Helper()
 	orig := scopedLstat
-	scopedLstat = func(p string) (os.FileInfo, error) {
+	scopedLstat = func(tree *fs.Tree, rel string) (os.FileInfo, error) {
+		p := filepath.Join(tree.Name(), rel)
 		if p == path {
 			return nil, &os.PathError{Op: "lstat", Path: p, Err: syscall.EACCES}
 		}
-		return orig(p)
+		return orig(tree, rel)
 	}
 	t.Cleanup(func() { scopedLstat = orig })
 }
