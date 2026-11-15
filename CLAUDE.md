@@ -183,6 +183,9 @@ without checking the source path first (see the data-loss guard).
 
 ## Git
 
-Fresh repo; the finished work is on **`main`**. A `feat/syncd` branch may exist
-pointing at an earlier commit. No remote is configured. End commit messages with
+**`main`** is the only long-lived branch and the default; it tracks `origin`
+(`github.com/william-coronado/syncd`). Work goes on a short-lived branch off
+`main` and lands through a GitHub PR merged with a **merge commit** ("Merge pull
+request #N"), not squash. Once merged, delete the branch locally and on
+`origin` (GitHub does not delete it automatically). End commit messages with
 `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
