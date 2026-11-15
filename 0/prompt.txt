@@ -1,0 +1,16 @@
+Push
+
+---
+
+I tested it on a real Synology share. In case you want to do further tests:
+
+* remote: /Volumes/dev
+* local: ~/dev
+
+---
+
+Fix the remaining performance findings
+
+---
+
+Commit the working tree changes with a sensible message.
