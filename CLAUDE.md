@@ -181,6 +181,14 @@ without checking the source path first (see the data-loss guard).
 - The originals (`../macOS/file_sync_util`, `../drivesync`) were intentionally
   **kept**, not deleted — syncd supersedes both.
 
+## Deploy
+
+`~/deploy-syncd.sh` (outside the repo) builds for this Mac and for linux/amd64,
+installs to `~/.local/bin/syncd` here and to `/home/william/.local/bin/syncd` on
+`william@192.168.50.44`, and restarts any running `syncd watch` service so it
+picks up the new binary (no service reinstall needed). Run it from a clean `main`:
+`~/deploy-syncd.sh --test`. Options: `--local-only`, `--remote-only`, `--no-restart`.
+
 ## Git
 
 **`main`** is the only long-lived branch and the default; it tracks `origin`
