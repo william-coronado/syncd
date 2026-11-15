@@ -1,0 +1,13 @@
+Push
+
+---
+
+deploy it
+
+---
+
+make the deploy script wait for both daemons' first cycle
+
+---
+
+Yes, ship it
