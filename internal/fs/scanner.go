@@ -221,7 +221,9 @@ func (tree *Tree) Scan(ctx context.Context, subRel string, manifest map[string]d
 	} else if !info.IsDir() {
 		return ScanResult{}, fmt.Errorf("scan start is not a directory: %s", walkRel)
 	}
-	err := walkScanTree(tree, walkRel, func(rel string, d fs.DirEntry, walkErr error) error {
+	sfs := newScanFS(tree)
+	defer sfs.close()
+	err := walkScanTree(sfs, walkRel, func(rel string, d fs.DirEntry, walkErr error) error {
 		path := filepath.Join(root, filepath.FromSlash(rel))
 		select {
 		case <-ctx.Done():
@@ -274,15 +276,19 @@ func (tree *Tree) Scan(ctx context.Context, subRel string, manifest map[string]d
 			// scan could propagate false deletes to the other side.
 			return fmt.Errorf("scan start changed: %s", path)
 		}
-		if d.IsDir() && strings.HasPrefix(d.Name(), holdingPrefix) {
-			// A syncd holding directory (claimEntry): another process's
-			// in-flight overwrite or delete on a shared remote, or a
-			// displaced original retained after a failed operation. Never
-			// reconciled, and never fatal - aborting here would stall every
-			// client of the share - but reported every scan so a retained
-			// original is not forgotten.
-			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "syncd holding directory (in-flight or unfinished operation); inspect it if it persists"})
-			return filepath.SkipDir
+		if strings.HasPrefix(d.Name(), holdingPrefix) {
+			// A syncd held entry (claimEntry): another process's in-flight
+			// overwrite or delete on a shared remote, or a displaced
+			// original retained after a failed operation. Never reconciled,
+			// and never fatal - aborting here would stall every client of
+			// the share - but reported every scan so a retained original is
+			// not forgotten. Directories cover holding dirs left by earlier
+			// builds.
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "syncd held entry (in-flight or unfinished operation); inspect it if it persists"})
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			// For a subtree scan, the starting directory itself is matched
@@ -341,7 +347,7 @@ func (tree *Tree) Scan(ctx context.Context, subRel string, manifest map[string]d
 		case HashNever:
 			// leave hash empty; reconciler compares on size+mtime
 		case HashAlways:
-			h, hashErr := hashRegularInRoot(tree, filepath.FromSlash(rel))
+			h, hashErr := sfs.hash(rel)
 			if hashErr != nil {
 				result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 				result.Skipped[relPath] = struct{}{}
@@ -352,7 +358,7 @@ func (tree *Tree) Scan(ctx context.Context, subRel string, manifest map[string]d
 			if row, ok := manifest[relPath]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
 				hash = row.Hash
 			} else {
-				h, hashErr := hashRegularInRoot(tree, filepath.FromSlash(rel))
+				h, hashErr := sfs.hash(rel)
 				if hashErr != nil {
 					result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 					result.Skipped[relPath] = struct{}{}

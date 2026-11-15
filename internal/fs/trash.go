@@ -81,14 +81,14 @@ func (t *Trash) RemoveFrom(source *Tree, rel string, check EntryCheck) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("refusing to remove non-regular entry: %s", rel)
 	}
-	claimed, finish, err := claimEntry(parent, leaf)
+	claimed, held, finish, err := claimEntry(parent, leaf)
 	if os.IsNotExist(err) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	current, err := claimed.Lstat(leaf)
+	current, err := claimed.Lstat(held)
 	if err != nil {
 		return finish(err)
 	}
@@ -96,42 +96,41 @@ func (t *Trash) RemoveFrom(source *Tree, rel string, check EntryCheck) error {
 		return finish(fmt.Errorf("entry changed before removal: %s", rel))
 	}
 	if check != nil {
-		if err := check(claimed, leaf); err != nil {
+		if err := check(claimed, held); err != nil {
 			return finish(err)
 		}
 	}
 	if t == nil || t.onNetwork(parent.Name()) {
-		return finish(claimed.Remove(leaf, false))
+		return finish(claimed.Remove(held, false))
 	}
 	dst, name, err := t.reserveEntry(source.Name(), rel)
 	if err != nil {
 		return finish(fmt.Errorf("reserve trash entry: %w", err))
 	}
 	defer dst.Close()
-	err = moveIntoTrash(claimed, leaf, dst, name, false)
+	err = moveIntoTrash(claimed, held, dst, name, false)
 	if errors.Is(err, unix.EXDEV) {
-		// The original name is already detached. Confirm that an open writer
-		// did not change the held file while we copied it across devices.
-		var original string
-		original, err = claimed.Hash(leaf)
+		// The original name is already detached, so only a writer that
+		// already had the file open can still change it. Any such write
+		// moves its size or modification time (compared at full
+		// resolution), so a metadata snapshot around the copy detects it
+		// without re-reading the file and its copy.
+		var before, after os.FileInfo
+		before, err = claimed.Lstat(held)
 		if err == nil {
-			err = CopyBetween(claimed, leaf, dst, name)
+			err = CopyBetween(claimed, held, dst, name)
 		}
 		if err == nil {
-			var copied, latest string
-			copied, err = dst.Hash(name)
-			if err == nil {
-				latest, err = claimed.Hash(leaf)
-			}
-			if err == nil && (latest != original || copied != original) {
-				err = fmt.Errorf("source changed during trash copy: %s", rel)
-			}
+			after, err = claimed.Lstat(held)
+		}
+		if err == nil && !SameSnapshot(before, after) {
+			err = fmt.Errorf("source changed during trash copy: %s", rel)
 		}
 		if err == nil && check != nil {
-			err = check(claimed, leaf)
+			err = check(claimed, held)
 		}
 		if err == nil {
-			err = claimed.Remove(leaf, false)
+			err = claimed.Remove(held, false)
 		}
 	}
 	if err != nil {

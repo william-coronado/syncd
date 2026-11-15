@@ -352,13 +352,10 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		}
 	}
 
-	baseline := make(map[string]db.ManifestRow, len(prev))
-	for path := range prev {
-		baseline[path] = db.ManifestRow{Path: path}
-	}
-	if err := fs.CheckCaseAliases(baseline, scans.Local, scans.Remote); err != nil {
-		return err
-	}
+	// Case aliases were already refused by the scan (fs.ScanTrees, or
+	// scanPairForOpts for --dry-run). The two-way baseline cannot change
+	// that verdict: CheckCaseAliases consults a baseline only for a hashed
+	// case-only rename, and fast state carries no hashes.
 	res := reconcile.FastCompare(opts.Mode, left, right, prev, skipped)
 
 	// --dry-run prints the same summary the interactive confirm would show

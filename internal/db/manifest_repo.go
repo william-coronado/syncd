@@ -237,21 +237,3 @@ func (r *ManifestRepo) ApplyUpdates(ctx context.Context, upserts []ManifestRow, 
 	}
 	return nil
 }
-
-// LoadNames returns tracked names for the scoped case-alias preflight.
-func (r *ManifestRepo) LoadNames(ctx context.Context) (map[string]struct{}, error) {
-	rows, err := r.db.QueryContext(ctx, "SELECT path FROM file_manifest")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	names := make(map[string]struct{})
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names[name] = struct{}{}
-	}
-	return names, rows.Err()
-}

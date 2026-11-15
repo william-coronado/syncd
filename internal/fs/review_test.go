@@ -68,7 +68,7 @@ func TestCopyCheckedPreservesNewEntryDuringPublish(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(dst, "file")); err != nil || string(b) != "concurrent" {
 		t.Fatalf("concurrent data changed: %q %v", b, err)
 	}
-	retained, err := filepath.Glob(filepath.Join(dst, holdingPrefix+"*", "file"))
+	retained, err := filepath.Glob(filepath.Join(dst, holdingPrefix+"*"))
 	if err != nil || len(retained) != 1 {
 		t.Fatalf("expected a recovery file, got %v %v", retained, err)
 	}
@@ -86,7 +86,7 @@ func TestCopyCheckedPreservesNewEntryDuringPublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan aborted on a retained original: %v", err)
 	}
-	if len(res.Files) != 1 || len(res.Issues) != 1 || filepath.Dir(filepath.Join(dst, res.Issues[0].Path, "file")) != filepath.Dir(retained[0]) {
+	if len(res.Files) != 1 || len(res.Issues) != 1 || filepath.Join(dst, res.Issues[0].Path) != retained[0] {
 		t.Fatalf("retained original not reported or reconciled: files=%v issues=%v", res.Files, res.Issues)
 	}
 }
@@ -167,6 +167,11 @@ func TestScanSkipsHoldingDirectoryWithIssue(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "sub", "g"), []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// A held file (claimEntry's sibling name) is skipped the same way.
+	heldFile := holdingPrefix + ".g.tmp-2-2"
+	if err := os.WriteFile(filepath.Join(root, "sub", heldFile), []byte("held"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	matcher, err := LoadIgnoreMatcher(root)
 	if err != nil {
 		t.Fatal(err)
@@ -178,8 +183,87 @@ func TestScanSkipsHoldingDirectoryWithIssue(t *testing.T) {
 	if _, ok := res.Files["sub/g"]; !ok || len(res.Files) != 1 {
 		t.Fatalf("files = %v", res.Files)
 	}
-	if len(res.Issues) != 1 || res.Issues[0].Path != "sub/"+holdingPrefix+".f.tmp-1-1" {
-		t.Fatalf("holding directory not reported: %v", res.Issues)
+	if len(res.Issues) != 2 {
+		t.Fatalf("held entries not reported: %v", res.Issues)
+	}
+	reported := map[string]bool{}
+	for _, issue := range res.Issues {
+		reported[issue.Path] = true
+	}
+	if !reported["sub/"+holdingPrefix+".f.tmp-1-1"] || !reported["sub/"+heldFile] {
+		t.Fatalf("held entries not reported: %v", res.Issues)
+	}
+}
+
+// A device lacking both exclusive primitives is remembered, so later
+// publications there skip the two failing calls.
+func TestPublishRemembersDeviceWithoutExclusivePrimitives(t *testing.T) {
+	origRename, origLink := exclusiveRename, hardLink
+	resetMemo := func() {
+		noExclusive.Range(func(k, _ any) bool { noExclusive.Delete(k); return true })
+	}
+	t.Cleanup(func() { exclusiveRename, hardLink = origRename, origLink; resetMemo() })
+	resetMemo()
+	calls := 0
+	exclusiveRename = func(*os.File, string, *os.File, string) error { calls++; return unix.ENOTSUP }
+	hardLink = func(*os.File, string, *os.File, string) error { calls++; return unix.ENOTSUP }
+
+	root := t.TempDir()
+	for _, n := range []string{"a", "b"} {
+		if err := os.WriteFile(filepath.Join(root, n), []byte(n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	if err := publishExclusive(dir, "a", dir, "a2"); err != nil || calls != 2 {
+		t.Fatalf("first publish: err=%v calls=%d", err, calls)
+	}
+	if err := publishExclusive(dir, "b", dir, "a2"); !os.IsExist(err) || calls != 2 {
+		t.Fatalf("memoized publish: err=%v calls=%d (want EEXIST, no new calls)", err, calls)
+	}
+}
+
+// The descriptor-stack walk returns what per-call root walks returned.
+func TestScanThroughDescriptorStackMatchesTree(t *testing.T) {
+	root := t.TempDir()
+	files := []string{"a/b/c/d/deep", "a/b/side", "a/x", "z/y/w", "top"}
+	for _, f := range files {
+		p := filepath.Join(root, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matcher, err := LoadIgnoreMatcher(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ScanTree(context.Background(), root, nil, false, matcher, HashAlways, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Files) != len(files) {
+		t.Fatalf("files = %v", res.Files)
+	}
+	for _, f := range files {
+		want, err := FileBLAKE3(filepath.Join(root, filepath.FromSlash(f)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Files[f].Hash != want {
+			t.Fatalf("%s hash = %q, want %q", f, res.Files[f].Hash, want)
+		}
+	}
+	for _, d := range []string{"a", "a/b", "a/b/c", "a/b/c/d", "z", "z/y"} {
+		if _, ok := res.Dirs[d]; !ok {
+			t.Fatalf("dir %s missing: %v", d, res.Dirs)
+		}
 	}
 }
 

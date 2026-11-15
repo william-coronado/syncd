@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -14,53 +15,43 @@ type EntryCheck func(tree *Tree, name string) error
 
 const holdingPrefix = ".syncd-hold-"
 
-// claimEntry atomically detaches the current name into a private directory.
+// claimEntry atomically detaches the current name by renaming it to a
+// private sibling name (holdingPrefix + a temp suffix) in the same
+// directory, and returns a Tree over that directory plus the held name.
 // On failure, callers restore it without overwriting a newly created name.
-// A crash or failed restoration leaves the original bytes in the holding
-// directory, whose name is excluded from reconciliation: scans skip it and
-// report it as an issue (see Tree.Scan).
-func claimEntry(parent *os.File, leaf string) (*Tree, func(error) error, error) {
-	var holding *os.File
-	var name string
+// A crash or failed restoration leaves the original bytes under the held
+// name, which is excluded from reconciliation: scans skip it and report it
+// as an issue (see Tree.Scan). A sibling rename costs one metadata
+// operation, where a private holding directory per claim cost three more
+// (mkdir, open, rmdir) - round trips on a network share.
+func claimEntry(parent *os.File, leaf string) (*Tree, string, func(error) error, error) {
+	var hold string
+	var err error
 	for range maxTempSiblingAttempts {
-		name = holdingPrefix + tempSiblingPath(leaf)
-		err := unix.Mkdirat(fd(parent), name, 0o700)
-		if errors.Is(err, unix.EEXIST) {
-			continue
+		hold = holdingPrefix + tempSiblingPath(leaf)
+		if err = publishExclusive(parent, leaf, parent, hold); !os.IsExist(err) {
+			break
 		}
-		if err != nil {
-			return nil, nil, err
-		}
-		holding, err = openAt(parent, name, unix.O_RDONLY|unix.O_DIRECTORY, 0)
-		if err != nil {
-			return nil, nil, err
-		}
-		break
 	}
-	if holding == nil {
-		return nil, nil, fmt.Errorf("cannot reserve holding directory for %s", leaf)
-	}
-	if err := unix.Renameat(fd(parent), leaf, fd(holding), leaf); err != nil {
-		holding.Close()
-		_ = unix.Unlinkat(fd(parent), name, unix.AT_REMOVEDIR)
-		return nil, nil, err
+	if err != nil {
+		return nil, "", nil, err
 	}
 	finish := func(cause error) error {
-		defer holding.Close()
 		if cause != nil {
-			if err := publishExclusive(holding, leaf, parent, leaf); err != nil {
-				return fmt.Errorf("%w; original retained at %s (restore failed: %v)", cause, filepath.Join(holding.Name(), leaf), err)
+			if err := publishExclusive(parent, hold, parent, leaf); err != nil {
+				return fmt.Errorf("%w; original retained at %s (restore failed: %v)", cause, filepath.Join(parent.Name(), hold), err)
 			}
 		}
-		_ = unix.Unlinkat(fd(parent), name, unix.AT_REMOVEDIR)
 		return cause
 	}
-	return &Tree{dir: holding}, finish, nil
+	return &Tree{dir: parent, borrowed: true}, hold, finish, nil
 }
 
 // exclusiveRename and hardLink are seams so tests can simulate a mount
 // that supports neither primitive.
 var (
+	// noExclusive holds the devices (st_dev) where neither primitive works.
+	noExclusive     sync.Map
 	exclusiveRename = renameExclusive
 	hardLink        = func(src *os.File, old string, dst *os.File, new string) error {
 		return unix.Linkat(fd(src), old, fd(dst), new, 0)
@@ -72,21 +63,31 @@ var (
 // mounts support neither; there it falls back to check-then-rename, which
 // can still replace a name created inside that window - the exposure a
 // plain rename always had - rather than refusing every write and delete.
+//
+// A device found to lack both primitives is remembered for the life of the
+// process, so later publications there skip two failing round trips.
 func publishExclusive(src *os.File, old string, dst *os.File, new string) error {
-	err := exclusiveRename(src, old, dst, new)
-	if !unsupportedOp(err) {
-		return err
-	}
-	err = hardLink(src, old, dst, new)
-	if err == nil {
-		// The new name now safely references the same entry. The caller owns
-		// and can clean up the private/staging name if this unlink fails.
-		_ = unix.Unlinkat(fd(src), old, 0)
-		return nil
-	}
-	// EPERM: no hard links on this filesystem (or old is a directory).
-	if !unsupportedOp(err) && !errors.Is(err, unix.EPERM) {
-		return err
+	dev, known := deviceOf(dst)
+	if _, lacking := noExclusive.Load(dev); !known || !lacking {
+		err := exclusiveRename(src, old, dst, new)
+		if !unsupportedOp(err) {
+			return err
+		}
+		err = hardLink(src, old, dst, new)
+		if err == nil {
+			// The new name now safely references the same entry. The caller
+			// owns and can clean up the private/staging name if this unlink
+			// fails.
+			_ = unix.Unlinkat(fd(src), old, 0)
+			return nil
+		}
+		// EPERM: no hard links on this filesystem (or old is a directory).
+		if !unsupportedOp(err) && !errors.Is(err, unix.EPERM) {
+			return err
+		}
+		if known && !errors.Is(err, unix.EPERM) {
+			noExclusive.Store(dev, struct{}{})
+		}
 	}
 	if _, err := statAt(dst, new); err == nil {
 		return &os.PathError{Op: "publish", Path: filepath.Join(dst.Name(), new), Err: unix.EEXIST}
@@ -99,4 +100,12 @@ func publishExclusive(src *os.File, old string, dst *os.File, new string) error 
 func unsupportedOp(err error) bool {
 	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.ENOTSUP) ||
 		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL)
+}
+
+func deviceOf(f *os.File) (uint64, bool) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd(f), &st); err != nil {
+		return 0, false
+	}
+	return uint64(st.Dev), true
 }

@@ -40,8 +40,12 @@ func hashRegularInRoot(r *Tree, rel string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	return hashReader(f)
+}
+
+func hashReader(r io.Reader) (string, error) {
 	h := blake3.New(32, nil)
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, r); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

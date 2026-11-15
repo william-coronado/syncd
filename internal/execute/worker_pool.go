@@ -127,7 +127,15 @@ var ErrDestinationChanged = errors.New("destination changed since scan; deferrin
 // checkObserved validates the entry after it has been detached from the
 // destination name, so a concurrent pathname replacement cannot pass the
 // check and then be removed in its place.
+//
+// The content hash is compared once, on the first call (right after the
+// claim). Later calls on the same held entry - fs.CopyChecked re-checks
+// after preserving and after publishing - compare identity, size and
+// full-resolution mtime only: the only writer left is one that already had
+// the file open, and its writes move those. Re-hashing there read every
+// overwritten file three times, over the network for remote targets.
 func checkObserved(scanned fs.FileEntry) fs.EntryCheck {
+	contentVerified := false
 	return func(tree *fs.Tree, rel string) error {
 		info, err := tree.Lstat(rel)
 		if err != nil {
@@ -138,7 +146,7 @@ func checkObserved(scanned fs.FileEntry) fs.EntryCheck {
 			(scanned.Mtime != 0 && info.ModTime().Unix() != scanned.Mtime) {
 			return ErrDestinationChanged
 		}
-		if scanned.Hash != "" {
+		if scanned.Hash != "" && !contentVerified {
 			hash, err := tree.Hash(rel)
 			if err != nil {
 				return err
@@ -146,6 +154,7 @@ func checkObserved(scanned fs.FileEntry) fs.EntryCheck {
 			if hash != scanned.Hash {
 				return ErrDestinationChanged
 			}
+			contentVerified = true
 		}
 		return nil
 	}

@@ -19,6 +19,9 @@ var ErrSymlink = errors.New("symlink not supported")
 type Tree struct {
 	dir  *os.File
 	name string
+	// borrowed: dir belongs to someone else (a claim's parent descriptor);
+	// Close leaves it open.
+	borrowed bool
 }
 
 func OpenTree(name string) (*Tree, error) {
@@ -59,7 +62,12 @@ func OpenTree(name string) (*Tree, error) {
 	return &Tree{dir: dir, name: abs}, nil
 }
 
-func (t *Tree) Close() error { return t.dir.Close() }
+func (t *Tree) Close() error {
+	if t.borrowed {
+		return nil
+	}
+	return t.dir.Close()
+}
 func (t *Tree) Name() string {
 	if t.name != "" {
 		return t.name
@@ -85,19 +93,13 @@ func walkDirectory(root *os.File, rel string, create os.FileMode) (*os.File, err
 		return dir, nil
 	}
 	for _, component := range strings.Split(rel, "/") {
-		next, err := openAt(dir, component, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		next, err := openChildDir(dir, component)
 		if os.IsNotExist(err) && create != 0 {
 			if mkErr := unix.Mkdirat(fd(dir), component, uint32(create)); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
 				dir.Close()
 				return nil, mkErr
 			}
-			next, err = openAt(dir, component, unix.O_RDONLY|unix.O_DIRECTORY, 0)
-		}
-		if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
-			var st unix.Stat_t
-			if unix.Fstatat(fd(dir), component, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
-				err = fmt.Errorf("%w: %s", ErrSymlink, filepath.Join(dir.Name(), component))
-			}
+			next, err = openChildDir(dir, component)
 		}
 		dir.Close()
 		if err != nil {
@@ -106,6 +108,19 @@ func walkDirectory(root *os.File, rel string, create os.FileMode) (*os.File, err
 		dir = next
 	}
 	return dir, nil
+}
+
+// openChildDir opens one directory component beneath dir without following
+// a symlink, reporting a symlink there as ErrSymlink.
+func openChildDir(dir *os.File, component string) (*os.File, error) {
+	next, err := openAt(dir, component, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+		var st unix.Stat_t
+		if unix.Fstatat(fd(dir), component, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
+			err = fmt.Errorf("%w: %s", ErrSymlink, filepath.Join(dir.Name(), component))
+		}
+	}
+	return next, err
 }
 
 func (t *Tree) directory(rel string, create os.FileMode) (*os.File, error) {
@@ -159,6 +174,10 @@ func (t *Tree) ReadDir(rel string) ([]iofs.DirEntry, error) {
 		return nil, err
 	}
 	defer d.Close()
+	return readDirAt(d)
+}
+
+func readDirAt(d *os.File) ([]iofs.DirEntry, error) {
 	names, err := d.Readdirnames(-1)
 	if err != nil {
 		return nil, err
@@ -220,6 +239,12 @@ func SameEntry(a, b os.FileInfo) bool {
 		return x.Dev == y.Dev && x.Ino == y.Ino
 	}
 	return os.SameFile(a, b)
+}
+
+// SameSnapshot reports whether two observations of one entry agree on
+// identity, size and full-resolution modification time.
+func SameSnapshot(a, b os.FileInfo) bool {
+	return SameEntry(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
 func statAt(d *os.File, leaf string) (os.FileInfo, error) {

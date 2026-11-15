@@ -360,17 +360,18 @@ fsnotify-driven scoped reconcile — see "`syncd watch`" above.
 Symlinks and their descendants are excluded from reconciliation. File reads,
 transfers, moves, deletions, and directory operations are confined to the
 configured roots even if a parent is replaced by a symlink during a cycle.
-Robust overwrites and deletes move the current entry into a private holding
-directory before checking its identity, full modification timestamp, and
-content hash. Transfers publish without replacing any new entry at the
-destination name. A process that already has the old file open can still
-write to that file after the check.
+Robust overwrites and deletes first rename the current entry to a private
+`.syncd-hold-...` name beside it, then check its identity, size and full
+modification timestamp, and its content hash once. Later re-checks of that
+held entry compare metadata only. Transfers publish without replacing any
+new entry at the destination name. A process that already has the old file
+open can still write to that file after the check.
 
-`.syncd-hold-...` directories are never reconciled. One that exists only
+`.syncd-hold-...` entries are never reconciled. One that exists only
 briefly is another syncd's operation in flight on a shared remote. One that
-persists (after a crash or a concurrent recreation) holds a retained
-original: every scan reports it as a scan issue in the log. Inspect and
-recover the retained file, then remove the holding directory. If the share
+persists (after a crash or a concurrent recreation) is a retained original:
+every scan reports it as a scan issue in the log. Inspect and recover it,
+then remove it. If the share
 supports neither exclusive rename nor hard links, publication falls back to
 check-then-rename, so a name created by another writer in that brief window
 can still be replaced.

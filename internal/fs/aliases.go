@@ -134,7 +134,13 @@ func isCaseOnlyRename(manifest map[string]db.ManifestRow, scans []ScanResult, si
 // without scanning or hashing their unrelated files. It cannot tell a
 // case-only rename from a genuine collision; RunRobustScoped answers an
 // ErrCaseAlias from it with a full cycle, whose CheckCaseAliases can.
-func CheckScopedCaseAliases(local, remote *Tree, paths, baseline, dirs map[string]struct{}, scopes ...ScanResult) error {
+//
+// The baseline is deliberately not consulted: listing each affected parent
+// on both sides already sees every spelling that exists there, and a
+// baseline spelling that exists on neither side is a stale row the planner
+// only drops (see CheckCaseAliases). Loading the whole manifest here made
+// every fsnotify batch cost as much as the tree.
+func CheckScopedCaseAliases(local, remote *Tree, paths map[string]struct{}, scopes ...ScanResult) error {
 	fold := cases.Fold()
 	targets := map[string]map[string]string{}
 	add := func(rel string) {
@@ -163,15 +169,6 @@ func CheckScopedCaseAliases(local, remote *Tree, paths, baseline, dirs map[strin
 			return fmt.Errorf("%w: %q and %q", ErrCaseAlias, path.Join(parent, wanted), path.Join(parent, actual))
 		}
 		return nil
-	}
-	for _, names := range []map[string]struct{}{baseline, dirs} {
-		for rel := range names {
-			for ; rel != "." && rel != "/"; rel = path.Dir(rel) {
-				if err := check(path.Dir(rel), path.Base(rel)); err != nil {
-					return err
-				}
-			}
-		}
 	}
 	for _, tree := range []*Tree{local, remote} {
 		for parent := range targets {

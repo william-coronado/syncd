@@ -41,7 +41,10 @@ func CopyBetween(source *Tree, srcRel string, dest *Tree, dstRel string) error {
 
 // CopyChecked stages the incoming data before taking the destination out
 // of circulation. The check sees the actual displaced entry, and an entry
-// created concurrently at the final name is never overwritten.
+// created concurrently at the final name is never overwritten. check runs
+// up to three times on the displaced entry (after the claim, after
+// preserve, after publication); a check that reads content should do so
+// only on its first call (see execute.checkObserved).
 func CopyChecked(source *Tree, srcRel string, dest *Tree, dstRel string, present bool, check EntryCheck, preserve func(*Tree, string) error) error {
 	return copyBetween(source, srcRel, dest, dstRel, check, !present, preserve)
 }
@@ -96,18 +99,18 @@ func copyBetween(source *Tree, srcRel string, dest *Tree, dstRel string, check E
 		}
 		return unix.Renameat(fd(parent), tmpName, fd(parent), leaf)
 	}
-	claimed, finish, err := claimEntry(parent, leaf)
+	claimed, held, finish, err := claimEntry(parent, leaf)
 	if err != nil {
 		return err
 	}
-	if err := check(claimed, leaf); err != nil {
+	if err := check(claimed, held); err != nil {
 		return finish(err)
 	}
 	if preserve != nil {
-		if err := preserve(claimed, leaf); err != nil {
+		if err := preserve(claimed, held); err != nil {
 			return finish(err)
 		}
-		if err := check(claimed, leaf); err != nil {
+		if err := check(claimed, held); err != nil {
 			return finish(err)
 		}
 	}
@@ -116,13 +119,12 @@ func copyBetween(source *Tree, srcRel string, dest *Tree, dstRel string, check E
 	}
 	// Detect edits to an already-open displaced file during publication.
 	// Leave it available for recovery if it changed or removal failed.
-	checkErr := check(claimed, leaf)
+	checkErr := check(claimed, held)
 	if checkErr == nil {
-		checkErr = claimed.Remove(leaf, false)
+		checkErr = claimed.Remove(held, false)
 	}
 	if checkErr != nil {
-		claimed.Close()
-		return fmt.Errorf("replacement published, original retained at %s: %w", filepath.Join(claimed.Name(), leaf), checkErr)
+		return fmt.Errorf("replacement published, original retained at %s: %w", filepath.Join(parent.Name(), held), checkErr)
 	}
 	return finish(nil)
 }

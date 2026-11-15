@@ -486,23 +486,24 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	if err := fs.CheckCaseAliases(scopedManifest, localScan, remoteScan); err != nil {
 		return escalateCaseAlias(ctx, p, err)
 	}
-	dirRepo := db.NewDirRepo(p.DB)
-	dirBaseline, err := dirRepo.LoadAll(ctx)
-	if err != nil {
-		return reconcile.Plan{}, 0, &robustHardError{stage: "load dir manifest", err: err}
-	}
-	baselineNames, err := p.Repo.LoadNames(ctx)
-	if err != nil {
-		return reconcile.Plan{}, 0, err
-	}
 	activePaths := make(map[string]struct{})
 	for rel := range relPaths {
 		if !matcher.MatchPathOrAncestor(rel, true) || !matcher.MatchPathOrAncestor(rel, false) {
 			activePaths[rel] = struct{}{}
 		}
 	}
-	if err := fs.CheckScopedCaseAliases(local, remote, activePaths, baselineNames, dirBaseline, localScan, remoteScan); err != nil {
+	if err := fs.CheckScopedCaseAliases(local, remote, activePaths, localScan, remoteScan); err != nil {
 		return escalateCaseAlias(ctx, p, err)
+	}
+	// Loaded BEFORE executing anything: once file actions have run, nothing
+	// that can fail on a cancelled ctx may stand between them and
+	// commitManifestUpdates. Only a batch with a directory path needs it.
+	dirRepo := db.NewDirRepo(p.DB)
+	var dirBaseline map[string]struct{}
+	if len(subtrees) > 0 {
+		if dirBaseline, err = dirRepo.LoadAll(ctx); err != nil {
+			return reconcile.Plan{}, 0, &robustHardError{stage: "load dir manifest", err: err}
+		}
 	}
 
 	skipped := mergeSkipSet(localScan, remoteScan)
