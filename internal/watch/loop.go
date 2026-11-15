@@ -31,6 +31,11 @@ const (
 	defaultDeepScan   = time.Hour
 )
 
+// FirstFullCycleMessage is logged once per Run, after its first successful
+// whole-tree cycle. ~/deploy-syncd.sh waits for this exact text after
+// restarting a daemon; keep it stable.
+const FirstFullCycleMessage = "watch: first full cycle complete"
+
 // newTicker is time.NewTicker, indirected through a package-level variable
 // purely so tests can observe which durations Run actually passes to it -
 // e.g. confirming a non-positive RemotePoll/DeepScan really gets clamped to
@@ -118,13 +123,14 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 	// guardedCycle serializes cycles through mu, re-checks the remote canary
 	// first, and logs+skips fn on either a vanished canary or a cycle error
 	// - it never returns an error to the caller, since a single bad cycle
-	// must not stop the always-on loop.
-	guardedCycle := func(fn func() error) {
+	// must not stop the always-on loop. It reports whether fn ran and
+	// succeeded.
+	guardedCycle := func(fn func() error) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		if err := runtime.CheckRemoteCanary(p.RemoteRoot); err != nil {
 			p.Logger.Error("watch: remote canary check failed, skipping cycle", map[string]any{"error": err.Error()})
-			return
+			return false
 		}
 		if err := fn(); err != nil {
 			if errors.Is(err, reconcile.ErrDeleteLimit) {
@@ -133,9 +139,23 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 				p.Logger.Error("watch: cycle skipped, it would delete more than --max-delete allows; check both trees, then run 'syncd approve-deletes' with this --local/--remote to see the refused deletions and let exactly those through once", map[string]any{
 					"error": err.Error(), "local": p.LocalRoot, "remote": p.RemoteRoot,
 				})
-				return
+				return false
 			}
 			p.Logger.Error("watch: reconcile cycle failed", map[string]any{"error": err.Error()})
+			return false
+		}
+		return true
+	}
+
+	// fullCycle is guardedCycle for a whole-tree cycle (poll, deep scan,
+	// rescan). The first one to succeed logs FirstFullCycleMessage once, so
+	// whoever (re)started the daemon can tell it is working end to end: a
+	// scoped fsnotify batch touches too little to show that.
+	firstFullDone := false
+	fullCycle := func(fn func() error) {
+		if guardedCycle(fn) && !firstFullDone {
+			firstFullDone = true
+			p.Logger.Printf("%s", FirstFullCycleMessage)
 		}
 	}
 
@@ -175,7 +195,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 		lastIgnore = sig
 		p.Logger.Printf("watch: .syncdignore changed; watcher rebuilt with the new rules")
 		if rescan {
-			guardedCycle(func() error {
+			fullCycle(func() error {
 				rescanParams := p
 				rescanParams.Policy = fs.HashIfChanged
 				_, _, err := app.RunRobustOnce(ctx, rescanParams)
@@ -219,7 +239,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			// arrive as a batch. Reconcile the whole tree now rather than
 			// leaving them until the next remote poll / deep scan.
 			p.Logger.Error("watch: filesystem event queue overflowed; running a full rescan", map[string]any{"error": werr.Error()})
-			guardedCycle(func() error {
+			fullCycle(func() error {
 				rescanParams := p
 				rescanParams.Policy = fs.HashIfChanged
 				_, _, err := app.RunRobustOnce(ctx, rescanParams)
@@ -229,7 +249,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 
 		case <-pollTicker.C:
 			reloadIgnore(false) // this poll is itself the full rescan
-			guardedCycle(func() error {
+			fullCycle(func() error {
 				pollParams := p
 				pollParams.Policy = fs.HashIfChanged
 				_, _, err := app.RunRobustOnce(ctx, pollParams)
@@ -237,7 +257,7 @@ func Run(ctx context.Context, p app.RobustParams, matcher *fs.IgnoreMatcher, cfg
 			})
 
 		case <-deepTicker.C:
-			guardedCycle(func() error {
+			fullCycle(func() error {
 				deepParams := p
 				deepParams.Policy = fs.HashAlways
 				_, _, err := app.RunRobustOnce(ctx, deepParams)
