@@ -1,0 +1,9 @@
+why is there a "-p" folder in the codebase?
+
+---
+
+update CLAUDE.md for the deploy script's new wait
+
+---
+
+Commit the working tree changes with a sensible message.
