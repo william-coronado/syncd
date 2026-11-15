@@ -366,16 +366,23 @@ content hash. Transfers publish without replacing any new entry at the
 destination name. A process that already has the old file open can still
 write to that file after the check.
 
-If a crash or concurrent recreation leaves a `.syncd-hold-...` directory,
-sync pauses reconciliation there. Inspect and recover the retained file
-before removing the holding directory and retrying. If the share supports
-neither exclusive rename nor hard links, a guarded transfer reports an error.
+`.syncd-hold-...` directories are never reconciled. One that exists only
+briefly is another syncd's operation in flight on a shared remote. One that
+persists (after a crash or a concurrent recreation) holds a retained
+original: every scan reports it as a scan issue in the log. Inspect and
+recover the retained file, then remove the holding directory. If the share
+supports neither exclusive rename nor hard links, publication falls back to
+check-then-rename, so a name created by another writer in that brief window
+can still be replaced.
 
 Names that differ only by case, including directory components, stop the
 cycle before any transfers or deletions. This applies on all filesystems so
-pairs remain safe on case-insensitive APFS and SMB destinations. Resolve the
-reported names on both sides before retrying; for a tracked case-only rename,
-use an intermediate distinct name and sync it before the final rename.
+pairs remain safe on case-insensitive APFS and SMB destinations. One case is
+handled: `watch` (and `sync --hash`) propagate a case-only rename of a
+tracked, unchanged file made on one side. On a case-insensitive destination
+this can take two cycles. Otherwise, resolve the reported names by giving
+them distinct names, or the same spelling on both sides, before retrying.
+A directory case rename needs the same rename made on the other side.
 
 ## State directory
 

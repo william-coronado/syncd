@@ -275,9 +275,15 @@ func (tree *Tree) Scan(ctx context.Context, subRel string, manifest map[string]d
 			return fmt.Errorf("scan start changed: %s", path)
 		}
 		if d.IsDir() && strings.HasPrefix(d.Name(), holdingPrefix) {
-			return fmt.Errorf("unfinished sync operation at %s; inspect the retained file before retrying", path)
+			// A syncd holding directory (claimEntry): another process's
+			// in-flight overwrite or delete on a shared remote, or a
+			// displaced original retained after a failed operation. Never
+			// reconciled, and never fatal - aborting here would stall every
+			// client of the share - but reported every scan so a retained
+			// original is not forgotten.
+			result.Issues = append(result.Issues, ScanIssue{Path: relPath, Reason: "syncd holding directory (in-flight or unfinished operation); inspect it if it persists"})
+			return filepath.SkipDir
 		}
-
 		if d.IsDir() {
 			// For a subtree scan, the starting directory itself is matched
 			// with its ancestors too: ScanTree would never have entered an

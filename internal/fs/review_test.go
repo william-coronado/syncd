@@ -79,8 +79,15 @@ func TestCopyCheckedPreservesNewEntryDuringPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dest.Scan(context.Background(), ".", nil, false, matcher, HashNever, nil); err == nil {
-		t.Fatal("scan continued while a displaced entry awaited recovery")
+	// The retained original is reported on every scan, never reconciled,
+	// and does not stall the cycle (on a shared remote that would stall
+	// every client).
+	res, err := dest.Scan(context.Background(), ".", nil, false, matcher, HashNever, nil)
+	if err != nil {
+		t.Fatalf("scan aborted on a retained original: %v", err)
+	}
+	if len(res.Files) != 1 || len(res.Issues) != 1 || filepath.Dir(filepath.Join(dst, res.Issues[0].Path, "file")) != filepath.Dir(retained[0]) {
+		t.Fatalf("retained original not reported or reconciled: files=%v issues=%v", res.Files, res.Issues)
 	}
 }
 
@@ -145,5 +152,81 @@ func TestCrossDeviceTrashLeavesReplacementAtOriginalName(t *testing.T) {
 	saved := filepath.Join(trash, trashNow().Format(trashDayLayout), RootFolder(root), "file")
 	if b, err := os.ReadFile(saved); err != nil || string(b) != "original" {
 		t.Fatalf("original lost: %q %v", b, err)
+	}
+}
+
+func TestScanSkipsHoldingDirectoryWithIssue(t *testing.T) {
+	root := t.TempDir()
+	hold := filepath.Join(root, "sub", holdingPrefix+".f.tmp-1-1")
+	if err := os.MkdirAll(hold, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "f"), []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "g"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	matcher, err := LoadIgnoreMatcher(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ScanTree(context.Background(), root, nil, false, matcher, HashNever, nil)
+	if err != nil {
+		t.Fatalf("holding directory aborted the scan: %v", err)
+	}
+	if _, ok := res.Files["sub/g"]; !ok || len(res.Files) != 1 {
+		t.Fatalf("files = %v", res.Files)
+	}
+	if len(res.Issues) != 1 || res.Issues[0].Path != "sub/"+holdingPrefix+".f.tmp-1-1" {
+		t.Fatalf("holding directory not reported: %v", res.Issues)
+	}
+}
+
+// Some SMB mounts support neither exclusive rename nor hard links. Deletes
+// and overwrites must still work there, and an absent-destination publish
+// must still refuse to replace an existing name.
+func TestPublishWithoutExclusivePrimitives(t *testing.T) {
+	origRename, origLink := exclusiveRename, hardLink
+	t.Cleanup(func() { exclusiveRename, hardLink = origRename, origLink })
+	exclusiveRename = func(*os.File, string, *os.File, string) error { return unix.ENOTSUP }
+	hardLink = func(*os.File, string, *os.File, string) error { return unix.EPERM }
+
+	src, dst := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "f"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "f"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenTree(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	d, err := OpenTree(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	if err := CopyChecked(s, "f", d, "f", false, nil, nil); !os.IsExist(err) {
+		t.Fatalf("absent publish over an existing name: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "f")); string(b) != "old" {
+		t.Fatalf("existing destination replaced: %q", b)
+	}
+	if err := CopyChecked(s, "f", d, "f", true, func(*Tree, string) error { return nil }, nil); err != nil {
+		t.Fatalf("checked overwrite: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "f")); string(b) != "new" {
+		t.Fatalf("overwrite content = %q", b)
+	}
+	if err := (*Trash)(nil).RemoveFrom(d, "f", nil); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	entries, _ := os.ReadDir(dst)
+	if len(entries) != 0 {
+		t.Fatalf("leftovers after delete: %v", entries)
 	}
 }

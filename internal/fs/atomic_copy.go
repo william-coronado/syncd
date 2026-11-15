@@ -70,15 +70,17 @@ func copyBetween(source *Tree, srcRel string, dest *Tree, dstRel string, check E
 	if _, err := io.Copy(tmp, src); err != nil {
 		return fmt.Errorf("copy bytes: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	// Only after every byte is flushed and the handle closed: on network
+	// filesystems a later flush can stamp the server's "now" over it.
 	ts := unix.NsecToTimespec(srcInfo.ModTime().UnixNano())
 	if err := unix.UtimesNanoAt(fd(parent), tmpName, []unix.Timespec{ts, ts}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("set temp mtime: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
 	}
 	if err := dest.verifyParent(dstRel, parent); err != nil {
 		return err

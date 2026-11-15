@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -105,9 +106,11 @@ func TestFastSyncKeepsScannedRootThroughConfirmation(t *testing.T) {
 	}
 }
 
-func TestScopedScanRejectsCaseAliasOutsideEvent(t *testing.T) {
+// A case-only rename seen by a scoped batch is escalated to a full cycle,
+// which propagates it instead of refusing the pair forever.
+func TestScopedCaseOnlyRenamePropagates(t *testing.T) {
 	local, remote := t.TempDir(), t.TempDir()
-	setFile(t, filepath.Join(local, "report.txt"), "base", time.Now())
+	setFile(t, filepath.Join(local, "report.txt"), "base", time.Unix(1700000000, 0))
 	p := newTestRobustParams(t, local, remote)
 	ctx := context.Background()
 	if _, n, err := RunRobustOnce(ctx, p); err != nil || n != 0 {
@@ -116,11 +119,49 @@ func TestScopedScanRejectsCaseAliasOutsideEvent(t *testing.T) {
 	if err := os.Rename(filepath.Join(local, "report.txt"), filepath.Join(local, "Report.txt")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := RunRobustScoped(ctx, p, map[string]struct{}{"Report.txt": {}}); err == nil {
-		t.Fatal("scoped check accepted case alias")
+	if _, _, err := RunRobustScoped(ctx, p, map[string]struct{}{"Report.txt": {}}); err != nil {
+		t.Fatalf("scoped cycle refused a case-only rename: %v", err)
+	}
+	// On a case-insensitive remote the create may wait one cycle for the
+	// old spelling's delete; a second cycle must settle it either way.
+	if _, _, err := RunRobustOnce(ctx, p); err != nil {
+		t.Fatalf("follow-up cycle: %v", err)
+	}
+	entries, err := os.ReadDir(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Name() != ".synclock" {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) != 1 || names[0] != "Report.txt" {
+		t.Fatalf("remote entries = %v, want [Report.txt]", names)
+	}
+	if got := mustReadFile(t, filepath.Join(remote, "Report.txt")); got != "base" {
+		t.Fatalf("remote content = %q", got)
 	}
 	rows, err := p.Repo.LoadAll(ctx)
-	if err != nil || len(rows) != 1 || rows["report.txt"].Path == "" {
-		t.Fatalf("manifest changed: %v %v", rows, err)
+	if err != nil || len(rows) != 1 || rows["Report.txt"].Path == "" {
+		t.Fatalf("manifest = %v, %v", rows, err)
+	}
+}
+
+// Genuine collisions (two spellings on one side) are still refused, by the
+// escalated full cycle as well.
+func TestScopedCaseCollisionStillRefused(t *testing.T) {
+	local, remote := t.TempDir(), t.TempDir()
+	setFile(t, filepath.Join(local, "report.txt"), "a", time.Unix(1700000000, 0))
+	setFile(t, filepath.Join(remote, "Report.txt"), "b", time.Unix(1700000000, 0))
+	p := newTestRobustParams(t, local, remote)
+	_, _, err := RunRobustScoped(context.Background(), p, map[string]struct{}{"report.txt": {}})
+	if !errors.Is(err, fs.ErrCaseAlias) {
+		t.Fatalf("expected case-alias refusal, got %v", err)
+	}
+	rows, _ := p.Repo.LoadAll(context.Background())
+	if len(rows) != 0 {
+		t.Fatalf("manifest changed: %v", rows)
 	}
 }

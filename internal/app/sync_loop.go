@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -483,7 +484,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	logScanIssues(p.Logger, "local", localScan.Issues)
 	logScanIssues(p.Logger, "remote", remoteScan.Issues)
 	if err := fs.CheckCaseAliases(scopedManifest, localScan, remoteScan); err != nil {
-		return reconcile.Plan{}, 0, err
+		return escalateCaseAlias(ctx, p, err)
 	}
 	dirRepo := db.NewDirRepo(p.DB)
 	dirBaseline, err := dirRepo.LoadAll(ctx)
@@ -501,7 +502,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 		}
 	}
 	if err := fs.CheckScopedCaseAliases(local, remote, activePaths, baselineNames, dirBaseline, localScan, remoteScan); err != nil {
-		return reconcile.Plan{}, 0, err
+		return escalateCaseAlias(ctx, p, err)
 	}
 
 	skipped := mergeSkipSet(localScan, remoteScan)
@@ -771,6 +772,22 @@ func logScanIssues(logger *runtime.Logger, side string, issues []fs.ScanIssue) {
 			"count": len(issues),
 		})
 	}
+}
+
+// escalateCaseAlias answers a scoped cycle's case-alias refusal with a full
+// cycle. The scoped view (batch spellings looked up on possibly
+// case-insensitive trees) cannot tell a case-only rename from a genuine
+// collision; the full scan sees every side's actual names, and either
+// propagates the rename or refuses with the same error. Nothing has been
+// executed or committed by the scoped cycle at this point.
+func escalateCaseAlias(ctx context.Context, p RobustParams, err error) (reconcile.Plan, int, error) {
+	if !errors.Is(err, fs.ErrCaseAlias) {
+		return reconcile.Plan{}, 0, err
+	}
+	if p.Logger != nil {
+		p.Logger.Info("case-only name difference in batch; running a full cycle", map[string]any{"detail": err.Error()})
+	}
+	return RunRobustOnce(ctx, p)
 }
 
 func openTrees(left, right string) (*fs.Tree, *fs.Tree, error) {
