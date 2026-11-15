@@ -306,7 +306,21 @@ func confirmOrDefault(confirm func(string) bool) func(string) bool {
 
 // runFastOnce executes the size+mtime fast reconciler (mirror/update/two-way).
 func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
-	scans, err := scanPairForOpts(ctx, opts, nil, fs.HashNever)
+	var scans fs.ScanPairResult
+	var err error
+	var local, remote *fs.Tree
+	if opts.DryRun {
+		scans, err = scanPairForOpts(ctx, opts, nil, fs.HashNever)
+	} else {
+		local, remote, err = openTrees(opts.Left, opts.Right)
+		if err != nil {
+			return fmt.Errorf("scan: %w", err)
+		}
+		defer local.Close()
+		defer remote.Close()
+		scans, err = fs.ScanTrees(ctx, local, remote, nil, fs.HashNever, nil)
+	}
+
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)
 	}
@@ -371,7 +385,7 @@ func runFastOnce(ctx context.Context, sqlDB *sql.DB, opts SyncOptions) error {
 		} else if err := checkFastDeleteLimit(opts.MaxDelete, res.Tasks, len(left), len(right)); err != nil {
 			return unattendedDeleteLimitError(err)
 		}
-		if err := execute.RunFastTasksWithTrash(ctx, opts.Workers, opts.Left, opts.Right, res.Tasks, opts.Progress, opts.Trash); err != nil {
+		if err := execute.RunFastTasksInTrees(ctx, opts.Workers, local, remote, res.Tasks, opts.Progress, opts.Trash); err != nil {
 			return fmt.Errorf("run fast tasks: %w", err)
 		}
 	}

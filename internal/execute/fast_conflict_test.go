@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"syncd/internal/fs"
 	"syncd/internal/reconcile"
 )
 
@@ -82,7 +83,7 @@ func TestRunFastTasks_ConflictCopyFailureRestoresDestination(t *testing.T) {
 	writeAt(t, filepath.Join(left, "doc.txt"), "winner", tNew)
 	writeAt(t, filepath.Join(right, "doc.txt"), "loser", tOld)
 	orig := copyFunc
-	copyFunc = func(string, string, string, string) error { return errors.New("injected copy failure") }
+	copyFunc = func(*fs.Tree, string, *fs.Tree, string) error { return errors.New("injected copy failure") }
 	t.Cleanup(func() { copyFunc = orig })
 
 	err := RunFastTasks(context.Background(), 1, left, right,

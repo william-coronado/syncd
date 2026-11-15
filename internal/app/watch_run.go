@@ -75,6 +75,7 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 			return nil // cancelled while waiting: a clean shutdown
 		}
 	}
+	originalLocal, originalRemote := cfg.LocalRoot, cfg.RemoteRoot
 	resolvedLocal, err := resolveWatchRoot("local", cfg.LocalRoot)
 	if err != nil {
 		return err
@@ -114,11 +115,11 @@ func RunWatch(ctx context.Context, cfg WatchConfig, runLoop WatchLoopFunc) error
 	// The default log is named per root pair, so say where it is.
 	logger.Printf("syncd watch: local=%s remote=%s log=%s", cfg.LocalRoot, cfg.RemoteRoot, paths.LogPath)
 
-	lock, err := runtime.AcquireLock(paths.LockPath)
+	release, err := runtime.AcquirePairLocks(paths.LockPath, paths.StateDir, originalLocal, originalRemote)
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer release()
 
 	if err := runtime.CheckRemoteCanary(cfg.RemoteRoot); err != nil {
 		return err

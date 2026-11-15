@@ -247,7 +247,12 @@ func TestTrashReserveIsExclusive(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			p, err := tr.reserve("/some/root", "a/b.txt")
+			parent, name, err := tr.reserveEntry("/some/root", "a/b.txt")
+			var p string
+			if err == nil {
+				p = filepath.Join(parent.Name(), name)
+				parent.Close()
+			}
 			if err != nil {
 				t.Error(err)
 			}

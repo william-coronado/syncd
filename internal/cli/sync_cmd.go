@@ -207,11 +207,11 @@ func runSyncJob(ctx context.Context, job SyncJob, ropts syncRunOptions) error {
 	if err != nil {
 		return fmt.Errorf("job %q: resolve lock path: %w", job.Name, err)
 	}
-	lock, err := runtime.AcquireLock(lockPath)
+	release, err := runtime.AcquirePairLocks(lockPath, filepath.Dir(lockPath), job.Left, job.Right)
 	if err != nil {
 		return fmt.Errorf("job %q: another sync is already running for this job: %w", job.Name, err)
 	}
-	defer lock.Release()
+	defer release()
 
 	// execute.RunActions (the --hash/robust path) has no ProgressSink
 	// parameter, so a bar started here would never see AddBytes and would

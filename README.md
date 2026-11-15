@@ -360,8 +360,16 @@ fsnotify-driven scoped reconcile — see "`syncd watch`" above.
 Symlinks and their descendants are excluded from reconciliation. File reads,
 transfers, moves, deletions, and directory operations are confined to the
 configured roots even if a parent is replaced by a symlink during a cycle.
-Robust uploads, downloads, and deletions recheck the destination's full
-modification timestamp and content hash before changing it.
+Robust overwrites and deletes move the current entry into a private holding
+directory before checking its identity, full modification timestamp, and
+content hash. Transfers publish without replacing any new entry at the
+destination name. A process that already has the old file open can still
+write to that file after the check.
+
+If a crash or concurrent recreation leaves a `.syncd-hold-...` directory,
+sync pauses reconciliation there. Inspect and recover the retained file
+before removing the holding directory and retrying. If the share supports
+neither exclusive rename nor hard links, a guarded transfer reports an error.
 
 Names that differ only by case, including directory components, stop the
 cycle before any transfers or deletions. This applies on all filesystems so
@@ -405,11 +413,12 @@ flags** — its db paths under `~/.local/state/syncd/` (`jobs.db`, and each
 `--hash` job's own `hash-<id>.db`) are currently fixed and not
 user-overridable.
 
-With the default state directory, `sync` and `watch` share an exclusive
-lock for each canonical root pair, regardless of root order or job name.
-Symlinked root aliases use the same lock. Explicit watch state/lock overrides
-must point at the shared lock if one-off sync jobs also use those roots.
-Restart existing watch services after upgrading to adopt the shared lock name.
+`sync` and `watch` share a lock for each resolved root pair, regardless of
+root order, casing, or job name. Compatibility locks cover the former names
+for the configured roots during upgrades. Stop older processes before
+upgrading if they use different path spellings or custom watch state
+locations. Watch still honors its explicit lock path in addition to the
+shared lock.
 
 The robust engine validates a remote canary
 file (`.synclock`) before touching the remote — `syncd init` bootstraps it,

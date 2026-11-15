@@ -2,13 +2,14 @@ package execute
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+	"syncd/internal/fs"
 	"syncd/internal/reconcile"
 )
 
@@ -52,7 +53,12 @@ func TestApplyFastTask_DeleteFailsSafelyWhenPathIsActuallyANonEmptyDirectory(t *
 		t.Fatalf("write unexpected.txt: %v", err)
 	}
 
-	err := applyFastTask(left, "", reconcile.FastTask{Type: reconcile.DeleteL, RelPath: "was-a-file"}, nil)
+	tree, err := fs.OpenTree(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+	err = applyFastTask(tree, nil, reconcile.FastTask{Type: reconcile.DeleteL, RelPath: "was-a-file"}, nil)
 	if err == nil {
 		t.Fatal("expected an error deleting a non-empty directory where a file was expected, got nil")
 	}
@@ -86,16 +92,16 @@ func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirector
 
 	// Force the Rename→fallback path by making the rename always fail.
 	origRename := renameFunc
-	renameFunc = func(_, _, _, _ string) error {
-		return fmt.Errorf("simulated cross-device rename failure")
+	renameFunc = func(_ *fs.Tree, _ string, _ *fs.Tree, _ string, _ bool) error {
+		return unix.EXDEV
 	}
 	defer func() { renameFunc = origRename }()
 
 	// Simulate the copy succeeding, then the TOCTOU race replacing src with a
 	// non-empty directory before moveFastFile's os.Remove(src) runs.
 	origCopy := copyFunc
-	copyFunc = func(srcRoot, srcRel, dstRoot, dstRel string) error {
-		srcPath, dstPath := filepath.Join(srcRoot, srcRel), filepath.Join(dstRoot, dstRel)
+	copyFunc = func(srcRoot *fs.Tree, srcRel string, dstRoot *fs.Tree, dstRel string) error {
+		srcPath, dstPath := filepath.Join(srcRoot.Name(), srcRel), filepath.Join(dstRoot.Name(), dstRel)
 		if err := os.WriteFile(dstPath, []byte("hi"), 0o644); err != nil {
 			return err
 		}
@@ -109,7 +115,12 @@ func TestApplyFastTask_MoveFallbackRemoveFailsSafelyWhenSourceIsNonEmptyDirector
 	}
 	defer func() { copyFunc = origCopy }()
 
-	err := applyFastTask(root, root, reconcile.FastTask{
+	tree, err := fs.OpenTree(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+	err = applyFastTask(tree, tree, reconcile.FastTask{
 		Type: reconcile.MoveR, RelPath: "new/moved", OldRelPath: "old",
 	}, nil)
 	if err == nil {

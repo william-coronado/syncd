@@ -39,7 +39,14 @@ import (
 // one beneath a skipped directory) is left completely alone this cycle: no
 // create, no delete, no baseline change (review finding P1 #2, Codex).
 func reconcileDirectories(logger *runtime.Logger, localRoot, remoteRoot string, localDirs, remoteDirs, dirBaseline map[string]struct{}, skipped reconcile.SkipSet) (toAdd, toRemove []string, failures int) {
-	return applyDirOps(logger, localRoot, remoteRoot, planDirectories(localDirs, remoteDirs, dirBaseline, skipped))
+	local, remote, err := openTrees(localRoot, remoteRoot)
+	if err != nil {
+		logger.Warn("open directories", map[string]any{"error": err.Error()})
+		return nil, nil, 1
+	}
+	defer local.Close()
+	defer remote.Close()
+	return applyDirOps(logger, local, remote, planDirectories(localDirs, remoteDirs, dirBaseline, skipped))
 }
 
 // DirOpKind is one directory operation planDirectories can decide on. The
@@ -148,7 +155,7 @@ func planDirectories(localDirs, remoteDirs, dirBaseline map[string]struct{}, ski
 // aborting - a directory create/delete failure never loses file data
 // (os.Remove is non-recursive and refuses a non-empty directory), and a
 // failed op leaves the baseline unchanged for that path.
-func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []DirOp) (toAdd, toRemove []string, failures int) {
+func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot *fs.Tree, ops []DirOp) (toAdd, toRemove []string, failures int) {
 	for _, op := range ops {
 		var err error
 		var what string
@@ -164,9 +171,9 @@ func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []Dir
 		case DirRemoveRemote:
 			what, err = "failed to remove remote directory", removeEmptyDirInRoot(remoteRoot, op.Path)
 		case DirCreateLocal:
-			what, err = "failed to create local directory", fs.MkdirInRoot(localRoot, filepath.FromSlash(op.Path))
+			what, err = "failed to create local directory", localRoot.MkdirAll(filepath.FromSlash(op.Path))
 		case DirCreateRemote:
-			what, err = "failed to create remote directory", fs.MkdirInRoot(remoteRoot, filepath.FromSlash(op.Path))
+			what, err = "failed to create remote directory", remoteRoot.MkdirAll(filepath.FromSlash(op.Path))
 		}
 		if err != nil {
 			failures++
@@ -194,7 +201,17 @@ func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot string, ops []Dir
 // parent: removing "sub/nested/emptied" (itself emptied by a delete) can in
 // turn empty "sub/nested", and so on up the tree. Candidates are visited
 // deepest-first, and non-recursive removal leaves non-empty directories intact.
-func cleanupEmptiedDirs(localRoot, remoteRoot string, deletedRelPaths []string) {
+func cleanupEmptiedDirs(localRoot, remoteRoot string, paths []string) {
+	local, remote, err := openTrees(localRoot, remoteRoot)
+	if err != nil {
+		return
+	}
+	defer local.Close()
+	defer remote.Close()
+	cleanupEmptiedDirsInTrees(local, remote, paths)
+}
+
+func cleanupEmptiedDirsInTrees(localRoot, remoteRoot *fs.Tree, deletedRelPaths []string) {
 	touched := make(map[string]struct{})
 	for _, relPath := range deletedRelPaths {
 		for dir := path.Dir(relPath); dir != "."; dir = path.Dir(dir) {
@@ -213,9 +230,9 @@ func cleanupEmptiedDirs(localRoot, remoteRoot string, deletedRelPaths []string) 
 	}
 }
 
-func removeEmptyDirInRoot(root, rel string) error {
+func removeEmptyDirInRoot(root *fs.Tree, rel string) error {
 	// Lstat verifies this is still a directory; Remove remains non-recursive.
-	info, err := fs.LstatInRoot(root, filepath.FromSlash(rel))
+	info, err := root.Lstat(filepath.FromSlash(rel))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -225,7 +242,7 @@ func removeEmptyDirInRoot(root, rel string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("not a directory: %s", rel)
 	}
-	err = fs.RemoveInRoot(root, filepath.FromSlash(rel))
+	err = root.Remove(filepath.FromSlash(rel), true)
 	if os.IsNotExist(err) {
 		return nil
 	}

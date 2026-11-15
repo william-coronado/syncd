@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 // AtomicCopyFile is the unscoped convenience API. Sync operations use
@@ -20,12 +22,32 @@ func AtomicCopyFile(srcPath, dstPath string) error {
 }
 
 func AtomicCopyFileInRoots(srcRoot, srcRel, dstRoot, dstRel string) error {
-	source, err := openSyncRoot(srcRoot)
+	source, err := OpenTree(srcRoot)
 	if err != nil {
 		return err
 	}
 	defer source.Close()
-	src, err := openRegularInRoot(source, srcRel)
+	dest, err := OpenTree(dstRoot)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+	return CopyBetween(source, srcRel, dest, dstRel)
+}
+
+func CopyBetween(source *Tree, srcRel string, dest *Tree, dstRel string) error {
+	return copyBetween(source, srcRel, dest, dstRel, nil, false, nil)
+}
+
+// CopyChecked stages the incoming data before taking the destination out
+// of circulation. The check sees the actual displaced entry, and an entry
+// created concurrently at the final name is never overwritten.
+func CopyChecked(source *Tree, srcRel string, dest *Tree, dstRel string, present bool, check EntryCheck, preserve func(*Tree, string) error) error {
+	return copyBetween(source, srcRel, dest, dstRel, check, !present, preserve)
+}
+
+func copyBetween(source *Tree, srcRel string, dest *Tree, dstRel string, check EntryCheck, absent bool, preserve func(*Tree, string) error) error {
+	src, err := source.openRegular(srcRel)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
@@ -34,41 +56,73 @@ func AtomicCopyFileInRoots(srcRoot, srcRel, dstRoot, dstRel string) error {
 	if err != nil {
 		return err
 	}
-	dest, err := openSyncRoot(dstRoot)
+	parent, leaf, err := dest.parent(dstRel, 0o755)
 	if err != nil {
 		return err
 	}
-	defer dest.Close()
-	if err := checkPath(dest, dstRel); err != nil {
-		return err
-	}
-	if err := dest.MkdirAll(filepath.Dir(dstRel), 0o755); err != nil {
-		return err
-	}
-	tmp, tmpPath, err := createTempSiblingInRoot(dest, dstRel, srcInfo.Mode().Perm())
+	defer parent.Close()
+	tmp, tmpName, err := createTempSibling(parent, leaf, srcInfo.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	defer tmp.Close()
-	defer dest.Remove(tmpPath)
+	defer unix.Unlinkat(fd(parent), tmpName, 0)
 	if _, err := io.Copy(tmp, src); err != nil {
 		return fmt.Errorf("copy bytes: %w", err)
 	}
-	// Root.Chtimes confines traversal and does not follow a concurrently
-	// substituted final symlink on Unix. Keep the source's full precision.
-	if err := dest.Chtimes(tmpPath, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
+	ts := unix.NsecToTimespec(srcInfo.ModTime().UnixNano())
+	if err := unix.UtimesNanoAt(fd(parent), tmpName, []unix.Timespec{ts, ts}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("set temp mtime: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %w", err)
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
+		return err
 	}
-	if err := dest.Rename(tmpPath, dstRel); err != nil {
-		return fmt.Errorf("rename temp into place: %w", err)
+	if err := dest.verifyParent(dstRel, parent); err != nil {
+		return err
 	}
-	return nil
+	if absent {
+		return publishExclusive(parent, tmpName, parent, leaf)
+	}
+	if check == nil {
+		if info, err := statAt(parent, leaf); err == nil && !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing to replace non-regular entry: %s", dstRel)
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return unix.Renameat(fd(parent), tmpName, fd(parent), leaf)
+	}
+	claimed, finish, err := claimEntry(parent, leaf)
+	if err != nil {
+		return err
+	}
+	if err := check(claimed, leaf); err != nil {
+		return finish(err)
+	}
+	if preserve != nil {
+		if err := preserve(claimed, leaf); err != nil {
+			return finish(err)
+		}
+		if err := check(claimed, leaf); err != nil {
+			return finish(err)
+		}
+	}
+	if err := publishExclusive(parent, tmpName, parent, leaf); err != nil {
+		return finish(err)
+	}
+	// Detect edits to an already-open displaced file during publication.
+	// Leave it available for recovery if it changed or removal failed.
+	checkErr := check(claimed, leaf)
+	if checkErr == nil {
+		checkErr = claimed.Remove(leaf, false)
+	}
+	if checkErr != nil {
+		claimed.Close()
+		return fmt.Errorf("replacement published, original retained at %s: %w", filepath.Join(claimed.Name(), leaf), checkErr)
+	}
+	return finish(nil)
 }
 
 // tempFileInfix marks every atomic-write staging filename tempSiblingPath
@@ -132,18 +186,11 @@ const maxTempSiblingAttempts = 5
 // O_TRUNC alone would clobber a stale leftover temp file from a crashed
 // prior run, or the vanishingly rare genuine name collision, instead of
 // failing or picking a different name (review finding, Gemini 3.6).
-func createTempSiblingInRoot(root *os.Root, dstPath string, perm os.FileMode) (*os.File, string, error) {
+func createTempSibling(parent *os.File, dstName string, perm os.FileMode) (*os.File, string, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxTempSiblingAttempts; attempt++ {
-		tmpPath := tempSiblingPathFunc(dstPath)
-		if filepath.IsAbs(tmpPath) {
-			var err error
-			tmpPath, err = filepath.Rel(root.Name(), tmpPath)
-			if err != nil {
-				return nil, "", err
-			}
-		}
-		tmp, err := root.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+		tmpPath := filepath.Base(tempSiblingPathFunc(filepath.Join(parent.Name(), dstName)))
+		tmp, err := openAt(parent, tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 		if err == nil {
 			return tmp, tmpPath, nil
 		}

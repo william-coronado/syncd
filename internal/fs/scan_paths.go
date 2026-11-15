@@ -26,6 +26,17 @@ import (
 // independently, so ScanPaths does not abort on anything short of a caller
 // bug (there is no ctx to cancel).
 func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db.ManifestRow, policy HashPolicy, validateSMBName bool, matcher *IgnoreMatcher) (ScanResult, error) {
+	tree, err := OpenTree(root)
+	if err != nil {
+		return ScanResult{}, err
+	}
+	defer tree.Close()
+	return tree.ScanPaths(relPaths, manifest, policy, validateSMBName, matcher)
+}
+
+func (tree *Tree) ScanPaths(relPaths map[string]struct{}, manifest map[string]db.ManifestRow, policy HashPolicy, validateSMBName bool, matcher *IgnoreMatcher) (ScanResult, error) {
+	root := tree.Name()
+
 	result := ScanResult{
 		Files:       make(map[string]FileEntry),
 		Skipped:     make(map[string]struct{}),
@@ -38,7 +49,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 			continue
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
-		info, err := LstatInRoot(root, filepath.FromSlash(rel))
+		info, err := tree.Lstat(filepath.FromSlash(rel))
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue // absent on this side
@@ -53,14 +64,6 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 		}
 		if info.IsDir() {
 			continue // scoped incremental handles files; dirs via deep scan
-		}
-		// Symlinks are never followed (see ScanTree's doc comment for why);
-		// devices/sockets/FIFOs are skipped the same way so hashing one
-		// can't block forever.
-		if info.Mode()&os.ModeSymlink != 0 {
-			result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: "symlink not supported"})
-			result.Skipped[rel] = struct{}{}
-			continue
 		}
 		if !info.Mode().IsRegular() {
 			result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: "not a regular file"})
@@ -78,7 +81,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 		switch policy {
 		case HashNever:
 		case HashAlways:
-			h, hashErr := FileBLAKE3InRoot(root, filepath.FromSlash(rel))
+			h, hashErr := hashRegularInRoot(tree, filepath.FromSlash(rel))
 			if hashErr != nil {
 				result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 				result.Skipped[rel] = struct{}{}
@@ -89,7 +92,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 			if row, ok := manifest[rel]; ok && row.Size == size && row.Mtime == mtime && mtime < scanStart {
 				hash = row.Hash
 			} else {
-				h, hashErr := FileBLAKE3InRoot(root, filepath.FromSlash(rel))
+				h, hashErr := hashRegularInRoot(tree, filepath.FromSlash(rel))
 				if hashErr != nil {
 					result.Issues = append(result.Issues, ScanIssue{Path: rel, Reason: fmt.Sprintf("hash file: %s", hashErr)})
 					result.Skipped[rel] = struct{}{}
@@ -98,7 +101,7 @@ func ScanPaths(root string, relPaths map[string]struct{}, manifest map[string]db
 				hash = h
 			}
 		}
-		result.Files[rel] = FileEntry{Path: rel, AbsPath: abs, Size: size, Mtime: mtime, Hash: hash, ModTime: info.ModTime()}
+		result.Files[rel] = FileEntry{Path: rel, AbsPath: abs, Size: size, Mtime: mtime, Hash: hash, ModTime: info.ModTime(), Info: info}
 	}
 	return result, nil
 }

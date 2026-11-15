@@ -27,36 +27,19 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 		return Result{Action: action, Error: fmt.Errorf("conflict requires local and remote versions: %s", action.Path)}
 	}
 
-	localCanonicalPath := filepath.FromSlash(action.Path)
-	remoteCanonicalPath := filepath.FromSlash(action.Path)
-
-	conflictRel, err := findAvailableConflictPath(state.LocalRoot, state.RemoteRoot, action.Path, timeNow().UTC())
+	rel := filepath.FromSlash(action.Path)
+	conflictRel, err := findAvailableConflictInTrees(state.LocalTree, state.RemoteTree, action.Path, timeNow().UTC())
 	if err != nil {
 		return Result{Action: action, Error: err}
 	}
-	localConflictPath := filepath.FromSlash(conflictRel)
-	remoteConflictPath := filepath.FromSlash(conflictRel)
-
-	if err := fs.MkdirInRoot(state.LocalRoot, filepath.Dir(localConflictPath)); err != nil {
-		return Result{Action: action, Error: fmt.Errorf("prepare local conflict parent: %w", err)}
+	conflictName := filepath.FromSlash(conflictRel)
+	preserve := func(held *fs.Tree, leaf string) error {
+		return fs.CopyChecked(held, leaf, state.LocalTree, conflictName, false, nil, nil)
 	}
-	if err := fs.RenameInRoots(state.LocalRoot, localCanonicalPath, state.LocalRoot, localConflictPath); err != nil {
-		return Result{Action: action, Error: fmt.Errorf("rename local conflict file: %w", err)}
+	if err := fs.CopyChecked(state.RemoteTree, rel, state.LocalTree, rel, true, checkObserved(local), preserve); err != nil {
+		return Result{Action: action, Error: fmt.Errorf("download remote canonical for conflict: %w", err)}
 	}
-	if err := fs.AtomicCopyFileInRoots(state.RemoteRoot, remoteCanonicalPath, state.LocalRoot, localCanonicalPath); err != nil {
-		// Best-effort rollback: put the local original back so this failed
-		// cycle doesn't leave localCanonicalPath looking deleted - without
-		// this, that only gets fixed by a LATER cycle's scan/plan noticing
-		// "local deleted, remote changed vs. manifest" and re-downloading
-		// (review finding, Gemini 3.6). If the rollback itself fails too,
-		// surface both errors - the caller needs to know the file is
-		// genuinely missing, not just that the download failed.
-		if rerr := fs.RenameInRoots(state.LocalRoot, localConflictPath, state.LocalRoot, localCanonicalPath); rerr != nil {
-			return Result{Action: action, Error: fmt.Errorf("download remote canonical after conflict rename: %w (rollback also failed, local file may be missing: %v)", err, rerr)}
-		}
-		return Result{Action: action, Error: fmt.Errorf("download remote canonical after conflict rename: %w", err)}
-	}
-	if err := fs.AtomicCopyFileInRoots(state.LocalRoot, localConflictPath, state.RemoteRoot, remoteConflictPath); err != nil {
+	if err := fs.CopyChecked(state.LocalTree, conflictName, state.RemoteTree, conflictName, false, nil, nil); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("upload conflict copy to remote: %w", err)}
 	}
 
@@ -96,24 +79,38 @@ func runConflict(state SyncState, action reconcile.Action) Result {
 // The pair lock serializes syncd processes; other writers can still race
 // with this check, so the actual filesystem operations remain confined.
 func findAvailableConflictPath(localRoot, remoteRoot, relPath string, ts time.Time) (string, error) {
+	local, err := fs.OpenTree(localRoot)
+	if err != nil {
+		return "", err
+	}
+	defer local.Close()
+	remote, err := fs.OpenTree(remoteRoot)
+	if err != nil {
+		return "", err
+	}
+	defer remote.Close()
+	return findAvailableConflictInTrees(local, remote, relPath, ts)
+}
+
+func findAvailableConflictInTrees(local, remote *fs.Tree, relPath string, ts time.Time) (string, error) {
 	for attempt := 0; attempt < maxConflictPathAttempts; attempt++ {
 		candidate := conflictPathAttempt(relPath, ts, attempt)
-		localP := filepath.Join(localRoot, filepath.FromSlash(candidate))
-		remoteP := filepath.Join(remoteRoot, filepath.FromSlash(candidate))
-		if !pathExists(localP) && !pathExists(remoteP) {
+		_, lerr := local.Stat(filepath.FromSlash(candidate))
+		_, rerr := remote.Stat(filepath.FromSlash(candidate))
+		if lerr != nil && !os.IsNotExist(lerr) {
+			return "", lerr
+		}
+		if rerr != nil && !os.IsNotExist(rerr) {
+			return "", rerr
+		}
+		if os.IsNotExist(lerr) && os.IsNotExist(rerr) {
 			return candidate, nil
 		}
 	}
 	return "", fmt.Errorf("no available conflict filename for %s after %d attempts", relPath, maxConflictPathAttempts)
 }
 
-// maxConflictPathAttempts bounds findAvailableConflictPath's search.
 const maxConflictPathAttempts = 1000
-
-func pathExists(p string) bool {
-	_, err := os.Lstat(p)
-	return err == nil
-}
 
 func conflictPath(relPath string, ts time.Time) string {
 	return conflictPathAttempt(relPath, ts, 0)

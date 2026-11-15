@@ -197,6 +197,12 @@ func (e *robustHardError) Unwrap() error { return e.err }
 // ApplyUpdates failed - see its doc comment), or the bare execute.RunActions
 // runErr (e.g. context cancellation) after a manifest commit was attempted.
 func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, error) {
+	local, remote, err := openTrees(p.LocalRoot, p.RemoteRoot)
+	if err != nil {
+		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
+	}
+	defer local.Close()
+	defer remote.Close()
 	manifest, err := p.Repo.LoadAll(ctx)
 	if err != nil {
 		return reconcile.Plan{}, 0, &robustHardError{stage: "load manifest", err: err}
@@ -208,7 +214,7 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 		return reconcile.Plan{}, 0, &robustHardError{stage: "load dir manifest", err: err}
 	}
 
-	scans, err := fs.ScanPair(ctx, p.LocalRoot, p.RemoteRoot, manifest, p.Policy, scanProgressLogger(p.Logger))
+	scans, err := fs.ScanTrees(ctx, local, remote, manifest, p.Policy, scanProgressLogger(p.Logger))
 	if err != nil {
 		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
 	}
@@ -242,8 +248,9 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	}
 
 	state := execute.SyncState{
-		LocalRoot:   p.LocalRoot,
-		RemoteRoot:  p.RemoteRoot,
+		LocalRoot:  p.LocalRoot,
+		RemoteRoot: p.RemoteRoot,
+		LocalTree:  local, RemoteTree: remote,
 		LocalFiles:  localFiles,
 		RemoteFiles: remoteFiles,
 		Trash:       p.Trash,
@@ -256,9 +263,9 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 
-	dirsToAdd, dirsToRemove, dirFailures := applyDirOps(p.Logger, p.LocalRoot, p.RemoteRoot, dirOps)
+	dirsToAdd, dirsToRemove, dirFailures := applyDirOps(p.Logger, local, remote, dirOps)
 	failures += dirFailures
-	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
+	cleanupEmptiedDirsInTrees(local, remote, deletes)
 
 	noopUpserts, noopDeletes := noopManifestUpdates(plan, localFiles, remoteFiles, manifest)
 	upserts = append(upserts, noopUpserts...)
@@ -401,11 +408,17 @@ func collectManifestUpdates(results []execute.Result, logger *runtime.Logger) (u
 // manifest-commit flow. Directories outside the batch's subtrees (e.g. new
 // empty directories elsewhere) are left to the periodic full cycles.
 func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]struct{}) (reconcile.Plan, int, error) {
-	matcher, err := fs.LoadIgnoreMatcher(p.LocalRoot)
+	local, remote, err := openTrees(p.LocalRoot, p.RemoteRoot)
+	if err != nil {
+		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
+	}
+	defer local.Close()
+	defer remote.Close()
+	matcher, err := local.LoadIgnoreMatcher()
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	subtrees, prefixes, unknown := scopedSubtrees(p.LocalRoot, p.RemoteRoot, relPaths, matcher)
+	subtrees, prefixes, unknown := scopedSubtrees(local, remote, relPaths, matcher)
 
 	// Only this batch's rows (plus everything beneath its directory
 	// paths): loading the whole manifest per fsnotify batch made the
@@ -425,24 +438,24 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	}
 	remoteManifest := db.RemoteStatView(scopedManifest)
 
-	localScan, err := fs.ScanPaths(p.LocalRoot, relPaths, scopedManifest, p.Policy, true, matcher)
+	localScan, err := local.ScanPaths(relPaths, scopedManifest, p.Policy, true, matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
-	remoteScan, err := fs.ScanPaths(p.RemoteRoot, relPaths, remoteManifest, p.Policy, false, matcher)
+	remoteScan, err := remote.ScanPaths(relPaths, remoteManifest, p.Policy, false, matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, err
 	}
 	for _, st := range subtrees {
 		if st.local {
-			sub, err := fs.ScanSubtree(ctx, p.LocalRoot, st.rel, scopedManifest, true, matcher, p.Policy)
+			sub, err := local.Scan(ctx, st.rel, scopedManifest, true, matcher, p.Policy, nil)
 			if err != nil {
 				return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
 			}
 			mergeScanResult(&localScan, sub)
 		}
 		if st.remote {
-			sub, err := fs.ScanSubtree(ctx, p.RemoteRoot, st.rel, remoteManifest, false, matcher, p.Policy)
+			sub, err := remote.Scan(ctx, st.rel, remoteManifest, false, matcher, p.Policy, nil)
 			if err != nil {
 				return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
 			}
@@ -472,6 +485,25 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	if err := fs.CheckCaseAliases(scopedManifest, localScan, remoteScan); err != nil {
 		return reconcile.Plan{}, 0, err
 	}
+	dirRepo := db.NewDirRepo(p.DB)
+	dirBaseline, err := dirRepo.LoadAll(ctx)
+	if err != nil {
+		return reconcile.Plan{}, 0, &robustHardError{stage: "load dir manifest", err: err}
+	}
+	baselineNames, err := p.Repo.LoadNames(ctx)
+	if err != nil {
+		return reconcile.Plan{}, 0, err
+	}
+	activePaths := make(map[string]struct{})
+	for rel := range relPaths {
+		if !matcher.MatchPathOrAncestor(rel, true) || !matcher.MatchPathOrAncestor(rel, false) {
+			activePaths[rel] = struct{}{}
+		}
+	}
+	if err := fs.CheckScopedCaseAliases(local, remote, activePaths, baselineNames, dirBaseline, localScan, remoteScan); err != nil {
+		return reconcile.Plan{}, 0, err
+	}
+
 	skipped := mergeSkipSet(localScan, remoteScan)
 	plan := reconcile.BuildPlan(localScan.Files, remoteScan.Files, scopedManifest, skipped)
 	if _, err := p.applyFirstSync(&plan, localScan.Files, remoteScan.Files, scopedManifest, func() (bool, error) {
@@ -488,19 +520,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 		return plan, 0, err
 	}
 
-	// Loaded BEFORE executing anything: once file actions have run, nothing
-	// that can fail on a cancelled ctx may stand between them and
-	// commitManifestUpdates, or completed changes would go unrecorded in
-	// the three-way baseline.
-	dirRepo := db.NewDirRepo(p.DB)
-	var dirBaseline map[string]struct{}
-	if len(subtrees) > 0 {
-		if dirBaseline, err = dirRepo.LoadAll(ctx); err != nil {
-			return plan, 0, &robustHardError{stage: "load dir manifest", err: err}
-		}
-	}
-
-	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files, Trash: p.Trash}
+	state := execute.SyncState{LocalRoot: p.LocalRoot, RemoteRoot: p.RemoteRoot, LocalTree: local, RemoteTree: remote, LocalFiles: localScan.Files, RemoteFiles: remoteScan.Files, Trash: p.Trash}
 	results, runErr := execute.RunActions(ctx, p.Workers, state, execActions)
 	p.recordDeletes(results, approved)
 	scopedActionsDone()
@@ -509,11 +529,10 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	var dirsToAdd, dirsToRemove []string
 	if len(subtrees) > 0 {
 		var dirFailures int
-		dirsToAdd, dirsToRemove, dirFailures = reconcileDirectories(p.Logger, p.LocalRoot, p.RemoteRoot,
-			localScan.Dirs, remoteScan.Dirs, baselineWithin(dirBaseline, subtrees), skipped)
+		dirsToAdd, dirsToRemove, dirFailures = applyDirOps(p.Logger, local, remote, planDirectories(localScan.Dirs, remoteScan.Dirs, baselineWithin(dirBaseline, subtrees), skipped))
 		failures += dirFailures
 	}
-	cleanupEmptiedDirs(p.LocalRoot, p.RemoteRoot, deletes)
+	cleanupEmptiedDirsInTrees(local, remote, deletes)
 
 	noopUpserts, noopDeletes := noopManifestUpdates(plan, localScan.Files, remoteScan.Files, scopedManifest)
 	upserts = append(upserts, noopUpserts...)
@@ -543,10 +562,10 @@ type scopedUnknown struct {
 	err       error
 }
 
-// scopedLstat is os.Lstat, indirected so tests can simulate a permission
+// scopedLstat is Tree.Lstat, indirected so tests can simulate a permission
 // error on one side deterministically (chmod can't, when tests run as
 // root). Same pattern as watch's newTicker/newWatcher.
-var scopedLstat = os.Lstat
+var scopedLstat = (*fs.Tree).Lstat
 
 // scopedActionsDone runs right after RunRobustScoped's file actions finish;
 // a no-op in production. Tests use it to cancel ctx at exactly that point.
@@ -563,12 +582,9 @@ var scopedActionsDone = func() {}
 // not-existing is returned in unknown instead, and neither expanded nor
 // prefix-loaded: its state on that side is not known, so nothing beneath
 // it may be planned from this cycle (see RunRobustScoped).
-func scopedSubtrees(localRoot, remoteRoot string, relPaths map[string]struct{}, matcher *fs.IgnoreMatcher) ([]scopedSubtree, []string, []scopedUnknown) {
-	stat := func(root, rel string) (dir, missing bool, err error) {
-		if err := fs.CheckPath(root, filepath.FromSlash(rel)); err != nil {
-			return false, false, err
-		}
-		info, err := scopedLstat(filepath.Join(root, filepath.FromSlash(rel)))
+func scopedSubtrees(localRoot, remoteRoot *fs.Tree, relPaths map[string]struct{}, matcher *fs.IgnoreMatcher) ([]scopedSubtree, []string, []scopedUnknown) {
+	stat := func(root *fs.Tree, rel string) (dir, missing bool, err error) {
+		info, err := scopedLstat(root, filepath.FromSlash(rel))
 		if err != nil {
 			if os.IsNotExist(err) {
 				return false, true, nil
@@ -755,4 +771,17 @@ func logScanIssues(logger *runtime.Logger, side string, issues []fs.ScanIssue) {
 			"count": len(issues),
 		})
 	}
+}
+
+func openTrees(left, right string) (*fs.Tree, *fs.Tree, error) {
+	local, err := fs.OpenTree(left)
+	if err != nil {
+		return nil, nil, err
+	}
+	remote, err := fs.OpenTree(right)
+	if err != nil {
+		local.Close()
+		return nil, nil, err
+	}
+	return local, remote, nil
 }

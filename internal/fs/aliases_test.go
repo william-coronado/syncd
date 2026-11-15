@@ -27,3 +27,11 @@ func TestCheckCaseAliasesIncludesDirectoriesAndBaseline(t *testing.T) {
 		})
 	}
 }
+
+func TestCaseAliasesIncludeSkippedEntries(t *testing.T) {
+	local := ScanResult{Files: map[string]FileEntry{"report": {}}}
+	remote := ScanResult{Skipped: map[string]struct{}{"Report": {}}}
+	if err := CheckCaseAliases(nil, local, remote); err == nil {
+		t.Fatal("skipped entry was omitted from case checks")
+	}
+}

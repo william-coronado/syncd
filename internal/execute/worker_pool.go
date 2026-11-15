@@ -15,10 +15,11 @@ import (
 )
 
 type SyncState struct {
-	LocalRoot   string
-	RemoteRoot  string
-	LocalFiles  map[string]fs.FileEntry
-	RemoteFiles map[string]fs.FileEntry
+	LocalRoot             string
+	RemoteRoot            string
+	LocalTree, RemoteTree *fs.Tree
+	LocalFiles            map[string]fs.FileEntry
+	RemoteFiles           map[string]fs.FileEntry
 	// Trash, if set, receives deleted files that live on a local disk
 	// instead of their being removed outright (see fs.Trash). nil removes.
 	Trash *fs.Trash
@@ -37,6 +38,20 @@ type Result struct {
 }
 
 func RunActions(ctx context.Context, workers int, state SyncState, actions []reconcile.Action) ([]Result, error) {
+	if len(actions) > 0 && state.LocalTree == nil {
+		local, err := fs.OpenTree(state.LocalRoot)
+		if err != nil {
+			return nil, err
+		}
+		defer local.Close()
+		remote, err := fs.OpenTree(state.RemoteRoot)
+		if err != nil {
+			return nil, err
+		}
+		defer remote.Close()
+		state.LocalTree, state.RemoteTree = local, remote
+	}
+
 	if workers < 1 {
 		workers = 1
 	}
@@ -109,45 +124,31 @@ func RunActions(ctx context.Context, workers int, state SyncState, actions []rec
 // planned against a now-stale scan.
 var ErrDestinationChanged = errors.New("destination changed since scan; deferring to next cycle")
 
-// verifyDestinationUnchanged checks absPath against the scan's view of it:
-// scanned/present is the entry (if any) the scan recorded for that path on
-// the destination side. A path the scan saw absent must still be absent; a
-// path the scan saw must still be a regular file with the same size and
-// mtime. allowVanished tolerates a scanned path that has since disappeared
-// (correct for deletes, whose goal state is "absent" anyway).
-func verifyDestinationUnchanged(root, rel string, scanned fs.FileEntry, present, allowVanished bool) error {
-	info, err := fs.LstatInRoot(root, rel)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat destination: %w", err)
-		}
-		if !present || allowVanished {
-			return nil
-		}
-		return fmt.Errorf("%w (scanned present, now missing)", ErrDestinationChanged)
-	}
-	if !present {
-		return fmt.Errorf("%w (scanned absent, now exists)", ErrDestinationChanged)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%w (no longer a regular file)", ErrDestinationChanged)
-	}
-	if info.Size() != scanned.Size || info.ModTime().Unix() != scanned.Mtime || (!scanned.ModTime.IsZero() && !info.ModTime().Equal(scanned.ModTime)) {
-		return fmt.Errorf("%w (size/mtime %d/%d, scanned %d/%d)", ErrDestinationChanged, info.Size(), info.ModTime().Unix(), scanned.Size, scanned.Mtime)
-	}
-	// A coarse timestamp, or a writer that preserves timestamps, can hide
-	// an edit even when the stat matches. Robust scans have a content hash;
-	// validate it before a destructive action as well.
-	if scanned.Hash != "" {
-		hash, err := fs.FileBLAKE3InRoot(root, rel)
+// checkObserved validates the entry after it has been detached from the
+// destination name, so a concurrent pathname replacement cannot pass the
+// check and then be removed in its place.
+func checkObserved(scanned fs.FileEntry) fs.EntryCheck {
+	return func(tree *fs.Tree, rel string) error {
+		info, err := tree.Lstat(rel)
 		if err != nil {
-			return fmt.Errorf("verify destination content: %w", err)
+			return fmt.Errorf("%w: %v", ErrDestinationChanged, err)
 		}
-		if hash != scanned.Hash {
-			return fmt.Errorf("%w (content changed)", ErrDestinationChanged)
+		if !info.Mode().IsRegular() || (scanned.Info != nil && !fs.SameEntry(scanned.Info, info)) ||
+			info.Size() != scanned.Size || (!scanned.ModTime.IsZero() && !info.ModTime().Equal(scanned.ModTime)) ||
+			(scanned.Mtime != 0 && info.ModTime().Unix() != scanned.Mtime) {
+			return ErrDestinationChanged
 		}
+		if scanned.Hash != "" {
+			hash, err := tree.Hash(rel)
+			if err != nil {
+				return err
+			}
+			if hash != scanned.Hash {
+				return ErrDestinationChanged
+			}
+		}
+		return nil
 	}
-	return nil
 }
 
 func applyAction(state SyncState, action reconcile.Action) Result {
@@ -177,18 +178,21 @@ func runUpload(state SyncState, action reconcile.Action) Result {
 	if !ok {
 		return Result{Action: action, Error: fmt.Errorf("upload source missing: %s", action.Path)}
 	}
+	rel := filepath.FromSlash(action.Path)
 	scanned, present := state.RemoteFiles[action.Path]
-	if err := verifyDestinationUnchanged(state.RemoteRoot, filepath.FromSlash(action.Path), scanned, present, false); err != nil {
-		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
-	}
+	var preserve func(*fs.Tree, string) error
 	if action.PreserveDest {
-		if err := state.Trash.Preserve(state.RemoteRoot, action.Path); err != nil {
-			return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
+		preserve = func(held *fs.Tree, leaf string) error {
+			return state.Trash.PreserveFrom(held, leaf, state.RemoteRoot, action.Path)
 		}
 	}
-	if err := fs.AtomicCopyFileInRoots(state.LocalRoot, relativeSource(state.LocalRoot, local), state.RemoteRoot, filepath.FromSlash(action.Path)); err != nil {
+	if err := fs.CopyChecked(state.LocalTree, relativeSource(state.LocalTree.Name(), local), state.RemoteTree, rel, present, checkObserved(scanned), preserve); err != nil {
+		if os.IsExist(err) || os.IsNotExist(err) {
+			err = fmt.Errorf("%w: %v", ErrDestinationChanged, err)
+		}
 		return Result{Action: action, Error: fmt.Errorf("upload %s: %w", action.Path, err)}
 	}
+
 	return Result{
 		Action: action,
 		Updates: []ManifestUpdate{
@@ -204,18 +208,21 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 	if !ok {
 		return Result{Action: action, Error: fmt.Errorf("download source missing: %s", action.Path)}
 	}
+	rel := filepath.FromSlash(action.Path)
 	scanned, present := state.LocalFiles[action.Path]
-	if err := verifyDestinationUnchanged(state.LocalRoot, filepath.FromSlash(action.Path), scanned, present, false); err != nil {
-		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
-	}
+	var preserve func(*fs.Tree, string) error
 	if action.PreserveDest {
-		if err := state.Trash.Preserve(state.LocalRoot, action.Path); err != nil {
-			return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
+		preserve = func(held *fs.Tree, leaf string) error {
+			return state.Trash.PreserveFrom(held, leaf, state.LocalRoot, action.Path)
 		}
 	}
-	if err := fs.AtomicCopyFileInRoots(state.RemoteRoot, relativeSource(state.RemoteRoot, remote), state.LocalRoot, filepath.FromSlash(action.Path)); err != nil {
+	if err := fs.CopyChecked(state.RemoteTree, relativeSource(state.RemoteTree.Name(), remote), state.LocalTree, rel, present, checkObserved(scanned), preserve); err != nil {
+		if os.IsExist(err) || os.IsNotExist(err) {
+			err = fmt.Errorf("%w: %v", ErrDestinationChanged, err)
+		}
 		return Result{Action: action, Error: fmt.Errorf("download %s: %w", action.Path, err)}
 	}
+
 	return Result{
 		Action: action,
 		Updates: []ManifestUpdate{
@@ -227,20 +234,21 @@ func runDownload(state SyncState, action reconcile.Action) Result {
 }
 
 func runDelete(state SyncState, action reconcile.Action, deleteLocal bool) Result {
-	targetRoot, targetFiles := state.RemoteRoot, state.RemoteFiles
+	targetRoot, targetFiles := state.RemoteTree, state.RemoteFiles
 	if deleteLocal {
-		targetRoot, targetFiles = state.LocalRoot, state.LocalFiles
+		targetRoot, targetFiles = state.LocalTree, state.LocalFiles
 	}
 	// BuildPlan only deletes a path it saw, unchanged since the manifest, on
 	// the target side - so the target must still be exactly that file. If it
 	// was edited in the meantime, deleting it would destroy the edit.
 	scanned, present := targetFiles[action.Path]
-	if err := verifyDestinationUnchanged(targetRoot, filepath.FromSlash(action.Path), scanned, present, true); err != nil {
+	if !present {
+		return Result{Action: action, Error: ErrDestinationChanged}
+	}
+	if err := state.Trash.RemoveFrom(targetRoot, action.Path, checkObserved(scanned)); err != nil {
 		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
 	}
-	if err := state.Trash.Remove(targetRoot, action.Path); err != nil {
-		return Result{Action: action, Error: fmt.Errorf("delete %s: %w", action.Path, err)}
-	}
+
 	return Result{
 		Action: action,
 		Updates: []ManifestUpdate{

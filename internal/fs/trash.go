@@ -3,11 +3,14 @@ package fs
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // TrashDirName is the trash directory's name inside the state directory.
@@ -47,75 +50,134 @@ var (
 	isNetworkFS = isNetworkFilesystem
 )
 
-// Remove deletes root/rel, by moving it to the trash when it is a regular
-// file on a local disk. A path that is already gone is not an error. If the
-// file cannot be moved to the trash it is left in place and the error
-// returned: failing a delete (it is retried next run) is better than making
-// an unrecoverable one.
-//
-// Symlinks are rejected. Other non-regular paths use non-recursive removal, so
-// a path that has become a non-empty directory since the scan still fails
-// with ENOTEMPTY instead of being moved wholesale.
+// Remove moves a regular file to local trash or deletes it on a network mount.
 func (t *Trash) Remove(root, rel string) error {
-	abs := filepath.Join(root, filepath.FromSlash(rel))
-	if t == nil {
-		return removeInRootIfExists(root, filepath.FromSlash(rel))
-	}
-	info, err := LstatInRoot(root, filepath.FromSlash(rel))
+	source, err := OpenTree(root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return err
 	}
-	// Classified by the file's own directory, not the root: a root can
-	// contain a mount of a different kind.
-	if !info.Mode().IsRegular() || t.onNetwork(filepath.Dir(abs)) {
-		return removeInRootIfExists(root, filepath.FromSlash(rel))
-	}
-
-	dst, err := t.reserve(root, rel)
-	if err != nil {
-		return fmt.Errorf("move to trash: %w", err)
-	}
-	// dst is an empty file only this call owns, so replacing it is safe.
-	if err := RenameInRoots(root, filepath.FromSlash(rel), t.Dir, mustRelative(t.Dir, dst)); err == nil {
-		return nil
-	}
-	// Rename fails across filesystems (a tree on a different disk from the
-	// state directory): copy, then remove the original.
-	if err := AtomicCopyFileInRoots(root, filepath.FromSlash(rel), t.Dir, mustRelative(t.Dir, dst)); err != nil {
-		_ = os.Remove(dst)
-		return fmt.Errorf("move to trash: %w", err)
-	}
-	return removeInRootIfExists(root, filepath.FromSlash(rel))
+	defer source.Close()
+	return t.RemoveFrom(source, rel, nil)
 }
 
-// Preserve copies root/rel into the trash and leaves the original where it
-// is, for a file about to be overwritten rather than deleted. Unlike
-// Remove it applies to network filesystems too: the caller has decided
-// this one version is worth keeping. A path that does not exist, or is not
-// a regular file, is not an error and nothing is kept.
+// RemoveFrom claims the actual entry before checking or copying it. A writer
+// that replaces the original name after the claim keeps its replacement.
+func (t *Trash) RemoveFrom(source *Tree, rel string, check EntryCheck) error {
+	parent, leaf, err := source.parent(rel, 0)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	info, err := statAt(parent, leaf)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to remove non-regular entry: %s", rel)
+	}
+	claimed, finish, err := claimEntry(parent, leaf)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	current, err := claimed.Lstat(leaf)
+	if err != nil {
+		return finish(err)
+	}
+	if !SameEntry(info, current) || !current.Mode().IsRegular() {
+		return finish(fmt.Errorf("entry changed before removal: %s", rel))
+	}
+	if check != nil {
+		if err := check(claimed, leaf); err != nil {
+			return finish(err)
+		}
+	}
+	if t == nil || t.onNetwork(parent.Name()) {
+		return finish(claimed.Remove(leaf, false))
+	}
+	dst, name, err := t.reserveEntry(source.Name(), rel)
+	if err != nil {
+		return finish(fmt.Errorf("reserve trash entry: %w", err))
+	}
+	defer dst.Close()
+	err = moveIntoTrash(claimed, leaf, dst, name, false)
+	if errors.Is(err, unix.EXDEV) {
+		// The original name is already detached. Confirm that an open writer
+		// did not change the held file while we copied it across devices.
+		var original string
+		original, err = claimed.Hash(leaf)
+		if err == nil {
+			err = CopyBetween(claimed, leaf, dst, name)
+		}
+		if err == nil {
+			var copied, latest string
+			copied, err = dst.Hash(name)
+			if err == nil {
+				latest, err = claimed.Hash(leaf)
+			}
+			if err == nil && (latest != original || copied != original) {
+				err = fmt.Errorf("source changed during trash copy: %s", rel)
+			}
+		}
+		if err == nil && check != nil {
+			err = check(claimed, leaf)
+		}
+		if err == nil {
+			err = claimed.Remove(leaf, false)
+		}
+	}
+	if err != nil {
+		_ = dst.Remove(name, false)
+		return finish(fmt.Errorf("move to trash: %w", err))
+	}
+	return finish(nil)
+}
+
+// moveIntoTrash permits tests to simulate a separate device.
+var moveIntoTrash = RenameBetween
+
 func (t *Trash) Preserve(root, rel string) error {
 	if t == nil {
 		return nil
 	}
-	info, err := LstatInRoot(root, filepath.FromSlash(rel))
+	source, err := OpenTree(root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+		return err
+	}
+	defer source.Close()
+	info, err := source.Lstat(filepath.FromSlash(rel))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if !info.Mode().IsRegular() {
 		return nil
 	}
-	dst, err := t.reserve(root, rel)
-	if err != nil {
-		return fmt.Errorf("keep a copy in trash: %w", err)
+	return t.PreserveFrom(source, rel, root, rel)
+}
+
+// PreserveFrom copies an already claimed entry under its original trash name.
+func (t *Trash) PreserveFrom(source *Tree, name, originalRoot, originalRel string) error {
+	if t == nil {
+		return nil
 	}
-	if err := AtomicCopyFileInRoots(root, filepath.FromSlash(rel), t.Dir, mustRelative(t.Dir, dst)); err != nil {
-		_ = os.Remove(dst)
+	dst, leaf, err := t.reserveEntry(originalRoot, originalRel)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	if err := CopyBetween(source, filepath.FromSlash(name), dst, leaf); err != nil {
+		_ = dst.Remove(leaf, false)
 		return fmt.Errorf("keep a copy in trash: %w", err)
 	}
 	return nil
@@ -138,38 +200,50 @@ func RootFolder(root string) string {
 	return filepath.Base(root) + "-" + hex.EncodeToString(sum[:4])
 }
 
-// reserve creates, exclusively, an empty file at the trash destination for
-// root/rel and returns its path. O_EXCL makes the claim atomic across
-// processes; an existence check followed by a rename would let two
-// concurrent deletes pick the same name and the second replace the first.
-// When a file deleted earlier the same day already holds the plain name, a
-// time (and, if needed, a counter) suffix is tried.
-func (t *Trash) reserve(root, rel string) (string, error) {
-	now := trashNow()
-	base := filepath.Join(t.Dir, now.Format(trashDayLayout), RootFolder(root), filepath.FromSlash(rel))
-	// Owner-only: a file that was private because of its directory must not
-	// become readable by sitting in the trash.
-	if err := os.MkdirAll(filepath.Dir(base), 0o700); err != nil {
-		return "", err
+// reserveEntry returns the pinned parent that owns the exclusive reservation.
+// Copying and failure cleanup both use that same directory descriptor.
+func (t *Trash) reserveEntry(root, rel string) (*Tree, string, error) {
+	if !filepath.IsLocal(rel) || filepath.Clean(rel) == "." {
+		return nil, "", fmt.Errorf("invalid trash path: %q", rel)
 	}
-	stamped := base + "." + now.Format("150405")
+	stateDir := filepath.Dir(t.Dir)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, "", err
+	}
+	state, err := OpenTree(stateDir)
+	if err != nil {
+		return nil, "", err
+	}
+	defer state.Close()
+	now := trashNow()
+	base := filepath.Join(filepath.Base(t.Dir), now.Format(trashDayLayout), RootFolder(root), filepath.FromSlash(rel))
+	parent, leaf, err := state.parent(base, 0o700)
+	if err != nil {
+		return nil, "", err
+	}
 	for attempt := 0; attempt < 1000; attempt++ {
-		candidate := base
-		switch {
-		case attempt == 1:
-			candidate = stamped
-		case attempt > 1:
-			candidate = fmt.Sprintf("%s-%d", stamped, attempt)
+		candidate := leaf
+		if attempt == 1 {
+			candidate += "." + now.Format("150405")
+		} else if attempt > 1 {
+			candidate += fmt.Sprintf(".%s-%d", now.Format("150405"), attempt)
 		}
-		f, err := os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := openAt(parent, candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err == nil {
-			return candidate, f.Close()
+			if err := f.Close(); err != nil {
+				_ = unix.Unlinkat(fd(parent), candidate, 0)
+				parent.Close()
+				return nil, "", err
+			}
+			return &Tree{dir: parent}, candidate, nil
 		}
 		if !os.IsExist(err) {
-			return "", err
+			parent.Close()
+			return nil, "", err
 		}
 	}
-	return "", fmt.Errorf("no free trash name for %s", base)
+	parent.Close()
+	return nil, "", fmt.Errorf("no free trash name for %s", base)
 }
 
 func lexists(p string) bool {
@@ -184,11 +258,16 @@ func PruneTrash(dir string, keepDays int) (int, error) {
 	if keepDays <= 0 {
 		return 0, nil
 	}
-	entries, err := os.ReadDir(dir)
+	tree, err := OpenTree(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
+		return 0, err
+	}
+	defer tree.Close()
+	entries, err := tree.ReadDir(".")
+	if err != nil {
 		return 0, err
 	}
 	now := trashNow()
@@ -204,7 +283,7 @@ func PruneTrash(dir string, keepDays int) (int, error) {
 		if err != nil || !day.Before(cutoff) {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := pruneEntry(tree.dir, e.Name()); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -215,9 +294,32 @@ func PruneTrash(dir string, keepDays int) (int, error) {
 	return removed, firstErr
 }
 
-func removeInRootIfExists(root, rel string) error {
-	if err := RemoveInRoot(root, rel); err != nil && !os.IsNotExist(err) {
+// pruneEntry descends only through no-follow directory descriptors. A
+// symlink inside expired trash is removed as an entry, never traversed.
+func pruneEntry(parent *os.File, name string) error {
+	info, err := statAt(parent, name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	return nil
+	if !info.IsDir() {
+		return unix.Unlinkat(fd(parent), name, 0)
+	}
+	dir, err := openAt(parent, name, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	for _, child := range names {
+		if err := pruneEntry(dir, child); err != nil {
+			return err
+		}
+	}
+	return unix.Unlinkat(fd(parent), name, unix.AT_REMOVEDIR)
 }

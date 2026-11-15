@@ -26,7 +26,7 @@ func FileBLAKE3(path string) (string, error) {
 // FileBLAKE3InRoot hashes through a confined descriptor, never through an
 // absolute path whose parent might have been replaced by a symlink.
 func FileBLAKE3InRoot(root, rel string) (string, error) {
-	r, err := openSyncRoot(root)
+	r, err := OpenTree(root)
 	if err != nil {
 		return "", err
 	}
@@ -34,8 +34,8 @@ func FileBLAKE3InRoot(root, rel string) (string, error) {
 	return hashRegularInRoot(r, rel)
 }
 
-func hashRegularInRoot(r *os.Root, rel string) (string, error) {
-	f, err := openRegularInRoot(r, rel)
+func hashRegularInRoot(r *Tree, rel string) (string, error) {
+	f, err := r.openRegular(rel)
 	if err != nil {
 		return "", err
 	}
@@ -46,3 +46,5 @@ func hashRegularInRoot(r *os.Root, rel string) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
+
+func (t *Tree) Hash(rel string) (string, error) { return hashRegularInRoot(t, rel) }
