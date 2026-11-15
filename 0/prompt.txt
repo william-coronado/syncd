@@ -1,0 +1,44 @@
+Push
+
+---
+
+<bash-input>rm -rf /Volumes/dev/.syncd-review-probe.tmp</bash-input><bash-stdout>[No output was captured. The command ran in the terminal pane (tab 0); if it should have printed something, use read_terminal with tab_id "0" to check.]</bash-stdout><bash-stderr></bash-stderr>
+
+---
+
+merge the PR
+
+---
+
+switch to main and pull
+
+---
+
+can you write a deployment shell script and put it in /Users/william/, that:
+
+* compiles for this machine (macOS)
+* compiles for linux+amd64
+* copies the local binary to /Users/william/.local/bin and chmod +x
+* copies the linux binary to /home/william/.local/bin using william@192.168.50.44, and chmod +x
+
+I am not sure if I need to stop/uninstall/start services to pick up new binaries
+
+---
+
+Run it now
+
+---
+
+delete the codex/fix-sync-safety branch
+
+---
+
+delete the other two local branches too
+
+---
+
+update CLAUDE.md to reflect the new branch setup
+
+---
+
+Commit to main
