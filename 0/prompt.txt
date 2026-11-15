@@ -1,0 +1,21 @@
+Push
+
+---
+
+delete the conflict file here and on the share
+
+---
+
+add tools/syncd/syncd to ~/dev/.syncdignore
+
+---
+
+copy .syncdignore to the share now
+
+---
+
+commit the CLAUDE.md change for the deploy script
+
+---
+
+Add and commit
