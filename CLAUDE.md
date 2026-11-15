@@ -186,8 +186,13 @@ without checking the source path first (see the data-loss guard).
 `~/deploy-syncd.sh` (outside the repo) builds for this Mac and for linux/amd64,
 installs to `~/.local/bin/syncd` here and to `/home/william/.local/bin/syncd` on
 `william@192.168.50.44`, and restarts any running `syncd watch` service so it
-picks up the new binary (no service reinstall needed). Run it from a clean `main`:
-`~/deploy-syncd.sh --test`. Options: `--local-only`, `--remote-only`, `--no-restart`.
+picks up the new binary (no service reinstall needed). It then waits, Mac and
+Linux in parallel, for each restarted daemon to log `watch.FirstFullCycleMessage`
+(`watch: first full cycle complete`) and exits non-zero if one logs an error
+first or times out (its `--remote-poll` plus `SYNCD_WAIT_TIMEOUT`, default
+300s). The script greps for that exact text, so keep the message stable. Run it
+from a clean `main`: `~/deploy-syncd.sh --test`. Options: `--local-only`,
+`--remote-only`, `--no-restart`, `--no-wait`.
 
 ## Git
 
