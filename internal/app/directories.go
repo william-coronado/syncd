@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	iofs "io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -262,22 +265,55 @@ type dirRemoval struct {
 	trash   *fs.Trash
 }
 
-// isDisposableJunk names the ignored files that may be deleted so that a
-// directory deleted on the other side can go: Finder's .DS_Store and
-// AppleDouble ("._*") metadata, which only describe the directory and its
-// (already deleted) files. Finder leaves .DS_Store in every folder it
-// opens, so without this nearly every deleted folder on a Mac was refused
-// with "directory not empty" on every cycle.
-func isDisposableJunk(name string) bool {
-	return name == ".DS_Store" || strings.HasPrefix(name, "._")
+// Headers of the Finder files isDisposableJunk accepts: an AppleDouble
+// file's magic number (RFC 1740), and a .DS_Store's alignment word followed
+// by its "Bud1" buddy-allocator magic.
+var (
+	appleDoubleMagic = []byte{0x00, 0x05, 0x16, 0x07}
+	dsStoreMagic     = []byte{0x00, 0x00, 0x00, 0x01, 'B', 'u', 'd', '1'}
+)
+
+// isDisposableJunk reports whether entry e of directory rel is Finder
+// metadata that may be deleted so a directory deleted on the other side can
+// go: a .DS_Store, or an AppleDouble ("._*") file, which only describe the
+// directory and its (already deleted) files. Finder leaves .DS_Store in
+// every folder it opens, so without this nearly every deleted folder on a
+// Mac was refused with "directory not empty" on every cycle.
+//
+// The name alone is not enough: "._*" is ignored by default, so a user's
+// own "._notes" never syncs and exists only here. A file qualifies only if
+// it is a regular file that starts with its kind's header.
+func isDisposableJunk(root *fs.Tree, rel string, e iofs.DirEntry) bool {
+	var magic []byte
+	switch name := e.Name(); {
+	case name == ".DS_Store":
+		magic = dsStoreMagic
+	case strings.HasPrefix(name, "._"):
+		magic = appleDoubleMagic
+	default:
+		return false
+	}
+	if !e.Type().IsRegular() {
+		return false
+	}
+	f, err := root.Open(filepath.Join(filepath.FromSlash(rel), e.Name()))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, len(magic))
+	if _, err := io.ReadFull(f, head); err != nil {
+		return false
+	}
+	return bytes.Equal(head, magic)
 }
 
 // remove removes directory rel from root if it is empty. If it is not, and
 // every remaining entry is ignored:
 //
-//   - all of them disposable junk (isDisposableJunk, regular files): they go
-//     through the trash like any other sync-driven delete, then the
-//     directory is removed;
+//   - all of them disposable junk (isDisposableJunk: Finder metadata,
+//     checked by header): they go through the trash like any other
+//     sync-driven delete, then the directory is removed;
 //   - anything else: the directory is kept (kept=true, err=nil). An ignored
 //     file is never synced, so it is data that exists only here; deleting
 //     it to remove a directory would destroy it.
@@ -300,7 +336,7 @@ func (rm dirRemoval) remove(root *fs.Tree, rel string) (kept bool, err error) {
 		if !rm.matcher.MatchPathOrAncestor(child, e.IsDir()) {
 			return false, err
 		}
-		if e.Type().IsRegular() && isDisposableJunk(e.Name()) {
+		if isDisposableJunk(root, rel, e) {
 			junk = append(junk, e.Name())
 		}
 	}

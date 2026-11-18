@@ -215,17 +215,18 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 		return reconcile.Plan{}, 0, &robustHardError{stage: "load dir manifest", err: err}
 	}
 
-	scans, err := fs.ScanTrees(ctx, local, remote, manifest, p.Policy, scanProgressLogger(p.Logger))
+	// Read once: the scan and directory removal must judge entries by the
+	// same rules, even if .syncdignore is edited mid-cycle.
+	matcher, err := local.LoadIgnoreMatcher()
+	if err != nil {
+		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
+	}
+	scans, err := fs.ScanTreesWithMatcher(ctx, local, remote, manifest, p.Policy, scanProgressLogger(p.Logger), matcher)
 	if err != nil {
 		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
 	}
 	logScanIssues(p.Logger, "local", scans.Local.Issues)
 	logScanIssues(p.Logger, "remote", scans.Remote.Issues)
-	// The scan read these same rules; directory removal needs them too.
-	matcher, err := local.LoadIgnoreMatcher()
-	if err != nil {
-		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
-	}
 
 	localFiles, remoteFiles := scans.Local.Files, scans.Remote.Files
 	skipped := mergeSkipSet(scans.Local, scans.Remote)
