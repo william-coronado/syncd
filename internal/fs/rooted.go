@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"golang.org/x/text/unicode/norm"
 )
 
 var ErrSymlink = errors.New("symlink not supported")
@@ -94,6 +95,11 @@ func walkDirectory(root *os.File, rel string, create os.FileMode) (*os.File, err
 	}
 	for _, component := range strings.Split(rel, "/") {
 		next, err := openChildDir(dir, component)
+		if os.IsNotExist(err) {
+			if actual := normalizationVariant(dir, component); actual != component {
+				next, err = openChildDir(dir, actual)
+			}
+		}
 		if os.IsNotExist(err) && create != 0 {
 			if mkErr := unix.Mkdirat(fd(dir), component, uint32(create)); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
 				dir.Close()
@@ -136,7 +142,90 @@ func (t *Tree) parent(rel string, create os.FileMode) (*os.File, string, error) 
 	}
 	rel = filepath.Clean(rel)
 	d, err := t.directory(filepath.Dir(rel), create)
-	return d, filepath.Base(rel), err
+	if err != nil {
+		return nil, filepath.Base(rel), err
+	}
+	return d, resolveLeaf(d, filepath.Base(rel)), nil
+}
+
+// resolveLeaf returns the name under which dir actually holds want: want
+// itself when it exists (or cannot have another spelling), else its single
+// Unicode-normalization variant, if dir holds exactly one.
+//
+// Paths reach Tree in the scanner's NFC form, but Linux and Samba store
+// names byte for byte, so a file named in NFD (as files from a Mac often
+// are) exists only under its own bytes. Looking it up by the NFC key read
+// it as deleted: a local edit planned a remote delete, and remote edits and
+// deletes never reached it. Resolving here, in the one place every Tree
+// operation passes through, keeps the on-disk spelling for reads, replaces
+// and deletes alike. A name with no other spelling (see mayHaveVariants)
+// costs no extra lookup.
+func resolveLeaf(dir *os.File, want string) string {
+	if !mayHaveVariants(want) {
+		return want
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(fd(dir), want, &st, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+		return want
+	}
+	return normalizationVariant(dir, want)
+}
+
+// normalizationVariant returns the one entry of dir, other than want, that
+// is the same name as want up to Unicode normalization - or want itself if
+// there is none, or several (the collision the scanner refuses to sync;
+// picking one would act on a file the scan never attributed to this path).
+// Callers have already found want itself missing.
+func normalizationVariant(dir *os.File, want string) string {
+	if !mayHaveVariants(want) {
+		return want
+	}
+	// A private descriptor: reading names moves the directory offset, and
+	// dir may be read again by its owner.
+	listing, err := openAt(dir, ".", unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return want
+	}
+	defer listing.Close()
+	names, err := listing.Readdirnames(-1)
+	if err != nil {
+		return want
+	}
+	key := norm.NFC.String(want)
+	match := ""
+	for _, name := range names {
+		// An ASCII name is its own NFC form, so it can only equal key by
+		// being want itself.
+		if name == want || isASCII(name) || norm.NFC.String(name) != key {
+			continue
+		}
+		if match != "" {
+			return want
+		}
+		match = name
+	}
+	if match == "" {
+		return want
+	}
+	return match
+}
+
+// mayHaveVariants reports whether another spelling of name can normalize to
+// it. Any non-ASCII byte can; of ASCII, only ';', '`' and 'K', the NFC forms
+// of U+037E, U+1FEF and U+212A (KELVIN SIGN) - the only code points whose
+// NFC form contains ASCII. Every other ASCII name is the only spelling of
+// itself, so the common case pays no lookup.
+func mayHaveVariants(name string) bool {
+	return !isASCII(name) || strings.ContainsAny(name, ";`K")
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *Tree) Open(name string) (iofs.File, error) {
