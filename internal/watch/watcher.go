@@ -345,9 +345,14 @@ func (w *Watcher) handleEvent(ev fsnotify.Event, pending map[string]struct{}) {
 //
 // Each directory is added before it is listed, so a subdirectory created
 // during the walk is either listed here or reported by its watched parent.
-// Best-effort, like NewWatcher's walk: a directory that vanishes or fails to
-// be added is skipped. WalkDir never follows a symlink.
+// Best-effort, like NewWatcher's walk: a directory that vanishes is skipped,
+// and one that fails to be added (inotify's max_user_watches, say) is
+// skipped too but reported on Errors() - the first failure, with a count,
+// so watch.Run logs that coverage is degraded. WalkDir never follows a
+// symlink.
 func (w *Watcher) addTree(dir string) {
+	var first error
+	failed := 0
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return nil
@@ -358,7 +363,22 @@ func (w *Watcher) addTree(dir string) {
 				return filepath.SkipDir
 			}
 		}
-		_ = fsAdd(w.fsw, path)
+		if addErr := fsAdd(w.fsw, path); addErr != nil && !os.IsNotExist(addErr) {
+			if first == nil {
+				first = fmt.Errorf("watch %s: %w", path, addErr)
+			}
+			failed++
+		}
 		return nil
 	})
+	if first == nil {
+		return
+	}
+	if failed > 1 {
+		first = fmt.Errorf("%w (and %d more directories under %s); the remote poll covers them", first, failed-1, dir)
+	}
+	select { // never block event processing, as for fsnotify's own errors
+	case w.errs <- first:
+	default:
+	}
 }

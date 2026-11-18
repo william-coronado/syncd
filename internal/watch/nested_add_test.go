@@ -1,9 +1,11 @@
 package watch
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,5 +91,47 @@ func waitForPath(t *testing.T, w *Watcher, rel string) {
 		case <-deadline:
 			t.Fatalf("no batch reported %s", rel)
 		}
+	}
+}
+
+// A subdirectory that cannot be watched (inotify's max_user_watches, say)
+// is reported on Errors(), which watch.Run logs, rather than dropped.
+//
+// The Watcher here has no run goroutine, so swapping the fsAdd seam cannot
+// race with event handling.
+func TestHandleEvent_ReportsSubtreeWatchFailure(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "proj", "deep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsw.Close()
+	m, _ := fs.LoadIgnoreMatcher(root)
+	w := &Watcher{fsw: fsw, root: root, matcher: m, errs: make(chan error, errorBuffer)}
+
+	orig := fsAdd
+	t.Cleanup(func() { fsAdd = orig })
+	fsAdd = func(fsw *fsnotify.Watcher, path string) error {
+		if filepath.Base(path) == "deep" {
+			return errors.New("no space left on device")
+		}
+		return fsw.Add(path)
+	}
+
+	w.handleEvent(fsnotify.Event{Name: filepath.Join(root, "proj"), Op: fsnotify.Create}, map[string]struct{}{})
+
+	select {
+	case err := <-w.Errors():
+		if !strings.Contains(err.Error(), "deep") {
+			t.Fatalf("error does not name the directory: %v", err)
+		}
+	default:
+		t.Fatal("subtree watch failure was not reported")
 	}
 }
