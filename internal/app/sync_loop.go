@@ -221,6 +221,11 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 	}
 	logScanIssues(p.Logger, "local", scans.Local.Issues)
 	logScanIssues(p.Logger, "remote", scans.Remote.Issues)
+	// The scan read these same rules; directory removal needs them too.
+	matcher, err := local.LoadIgnoreMatcher()
+	if err != nil {
+		return reconcile.Plan{}, 0, &robustHardError{stage: "scan", err: err}
+	}
 
 	localFiles, remoteFiles := scans.Local.Files, scans.Remote.Files
 	skipped := mergeSkipSet(scans.Local, scans.Remote)
@@ -264,7 +269,7 @@ func RunRobustOnce(ctx context.Context, p RobustParams) (reconcile.Plan, int, er
 
 	upserts, deletes, failures := collectManifestUpdates(results, p.Logger)
 
-	dirsToAdd, dirsToRemove, dirFailures := applyDirOps(p.Logger, local, remote, dirOps)
+	dirsToAdd, dirsToRemove, dirFailures := applyDirOps(p.Logger, local, remote, dirOps, dirRemoval{matcher: matcher, trash: p.Trash})
 	failures += dirFailures
 	cleanupEmptiedDirsInTrees(local, remote, deletes)
 
@@ -531,7 +536,7 @@ func RunRobustScoped(ctx context.Context, p RobustParams, relPaths map[string]st
 	var dirsToAdd, dirsToRemove []string
 	if len(subtrees) > 0 {
 		var dirFailures int
-		dirsToAdd, dirsToRemove, dirFailures = applyDirOps(p.Logger, local, remote, planDirectories(localScan.Dirs, remoteScan.Dirs, baselineWithin(dirBaseline, subtrees), skipped))
+		dirsToAdd, dirsToRemove, dirFailures = applyDirOps(p.Logger, local, remote, planDirectories(localScan.Dirs, remoteScan.Dirs, baselineWithin(dirBaseline, subtrees), skipped), dirRemoval{matcher: matcher, trash: p.Trash})
 		failures += dirFailures
 	}
 	cleanupEmptiedDirsInTrees(local, remote, deletes)
