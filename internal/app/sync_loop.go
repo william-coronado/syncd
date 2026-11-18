@@ -686,6 +686,19 @@ func mergeScanResult(dst *fs.ScanResult, src fs.ScanResult) {
 // can simulate an unmounted share.
 var unmountedMountPoint = runtime.UnmountedMountPoint
 
+// checkRemoteMounted refuses a remote root whose mount point has nothing
+// mounted on it (see runtime.UnmountedMountPoint).
+func checkRemoteMounted(remoteRoot string) error {
+	mountPoint, err := unmountedMountPoint(remoteRoot)
+	if err != nil {
+		return fmt.Errorf("check remote mount: %w", err)
+	}
+	if mountPoint != "" {
+		return fmt.Errorf("remote %s is on %s, a mount point that is not mounted right now; mount the share and run init again", remoteRoot, mountPoint)
+	}
+	return nil
+}
+
 // RunInit bootstraps first-time setup: creates the local and remote root
 // directories if missing, and writes the remote canary file (.synclock) if
 // it isn't already there. It performs no reconciliation.
@@ -703,18 +716,20 @@ func RunInit(localRoot, remoteRoot string, logger *runtime.Logger) error {
 	// Before creating anything: on an unmounted share, the remote root and
 	// its canary would land on the local disk under the mount point, and
 	// the canary would then vouch for the local disk.
-	mountPoint, err := unmountedMountPoint(remoteRoot)
-	if err != nil {
-		return fmt.Errorf("check remote mount: %w", err)
-	}
-	if mountPoint != "" {
-		return fmt.Errorf("remote %s is on %s, a mount point that is not mounted right now; mount the share and run init again", remoteRoot, mountPoint)
+	if err := checkRemoteMounted(remoteRoot); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
 		return fmt.Errorf("create local root: %w", err)
 	}
 	if err := os.MkdirAll(remoteRoot, 0o755); err != nil {
 		return fmt.Errorf("create remote root: %w", err)
+	}
+	// Again, right before the one write that matters: the share may have
+	// gone away since the first check. The directories created meanwhile
+	// are harmless without a canary - watch refuses a remote that lacks one.
+	if err := checkRemoteMounted(remoteRoot); err != nil {
+		return err
 	}
 	created, err := runtime.EnsureRemoteCanary(remoteRoot)
 	if err != nil {

@@ -154,3 +154,17 @@ func TestUnmountedMountPoint_DarwinVolumes(t *testing.T) {
 		t.Errorf("outside volumes: got %q, %v", got, err)
 	}
 }
+
+// An fstab that exists but cannot be read must not pass as "nothing is
+// supposed to be mounted": init would then go ahead under an unmounted share.
+func TestUnmountedMountPoint_LinuxUnreadableFstabIsAnError(t *testing.T) {
+	dir := realTempDir(t)
+	unreadable := filepath.Join(dir, "fstab") // a directory: opens, but reading fails
+	if err := os.Mkdir(unreadable, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stubMounts(t, "linux", unreadable, filepath.Join(dir, "absent"), "", nil)
+	if got, err := UnmountedMountPoint(filepath.Join(dir, "x")); err == nil {
+		t.Fatalf("got %q with no error, want the fstab read error", got)
+	}
+}

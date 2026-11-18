@@ -77,8 +77,13 @@ func resolveExistingPrefix(abs string) string {
 
 func unmountedFstabEntry(abs string) (string, error) {
 	expected, err := readMountPoints(fstabPath, 1)
-	if err != nil || len(expected) == 0 {
+	if os.IsNotExist(err) {
 		return "", nil // no fstab to say what should be mounted
+	}
+	if err != nil {
+		// Not "nothing is configured": init would go ahead under a share
+		// that fstab may well list as unmounted.
+		return "", fmt.Errorf("read %s: %w", fstabPath, err)
 	}
 	mounted, infoErr := readMountPoints(mountinfoPath, 4)
 	for dir := abs; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {

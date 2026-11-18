@@ -38,3 +38,28 @@ func TestRunInit_RefusesRemoteUnderUnmountedMountPoint(t *testing.T) {
 		}
 	}
 }
+
+// The share can go away between the first check and the canary write; the
+// canary must still never be written to the local disk.
+func TestRunInit_RechecksMountBeforeWritingCanary(t *testing.T) {
+	parent := t.TempDir()
+	remoteRoot := filepath.Join(parent, "nas", "dev")
+	calls := 0
+	orig := unmountedMountPoint
+	t.Cleanup(func() { unmountedMountPoint = orig })
+	unmountedMountPoint = func(string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "", nil // mounted at the first check
+		}
+		return filepath.Join(parent, "nas"), nil // gone by the canary write
+	}
+
+	err := RunInit(filepath.Join(parent, "local"), remoteRoot, newTestLogger(t))
+	if err == nil || !strings.Contains(err.Error(), "not mounted") {
+		t.Fatalf("RunInit error = %v, want a not-mounted refusal", err)
+	}
+	if _, err := os.Lstat(filepath.Join(remoteRoot, ".synclock")); !os.IsNotExist(err) {
+		t.Fatalf("canary written despite the share going away (err=%v)", err)
+	}
+}
