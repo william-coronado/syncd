@@ -350,7 +350,7 @@ func syncdStateDir() (string, error) {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
 	dir := filepath.Join(home, ".local", "state", "syncd")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { // private: logs and manifests list every synced path
 		return "", fmt.Errorf("create state dir: %w", err)
 	}
 	return dir, nil

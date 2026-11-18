@@ -123,7 +123,7 @@ func (m Manager) Install(spec Spec) (Result, error) {
 	}
 	var content string
 	if m.GOOS == "darwin" {
-		if err := os.MkdirAll(spec.LogDir, 0o755); err != nil {
+		if err := os.MkdirAll(spec.LogDir, 0o700); err != nil { // the state dir
 			return Result{}, fmt.Errorf("create log directory: %w", err)
 		}
 		content = RenderPlist(spec)

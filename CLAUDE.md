@@ -34,6 +34,7 @@ go test ./...                      # full suite
 go test ./... -race                # race detector (watch/executor are concurrent)
 GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/syncd   # cross-compile check
 GOOS=linux  GOARCH=amd64 go build -o /dev/null ./cmd/syncd
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...       # known-CVE scan (stdlib + modules)
 ```
 
 Run:
@@ -97,7 +98,8 @@ remote view via `db.RemoteStatView`.
 
 ## Invariants & conventions (do not break)
 
-- Module path `syncd`; imports `syncd/internal/...`. Go **1.26.4**. Must build
+- Module path `syncd`; imports `syncd/internal/...`. Go **1.26.11** (1.26.4
+  had 25 standard-library advisories; keep `govulncheck` clean when bumping). Must build
   darwin **and** linux.
 - **Canary filename is `.synclock`** — a wire-protocol name already deployed on
   remote shares. Never rename it.

@@ -1,11 +1,19 @@
 package app
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	iofs "io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
+	"syscall"
+
+	"golang.org/x/text/unicode/norm"
 
 	"syncd/internal/fs"
 	"syncd/internal/reconcile"
@@ -46,7 +54,12 @@ func reconcileDirectories(logger *runtime.Logger, localRoot, remoteRoot string, 
 	}
 	defer local.Close()
 	defer remote.Close()
-	return applyDirOps(logger, local, remote, planDirectories(localDirs, remoteDirs, dirBaseline, skipped))
+	matcher, err := local.LoadIgnoreMatcher()
+	if err != nil {
+		logger.Warn("load ignore rules", map[string]any{"error": err.Error()})
+		return nil, nil, 1
+	}
+	return applyDirOps(logger, local, remote, planDirectories(localDirs, remoteDirs, dirBaseline, skipped), dirRemoval{matcher: matcher})
 }
 
 // DirOpKind is one directory operation planDirectories can decide on. The
@@ -153,12 +166,17 @@ func planDirectories(localDirs, remoteDirs, dirBaseline map[string]struct{}, ski
 // baseline additions/removals they imply, for the caller to persist via
 // db.DirRepo.ApplyUpdates. Failures are logged and tallied rather than
 // aborting - a directory create/delete failure never loses file data
-// (os.Remove is non-recursive and refuses a non-empty directory), and a
+// (removal is non-recursive and refuses a non-empty directory), and a
 // failed op leaves the baseline unchanged for that path.
-func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot *fs.Tree, ops []DirOp) (toAdd, toRemove []string, failures int) {
+//
+// A directory removal that is refused only because of ignored entries is
+// handled by rm (see dirRemoval.remove): junk is cleared and the directory
+// removed, or the directory is kept without counting as a failure.
+func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot *fs.Tree, ops []DirOp, rm dirRemoval) (toAdd, toRemove []string, failures int) {
 	for _, op := range ops {
 		var err error
 		var what string
+		var kept bool
 		switch op.Kind {
 		case dirBaselineAdd:
 			toAdd = append(toAdd, op.Path)
@@ -167,9 +185,11 @@ func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot *fs.Tree, ops []D
 			toRemove = append(toRemove, op.Path)
 			continue
 		case DirRemoveLocal:
-			what, err = "failed to remove local directory", removeEmptyDirInRoot(localRoot, op.Path)
+			kept, err = rm.remove(localRoot, op.Path)
+			what = "failed to remove local directory"
 		case DirRemoveRemote:
-			what, err = "failed to remove remote directory", removeEmptyDirInRoot(remoteRoot, op.Path)
+			kept, err = rm.remove(remoteRoot, op.Path)
+			what = "failed to remove remote directory"
 		case DirCreateLocal:
 			what, err = "failed to create local directory", localRoot.MkdirAll(filepath.FromSlash(op.Path))
 		case DirCreateRemote:
@@ -178,6 +198,12 @@ func applyDirOps(logger *runtime.Logger, localRoot, remoteRoot *fs.Tree, ops []D
 		if err != nil {
 			failures++
 			logger.Error(what, map[string]any{"path": op.Path, "error": err.Error()})
+			continue
+		}
+		if kept {
+			// Baseline unchanged, so the other side does not recreate it;
+			// re-planned (and re-kept) each cycle until the files go.
+			logger.Info("kept a directory deleted on the other side: it still holds ignored files", map[string]any{"path": op.Path, "op": string(op.Kind)})
 			continue
 		}
 		switch op.Kind {
@@ -228,6 +254,107 @@ func cleanupEmptiedDirsInTrees(localRoot, remoteRoot *fs.Tree, deletedRelPaths [
 		_ = removeEmptyDirInRoot(localRoot, relDir)
 		_ = removeEmptyDirInRoot(remoteRoot, relDir)
 	}
+}
+
+// dirRemoval carries what removing a directory deleted on the other side
+// needs beyond the trees. Ignored entries are never scanned, so the planner
+// cannot see that such a directory is not really empty; matcher identifies
+// them, and trash receives the junk that may be cleared.
+type dirRemoval struct {
+	matcher *fs.IgnoreMatcher
+	trash   *fs.Trash
+}
+
+// Headers of the Finder files isDisposableJunk accepts: an AppleDouble
+// file's magic number (RFC 1740), and a .DS_Store's alignment word followed
+// by its "Bud1" buddy-allocator magic.
+var (
+	appleDoubleMagic = []byte{0x00, 0x05, 0x16, 0x07}
+	dsStoreMagic     = []byte{0x00, 0x00, 0x00, 0x01, 'B', 'u', 'd', '1'}
+)
+
+// isDisposableJunk reports whether entry e of directory rel is Finder
+// metadata that may be deleted so a directory deleted on the other side can
+// go: a .DS_Store, or an AppleDouble ("._*") file, which only describe the
+// directory and its (already deleted) files. Finder leaves .DS_Store in
+// every folder it opens, so without this nearly every deleted folder on a
+// Mac was refused with "directory not empty" on every cycle.
+//
+// The name alone is not enough: "._*" is ignored by default, so a user's
+// own "._notes" never syncs and exists only here. A file qualifies only if
+// it is a regular file that starts with its kind's header.
+func isDisposableJunk(root *fs.Tree, rel string, e iofs.DirEntry) bool {
+	var magic []byte
+	switch name := e.Name(); {
+	case name == ".DS_Store":
+		magic = dsStoreMagic
+	case strings.HasPrefix(name, "._"):
+		magic = appleDoubleMagic
+	default:
+		return false
+	}
+	if !e.Type().IsRegular() {
+		return false
+	}
+	f, err := root.Open(filepath.Join(filepath.FromSlash(rel), e.Name()))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, len(magic))
+	if _, err := io.ReadFull(f, head); err != nil {
+		return false
+	}
+	return bytes.Equal(head, magic)
+}
+
+// remove removes directory rel from root if it is empty. If it is not, and
+// every remaining entry is ignored:
+//
+//   - all of them disposable junk (isDisposableJunk: Finder metadata,
+//     checked by header): they go through the trash like any other
+//     sync-driven delete, then the directory is removed;
+//   - anything else: the directory is kept (kept=true, err=nil). An ignored
+//     file is never synced, so it is data that exists only here; deleting
+//     it to remove a directory would destroy it.
+//
+// A directory still holding anything the sync tracks is a real failure,
+// returned as removeEmptyDirInRoot's error: its files are reconciled first,
+// and the directory is retried next cycle.
+func (rm dirRemoval) remove(root *fs.Tree, rel string) (kept bool, err error) {
+	err = removeEmptyDirInRoot(root, rel)
+	if !isNotEmpty(err) || rm.matcher == nil {
+		return false, err
+	}
+	entries, listErr := root.ReadDir(filepath.FromSlash(rel))
+	if listErr != nil {
+		return false, err
+	}
+	var junk []string
+	for _, e := range entries {
+		child := path.Join(rel, norm.NFC.String(e.Name()))
+		if !rm.matcher.MatchPathOrAncestor(child, e.IsDir()) {
+			return false, err
+		}
+		if isDisposableJunk(root, rel, e) {
+			junk = append(junk, e.Name())
+		}
+	}
+	if len(junk) < len(entries) {
+		return true, nil
+	}
+	for _, name := range junk {
+		if err := rm.trash.RemoveFrom(root, filepath.Join(filepath.FromSlash(rel), name), nil); err != nil {
+			return false, fmt.Errorf("remove %s: %w", path.Join(rel, name), err)
+		}
+	}
+	return false, removeEmptyDirInRoot(root, rel)
+}
+
+// isNotEmpty reports a directory removal refused for having entries (POSIX
+// allows either errno).
+func isNotEmpty(err error) bool {
+	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)
 }
 
 func removeEmptyDirInRoot(root *fs.Tree, rel string) error {

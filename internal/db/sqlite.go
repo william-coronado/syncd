@@ -3,6 +3,8 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -36,6 +38,7 @@ func dsn(path string, wal bool) string {
 // obvious blocked/timed-out caller on the very next call, rather than
 // quietly growing the pool and masking the leak.
 func Open(path string) (*sql.DB, error) {
+	restrictToOwner(path)
 	db, err := sql.Open("sqlite", dsn(path, true))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -107,6 +110,25 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate dir_manifest schema: %w", err)
 	}
 	return db, nil
+}
+
+// restrictToOwner makes the database at path readable by its owner only:
+// the manifest lists every synced path and its hash. It creates a missing
+// database file as 0600 before SQLite opens it (SQLite gives its -wal and
+// -shm files the database file's mode, and an empty file is an empty
+// database), and tightens a database, and its side files, that an older
+// syncd created world-readable. Best-effort: Open reports any real problem
+// with path itself.
+func restrictToOwner(path string) {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return
+	}
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0o600); err == nil {
+		_ = f.Close()
+	}
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+		_ = os.Chmod(p, 0o600)
+	}
 }
 
 // hasColumn reports whether table has a column named column. Both names

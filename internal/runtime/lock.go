@@ -14,10 +14,14 @@ type Lock struct {
 }
 
 func AcquireLock(path string) (*Lock, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
 	}
+	// Before locking: anyone who can open a lock can hold its flock, and
+	// one an older syncd created 0644 let other users block every sync.
+	// Best-effort, as a lock owned by someone else cannot be changed.
+	_ = f.Chmod(stateFileMode)
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("sync lock already held at %s", path)

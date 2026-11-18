@@ -70,7 +70,7 @@ func AcquirePairLocks(primary, stateDir, left, right string) (func(), error) {
 		return nil, err
 	}
 	shared := filepath.Join(home, ".local", "state", "syncd")
-	if err := os.MkdirAll(shared, 0o755); err != nil {
+	if err := os.MkdirAll(shared, stateDirMode); err != nil {
 		return nil, err
 	}
 

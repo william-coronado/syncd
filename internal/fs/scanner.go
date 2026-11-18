@@ -109,6 +109,13 @@ func ScanTrees(ctx context.Context, local, remote *Tree, manifest map[string]db.
 	if err != nil {
 		return ScanPairResult{}, err
 	}
+	return ScanTreesWithMatcher(ctx, local, remote, manifest, policy, progress, matcher)
+}
+
+// ScanTreesWithMatcher is ScanTrees with the ignore rules supplied, for a
+// caller that applies the same rules again later in its cycle and must not
+// re-read a .syncdignore edited in between.
+func ScanTreesWithMatcher(ctx context.Context, local, remote *Tree, manifest map[string]db.ManifestRow, policy HashPolicy, progress ScanPairProgressFunc, matcher *IgnoreMatcher) (ScanPairResult, error) {
 
 	var localProgress, remoteProgress ScanProgressFunc
 	if progress != nil {
