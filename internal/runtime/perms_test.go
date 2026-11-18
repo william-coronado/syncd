@@ -57,3 +57,52 @@ func TestAcquireLock_LockFileIsOwnerOnly(t *testing.T) {
 	defer l.Release()
 	assertOwnerOnly(t, path)
 }
+
+// A lock an older syncd created 0644, in a state directory others can
+// search, let another user open it and hold its flock, stopping every sync.
+func TestAcquireLock_TightensExistingLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.lock")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l, err := AcquireLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release()
+	assertOwnerOnly(t, path)
+}
+
+// Rotation renames a log that is over the cap to .old; an archive an older
+// syncd left world-readable must not stay that way.
+func TestNewLogger_TightensRotatedAndArchivedLogs(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "sync.log")
+	big := make([]byte, maxLogSizeBytes) // at the cap: rotated on open
+	if err := os.WriteFile(logPath, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(logPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l, err := NewLogger(true, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	assertOwnerOnly(t, logPath)
+	assertOwnerOnly(t, logPath+".old")
+
+	// An existing archive is tightened even when nothing rotates.
+	if err := os.Chmod(logPath+".old", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if l, err = NewLogger(true, logPath); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	assertOwnerOnly(t, logPath+".old")
+}

@@ -52,6 +52,11 @@ func NewLogger(silent bool, logPath string) (*Logger, error) {
 	if logPath == "" {
 		return l, nil
 	}
+	// Before rotating, which renames the current log to .old: both list
+	// every synced path, and an older syncd created them world-readable.
+	// Best-effort; either may not exist.
+	_ = os.Chmod(logPath, stateFileMode)
+	_ = os.Chmod(logPath+".old", stateFileMode)
 	if err := rotateLogIfNeeded(logPath); err != nil {
 		return nil, err
 	}
@@ -59,9 +64,6 @@ func NewLogger(silent bool, logPath string) (*Logger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
-	// Best-effort: a log an older syncd created world-readable lists every
-	// synced path.
-	_ = f.Chmod(stateFileMode)
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
