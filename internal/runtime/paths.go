@@ -13,6 +13,15 @@ import (
 // cannot import fs).
 const trashDirName = "trash"
 
+// stateDirMode and stateFileMode keep syncd's state private to the user:
+// the log and the manifest list every synced path. (Directories that
+// already exist keep their mode; the files in them are owner-only either
+// way, see NewLogger and db.Open.)
+const (
+	stateDirMode  = 0o700
+	stateFileMode = 0o600
+)
+
 type RuntimePaths struct {
 	StateDir string
 	DBPath   string
@@ -55,7 +64,7 @@ func ResolvePaths(cfg Config) (RuntimePaths, error) {
 		lockPath = filepath.Join(stateDir, name)
 	}
 
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(stateDir, stateDirMode); err != nil {
 		return RuntimePaths{}, fmt.Errorf("create state dir: %w", err)
 	}
 

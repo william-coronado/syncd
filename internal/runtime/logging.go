@@ -55,10 +55,13 @@ func NewLogger(silent bool, logPath string) (*Logger, error) {
 	if err := rotateLogIfNeeded(logPath); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, stateFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
+	// Best-effort: a log an older syncd created world-readable lists every
+	// synced path.
+	_ = f.Chmod(stateFileMode)
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -193,7 +196,7 @@ func (l *Logger) rotateLocked() {
 		l.rotationFailedLocked(fmt.Errorf("rename log file to .old: %w", err))
 		return
 	}
-	f, err := os.OpenFile(l.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(l.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, stateFileMode)
 	if err != nil {
 		l.rotationFailedLocked(fmt.Errorf("reopen log file after rotate: %w", err))
 		return
