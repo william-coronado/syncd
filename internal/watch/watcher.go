@@ -328,11 +328,37 @@ func (w *Watcher) handleEvent(ev fsnotify.Event, pending map[string]struct{}) {
 	}
 
 	if isDir && ev.Op&fsnotify.Create != 0 {
-		// Best-effort: if Add fails (e.g. the directory has already
-		// vanished by the time we get here), just skip adding it; the
-		// event itself is still recorded below.
-		_ = w.fsw.Add(ev.Name)
+		w.addTree(ev.Name)
 	}
 
 	pending[rel] = struct{}{}
+}
+
+// addTree watches a newly created directory and every directory beneath it
+// that the matcher does not ignore. A directory that arrives already
+// populated (moved or renamed in, mkdir -p, an unzip, a clone) produces a
+// Create event for its top level only, and fsnotify is not recursive:
+// adding just that one left its subdirectories unwatched, so later changes
+// inside them waited for the next remote poll. The batch's own scoped cycle
+// syncs what is already there (a directory path is walked as a subtree);
+// this is about what changes next.
+//
+// Each directory is added before it is listed, so a subdirectory created
+// during the walk is either listed here or reported by its watched parent.
+// Best-effort, like NewWatcher's walk: a directory that vanishes or fails to
+// be added is skipped. WalkDir never follows a symlink.
+func (w *Watcher) addTree(dir string) {
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if path != dir {
+			rel, relErr := fs.NormalizeRelativePath(w.root, path)
+			if relErr == nil && w.matcher.Match(rel, true) {
+				return filepath.SkipDir
+			}
+		}
+		_ = fsAdd(w.fsw, path)
+		return nil
+	})
 }
