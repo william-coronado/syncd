@@ -681,6 +681,10 @@ func mergeScanResult(dst *fs.ScanResult, src fs.ScanResult) {
 	dst.Issues = append(dst.Issues, src.Issues...)
 }
 
+// unmountedMountPoint is runtime.UnmountedMountPoint, indirected so tests
+// can simulate an unmounted share.
+var unmountedMountPoint = runtime.UnmountedMountPoint
+
 // RunInit bootstraps first-time setup: creates the local and remote root
 // directories if missing, and writes the remote canary file (.synclock) if
 // it isn't already there. It performs no reconciliation.
@@ -694,6 +698,16 @@ func RunInit(localRoot, remoteRoot string, logger *runtime.Logger) error {
 	}
 	if overlap {
 		return fmt.Errorf("local and remote roots must not be the same directory or nested inside one another: %s, %s", localRoot, remoteRoot)
+	}
+	// Before creating anything: on an unmounted share, the remote root and
+	// its canary would land on the local disk under the mount point, and
+	// the canary would then vouch for the local disk.
+	mountPoint, err := unmountedMountPoint(remoteRoot)
+	if err != nil {
+		return fmt.Errorf("check remote mount: %w", err)
+	}
+	if mountPoint != "" {
+		return fmt.Errorf("remote %s is on %s, a mount point that is not mounted right now; mount the share and run init again", remoteRoot, mountPoint)
 	}
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
 		return fmt.Errorf("create local root: %w", err)
