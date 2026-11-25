@@ -1,0 +1,5 @@
+I would like to include /Users/william/deploy-syncd.sh script into this project so it can be reused in macOS machines that download this project. But it should be configurable to what machines it can deploy
+
+---
+
+yes, commit and open the PR
