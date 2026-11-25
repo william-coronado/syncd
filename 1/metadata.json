@@ -1,0 +1,50 @@
+{
+  "cli_version": "0.13.4",
+  "checkpoint_id": "01M8AGZHE1FZD6M59ZKYEWV1TV",
+  "session_id": "f612e1dc-ed6d-4fe5-b0e9-14745f6e1dee",
+  "strategy": "manual-commit",
+  "created_at": "2026-11-25T23:34:46.909401Z",
+  "branch": "fix/nfd-remote-edit",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "internal/fs/normalization_test.go",
+    "internal/fs/rooted.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-fable-5-2",
+  "turn_id": "1f2dc9f9d01f",
+  "checkpoint_transcript_start": 269,
+  "transcript_lines_at_start": 269,
+  "compact_transcript_start": 24,
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 37803,
+    "cache_read_tokens": 1846233,
+    "output_tokens": 15114,
+    "api_call_count": 17
+  },
+  "session_token_usage": {
+    "input_tokens": 76,
+    "cache_creation_tokens": 106670,
+    "cache_read_tokens": 3253136,
+    "output_tokens": 39164,
+    "api_call_count": 36
+  },
+  "redaction": {
+    "replacements": 28,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 36,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  },
+  "session_metrics": {
+    "turn_count": 2
+  }
+}

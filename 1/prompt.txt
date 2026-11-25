@@ -1,0 +1,2 @@
+- look into the test issue
+- change default model in LCAUDE.md to reflect new model
