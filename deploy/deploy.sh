@@ -30,10 +30,11 @@
 # Blank lines and `#` comments are ignored; see deploy/deploy-hosts.example.
 # With no hosts file and no --host, the only target is `local`.
 #
-# A target may be macOS (launchd agents com.syncd.watch*) or Linux (systemd
-# user units syncd-watch*). Remote targets need ssh (keys or an agent; each is
-# authenticated once per run) and bash. Only services whose binary is the
-# installed BIN_DIR/syncd are restarted; others are reported and left alone.
+# A target may be macOS (launchd agents com.syncd.watch*, and the template's
+# com.user.syncd*) or Linux (systemd user units syncd-watch*). Remote
+# targets need ssh (keys or an agent; each is authenticated once per run)
+# and bash. Only services whose binary is the installed BIN_DIR/syncd are
+# restarted; others are reported and left alone.
 #
 # Environment:
 #   SYNCD_REPO          source checkout (default: the checkout holding this script)
@@ -58,7 +59,14 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${SYNCD_REPO:-$(cd "$script_dir/.." && pwd)}"
 HOSTS_FILE="${SYNCD_DEPLOY_HOSTS:-${XDG_CONFIG_HOME:-$HOME/.config}/syncd/deploy-hosts}"
+# A hosts file named explicitly must exist; only the default may be absent.
+hosts_explicit=0
+[[ -n "${SYNCD_DEPLOY_HOSTS:-}" ]] && hosts_explicit=1
 WAIT_TIMEOUT="${SYNCD_WAIT_TIMEOUT:-300}"
+if [[ ! "$WAIT_TIMEOUT" =~ ^[0-9]+$ ]]; then
+	echo "SYNCD_WAIT_TIMEOUT must be a whole number of seconds, not '$WAIT_TIMEOUT'" >&2
+	exit 2
+fi
 DEFAULT_BIN_DIR="~/.local/bin" # expanded on the target
 
 only=all # all | local | remote
@@ -80,13 +88,11 @@ while [[ $# -gt 0 ]]; do
 	--host=*) cli_hosts+=("${1#*=}") ;;
 	--hosts-file)
 		[[ $# -ge 2 ]] || { echo "--hosts-file needs a path" >&2; exit 2; }
-		HOSTS_FILE="$2"
-		[[ -f "$HOSTS_FILE" ]] || { echo "no such hosts file: $HOSTS_FILE" >&2; exit 2; }
+		HOSTS_FILE="$2" hosts_explicit=1
 		shift
 		;;
 	--hosts-file=*)
-		HOSTS_FILE="${1#*=}"
-		[[ -f "$HOSTS_FILE" ]] || { echo "no such hosts file: $HOSTS_FILE" >&2; exit 2; }
+		HOSTS_FILE="${1#*=}" hosts_explicit=1
 		;;
 	--local-only) [[ $only == remote ]] && only=none || only=local ;;
 	--remote-only) [[ $only == local ]] && only=none || only=remote ;;
@@ -99,6 +105,10 @@ while [[ $# -gt 0 ]]; do
 	esac
 	shift
 done
+if [[ $hosts_explicit -eq 1 && ${#cli_hosts[@]} -eq 0 && ! -f "$HOSTS_FILE" ]]; then
+	echo "no such hosts file: $HOSTS_FILE" >&2
+	exit 2
+fi
 if [[ $only == none ]]; then
 	echo "--local-only and --remote-only together leave nothing to do" >&2
 	exit 2
@@ -113,6 +123,8 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 t_dest=() t_plat=() t_bin=()
 add_target() { # DEST [OS/ARCH] [BIN_DIR]
 	local dest="$1" plat="${2:-auto}" bin="${3:-$DEFAULT_BIN_DIR}"
+	# ssh and scp would read a leading '-' as an option, not a host.
+	[[ "$dest" != -* ]] || die "target '$dest': a destination cannot start with '-'"
 	case "$plat" in
 	auto | */*) ;;
 	*) die "target $dest: platform '$plat' is not OS/ARCH (e.g. linux/amd64) or auto" ;;
@@ -188,16 +200,37 @@ watch_arg() {
 	done
 }
 
+# json_string S -> S escaped as Go's json.Marshal writes it inside a string
+# (the log is JSON, and Marshal also escapes &, < and > for HTML safety).
+json_string() {
+	local s="$1"
+	s="${s//\\/\\\\}"
+	s="${s//\"/\\\"}"
+	s="${s//&/\\u0026}"
+	s="${s//</\\u003c}"
+	s="${s//>/\\u003e}"
+	printf '%s' "$s"
+}
+
 # cycle_state LOG LOCAL SINCE -> first line: none | started | done, judged
 # from the newest startup line for LOCAL logged at or after SINCE (UTC);
-# then any error lines logged after that startup line.
+# then any error lines logged after that startup line. LOG.old, the rotated
+# log, is read first, so a rotation between startup and the first cycle
+# loses neither line. Values reach awk through its environment: -v would
+# expand the backslashes in them.
 cycle_state() {
-	awk -v start="\"syncd watch: local=$2 remote=" -v since="$3" -v done="$FIRST_CYCLE_MSG" '
+	local -a files
+	files=("$1")
+	[[ -f "$1.old" ]] && files=("$1.old" "$1")
+	CS_START="\"syncd watch: local=$(json_string "$2") remote=" CS_SINCE="$3" CS_DONE="$FIRST_CYCLE_MSG" \
+		awk '
+		BEGIN { start = ENVIRON["CS_START"]; since = ENVIRON["CS_SINCE"]; done = ENVIRON["CS_DONE"] }
 		{ ts = $0; sub(/^[^"]*"ts":"/, "", ts); sub(/".*$/, "", ts) }
 		index($0, start) && ts >= since { status = "started"; errs = ""; next }
 		status == "started" && index($0, done) { status = "done"; next }
 		status == "started" && index($0, "\"level\":\"error\"") { errs = errs $0 "\n" }
-		END { print (status == "" ? "none" : status); printf "%s", errs }' "$1"
+		END { print (status == "" ? "none" : status); printf "%s", errs }' \
+		"${files[@]}"
 }
 
 # wait_first_cycle NAME SINCE TIMEOUT WATCH-ARGS...
@@ -274,16 +307,16 @@ mkdir -p "$bin_dir"
 cd "$bin_dir" && pwd -P
 PREPARE_EOF
 
-# Install: verifies the copied .syncd.new, renames it over syncd, then
+# Install: verifies the copied staging file, renames it over syncd, then
 # restarts the watch services that run it (launchd on macOS, systemd on
 # Linux) and waits for their first cycle.
 read -r -d '' INSTALL_SCRIPT <<'INSTALL_EOF' || true
 set -euo pipefail
-bin_dir="$1" want="$2" restart="$3" wait_cycle="$4" wait_timeout="$5"
+bin_dir="$1" stage="$2" want="$3" restart="$4" wait_cycle="$5" wait_timeout="$6"
 sha256() {
 	if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
 }
-new="$bin_dir/.syncd.new"
+new="$bin_dir/$stage"
 got="$(sha256 "$new")"
 if [[ "$got" != "$want" ]]; then
 	rm -f "$new"
@@ -305,7 +338,9 @@ restart_launchd() {
 	local found=0 plist label target i arg bin since
 	local -a args
 	shopt -s nullglob
-	for plist in "$HOME"/Library/LaunchAgents/com.syncd.watch*.plist; do
+	# com.syncd.watch*: `syncd service install`; com.user.syncd*: the
+	# hand-edited template in deploy/launchd.
+	for plist in "$HOME"/Library/LaunchAgents/com.syncd.watch*.plist "$HOME"/Library/LaunchAgents/com.user.syncd*.plist; do
 		found=1
 		label="$(basename "$plist" .plist)"
 		target="gui/$(id -u)/$label"
@@ -333,8 +368,16 @@ restart_launchd() {
 	[[ $found -eq 1 ]] || echo "no syncd launchd service installed"
 }
 
+# running_argv PID -> the process's argv, one per line, exactly as it was
+# started. systemctl's ExecStart property joins argv with spaces and no
+# quoting, so a path with a space in it cannot be told from two arguments.
+running_argv() {
+	[[ -r "/proc/$1/cmdline" ]] || return 1
+	tr '\0' '\n' <"/proc/$1/cmdline"
+}
+
 restart_systemd() {
-	local units unit exec_start exec_bin since
+	local units unit pid exec_bin since line
 	local -a argv
 	units="$(systemctl --user list-unit-files 'syncd-watch*' --no-legend 2>/dev/null | awk '{print $1}')"
 	if [[ -z "$units" ]]; then
@@ -342,12 +385,17 @@ restart_systemd() {
 		return 0
 	fi
 	for unit in $units; do
-		exec_start="$(systemctl --user show -p ExecStart --value "$unit")"
-		exec_bin="$(printf '%s\n' "$exec_start" | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"
-		read -ra argv <<<"$(printf '%s\n' "$exec_start" | sed -n 's/.*argv\[\]=\([^;]*\) ;.*/\1/p')"
+		pid="$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null || echo 0)"
+		if [[ -z "$pid" || "$pid" == 0 ]] || ! systemctl --user is-active --quiet "$unit"; then
+			echo "$unit is installed but not running; it will use the new binary when started"
+			continue
+		fi
+		argv=()
+		while IFS= read -r line; do argv+=("$line"); done < <(running_argv "$pid")
+		exec_bin="${argv[0]:-}"
 		if [[ "$exec_bin" != "$deployed" ]]; then
-			echo "warning: $unit runs $exec_bin, not $deployed; leaving it alone" >&2
-		elif systemctl --user is-active --quiet "$unit"; then
+			echo "warning: $unit runs ${exec_bin:-?}, not $deployed; leaving it alone" >&2
+		else
 			since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 			systemctl --user restart "$unit"
 			sleep 2
@@ -361,8 +409,6 @@ restart_systemd() {
 			if [[ "$wait_cycle" == 1 ]]; then
 				wait_first_cycle "$unit" "$since" "$wait_timeout" "${argv[@]:1}" || status=1
 			fi
-		else
-			echo "$unit is installed but not running; it will use the new binary when started"
 		fi
 	done
 }
@@ -450,9 +496,12 @@ done
 
 # --- copy, then install / restart / wait on every target in parallel ------------
 step "Copying binaries"
+# A staging name per target and run: two targets can share a directory (one
+# host reached by two names), and so can two deploys running at once.
+stage_base=".syncd.new.$(hostname -s 2>/dev/null || echo host).$$"
 for i in "${!t_dest[@]}"; do
 	dest="${t_dest[$i]}" plat="${t_plat[$i]}"
-	copy_to "$dest" "$work_dir/syncd-${plat%/*}-${plat#*/}" "${t_dir[$i]}/.syncd.new" || die "$dest: copy failed; nothing installed there"
+	copy_to "$dest" "$work_dir/syncd-${plat%/*}-${plat#*/}" "${t_dir[$i]}/$stage_base.$i" || die "$dest: copy failed; nothing installed there"
 	echo "  $dest: copied"
 done
 
@@ -463,7 +512,7 @@ for i in "${!t_dest[@]}"; do
 	want="$(sha256 "$work_dir/syncd-${plat%/*}-${plat#*/}")"
 	(
 		run_on "$dest" "$WAIT_LIB"$'\n'"$INSTALL_SCRIPT" \
-			"${t_dir[$i]}" "$want" "$restart" "$wait_cycle" "$WAIT_TIMEOUT" 2>&1 |
+			"${t_dir[$i]}" "$stage_base.$i" "$want" "$restart" "$wait_cycle" "$WAIT_TIMEOUT" 2>&1 |
 			sed -e "s|^|[$dest] |"
 	) &
 	pids[$i]=$!

@@ -470,8 +470,11 @@ service definition for the machine it runs on.
 `deploy/deploy.sh` builds syncd from this checkout and installs it on every
 machine you list, over ssh. It then restarts each `syncd watch` service there
 (launchd on macOS, systemd on Linux) so it runs the new binary, and waits for
-each one to log its first full cycle. Targets are built and waited on in
-parallel, one build per platform.
+each one to log its first full cycle. It builds once per platform, one
+platform after another; installing, restarting and waiting then run on all
+targets at once. Only per-user services are restarted: those from
+`syncd service install`, and the `deploy/launchd` template. The system-wide
+`deploy/systemd/syncd.service` is left to you.
 
 List the targets in `~/.config/syncd/deploy-hosts`, one per line (start from
 [`deploy/deploy-hosts.example`](deploy/deploy-hosts.example)):
