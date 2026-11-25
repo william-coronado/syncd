@@ -465,6 +465,35 @@ service definition for the machine it runs on.
   verification pass, independent of the watch daemon's own deep scan.
 - `deploy/launchd/com.user.syncd.plist` — a launchd agent template.
 
+### Updating installed machines: `deploy/deploy.sh`
+
+`deploy/deploy.sh` builds syncd from this checkout and installs it on every
+machine you list, over ssh. It then restarts each `syncd watch` service there
+(launchd on macOS, systemd on Linux) so it runs the new binary, and waits for
+each one to log its first full cycle. Targets are built and waited on in
+parallel, one build per platform.
+
+List the targets in `~/.config/syncd/deploy-hosts`, one per line (start from
+[`deploy/deploy-hosts.example`](deploy/deploy-hosts.example)):
+
+```
+local                                       # this machine
+me@linux-box.lan                            # platform detected with uname
+me@raspberrypi  linux/arm64  ~/.local/bin   # or given explicitly
+```
+
+```bash
+deploy/deploy.sh --list          # show the targets
+deploy/deploy.sh --test          # go vet + go test, then deploy everywhere
+deploy/deploy.sh --host me@box   # just this host, ignoring the file
+```
+
+Other options: `--hosts-file`, `--local-only`, `--remote-only`,
+`--no-restart`, `--no-wait`; see `deploy/deploy.sh --help`. With no hosts
+file it deploys to `local` only. Remote targets need ssh access and bash.
+The script only restarts a service whose binary is the one it just
+installed. It never runs `service install`; do that once on each machine.
+
 ## Build
 
 ```bash
