@@ -203,3 +203,17 @@ reason written to stderr each time it changes. A truly permanent error
 (wrong credentials) therefore leaves the service "running" but idle. Revisit
 if that turns out to be confusing in practice - e.g. surface the wait reason
 in `syncd service status`.
+
+### 36. Claiming an accented name on APFS reads its directory each time
+
+`internal/fs/rooted.go` (`storedSpelling`) — APFS matches names regardless of
+Unicode normalization, so a claim cannot learn the stored spelling from a
+lookup and lists the directory instead, once per claimed file whose name has
+a decomposable character. Replacing or deleting thousands of such files in
+one directory is therefore quadratic there. Byte-exact filesystems (Linux,
+Samba) skip the listing. Two narrow cases are accepted too: if the listing
+fails, the claim proceeds under the NFC key (the pre-fix behavior: the file
+keeps its content but may be renamed to NFC), and an entry swapped for
+another spelling between the listing and the claim is restored under the
+listed one. Done = read the stored name with `getattrlistat(ATTR_CMN_NAME)`
+(not exported by `x/sys/unix`), or cache one listing per directory per cycle.

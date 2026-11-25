@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -200,9 +201,13 @@ func TestTrashRemoveFrom_RefusalRestoresStoredNormalizationForm(t *testing.T) {
 	}
 	defer tree.Close()
 
-	refuse := func(*Tree, string) error { return os.ErrPermission }
-	if err := NewTrash(t.TempDir()).RemoveFrom(tree, nfcCafe+".txt", refuse); err == nil {
-		t.Fatal("RemoveFrom succeeded despite the refusing check")
+	refused := false
+	refuse := func(*Tree, string) error { refused = true; return os.ErrPermission }
+	if err := NewTrash(t.TempDir()).RemoveFrom(tree, nfcCafe+".txt", refuse); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("RemoveFrom = %v, want the check's refusal", err)
+	}
+	if !refused {
+		t.Fatal("the check never ran, so nothing was claimed or restored")
 	}
 	assertOnlyName(t, root, nfdCafe+".txt")
 }

@@ -26,11 +26,11 @@ const holdingPrefix = ".syncd-hold-"
 // (mkdir, open, rmdir) - round trips on a network share.
 //
 // It also returns the spelling under which parent stored leaf (see
-// normalizationVariant). A restore puts the entry back under that name, and
+// storedSpelling). A restore puts the entry back under that name, and
 // a caller publishing a replacement must use it too: on APFS the NFC key
 // reaches an NFD-stored file, and republishing under the key would rename it.
 func claimEntry(parent *os.File, leaf string) (claimed *Tree, held, stored string, finish func(error) error, err error) {
-	leaf = normalizationVariant(parent, leaf)
+	leaf = storedSpelling(parent, leaf)
 	var hold string
 	for range maxTempSiblingAttempts {
 		hold = holdingPrefix + tempSiblingPath(leaf)
