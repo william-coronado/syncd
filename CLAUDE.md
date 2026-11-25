@@ -203,4 +203,4 @@ from a clean `main`: `~/deploy-syncd.sh --test`. Options: `--local-only`,
 `main` and lands through a GitHub PR merged with a **merge commit** ("Merge pull
 request #N"), not squash. Once merged, delete the branch locally and on
 `origin` (GitHub does not delete it automatically). End commit messages with
-`Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
+`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
