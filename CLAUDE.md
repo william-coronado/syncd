@@ -185,16 +185,22 @@ without checking the source path first (see the data-loss guard).
 
 ## Deploy
 
-`~/deploy-syncd.sh` (outside the repo) builds for this Mac and for linux/amd64,
-installs to `~/.local/bin/syncd` here and to `/home/william/.local/bin/syncd` on
-`william@192.168.50.44`, and restarts any running `syncd watch` service so it
-picks up the new binary (no service reinstall needed). It then waits, Mac and
-Linux in parallel, for each restarted daemon to log `watch.FirstFullCycleMessage`
-(`watch: first full cycle complete`) and exits non-zero if one logs an error
-first or times out (its `--remote-poll` plus `SYNCD_WAIT_TIMEOUT`, default
-300s). The script greps for that exact text, so keep the message stable. Run it
-from a clean `main`: `~/deploy-syncd.sh --test`. Options: `--local-only`,
-`--remote-only`, `--no-restart`, `--no-wait`.
+`deploy/deploy.sh` builds once per target platform and installs to each machine
+listed in the hosts file (`~/.config/syncd/deploy-hosts`, or
+`SYNCD_DEPLOY_HOSTS` / `--hosts-file`; format in `deploy/deploy-hosts.example`:
+`DEST [OS/ARCH|auto] [BIN_DIR]`, `DEST` = `local` or an ssh destination;
+`--host DEST` overrides the file). Machine names stay out of the repo. On each
+target it restarts any running `syncd watch` service (launchd or systemd) whose
+binary is the one installed, so it picks up the new binary (no service
+reinstall needed). It then waits, all targets in parallel, for each restarted
+daemon to log `watch.FirstFullCycleMessage` (`watch: first full cycle
+complete`) and exits non-zero if one logs an error first or times out (its
+`--remote-poll` plus `SYNCD_WAIT_TIMEOUT`, default 300s). The script greps for
+that exact text, so keep the message stable, along with the service names
+`com.syncd.watch*` / `syncd-watch*`. The script runs under macOS's stock bash
+3.2, so no associative arrays and no `"${arr[@]}"` on a possibly empty array.
+Run it from a clean `main`: `deploy/deploy.sh --test`. Options: `--list`,
+`--local-only`, `--remote-only`, `--no-restart`, `--no-wait`.
 
 ## Git
 

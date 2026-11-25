@@ -1,0 +1,17 @@
+# Targets for deploy/deploy.sh. Copy to ~/.config/syncd/deploy-hosts (or
+# point SYNCD_DEPLOY_HOSTS / --hosts-file at it) and edit.
+#
+#   DEST  [OS/ARCH]  [BIN_DIR]
+#
+# DEST     `local` (this machine) or an ssh destination: user@host, or a Host
+#          alias from ~/.ssh/config
+# OS/ARCH  linux/amd64, linux/arm64, darwin/arm64, darwin/amd64, or `auto`
+#          (the default: detected on the target with uname)
+# BIN_DIR  where syncd is installed (default ~/.local/bin, the target user's
+#          home). It must be the path the target's `syncd service install`
+#          ran from, or its service is not restarted.
+
+local
+# me@linux-box.lan
+# me@raspberrypi   linux/arm64
+# me@other-mac     auto          /opt/syncd/bin
