@@ -99,7 +99,7 @@ func copyBetween(source *Tree, srcRel string, dest *Tree, dstRel string, check E
 		}
 		return unix.Renameat(fd(parent), tmpName, fd(parent), leaf)
 	}
-	claimed, held, finish, err := claimEntry(parent, leaf)
+	claimed, held, leaf, finish, err := claimEntry(parent, leaf)
 	if err != nil {
 		return err
 	}

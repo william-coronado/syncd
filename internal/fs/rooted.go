@@ -171,11 +171,15 @@ func resolveLeaf(dir *os.File, want string) string {
 	return normalizationVariant(dir, want)
 }
 
-// normalizationVariant returns the one entry of dir, other than want, that
-// is the same name as want up to Unicode normalization - or want itself if
-// there is none, or several (the collision the scanner refuses to sync;
-// picking one would act on a file the scan never attributed to this path).
-// Callers have already found want itself missing.
+// normalizationVariant returns the spelling under which dir stores want:
+// want itself if dir holds those exact bytes, else the one entry that is
+// the same name up to Unicode normalization - or want if there is none, or
+// several (the collision the scanner refuses to sync; picking one would act
+// on a file the scan never attributed to this path).
+//
+// Finding want by lookup is not enough to know its spelling: APFS matches
+// names regardless of normalization, so the NFC key opens an NFD-stored
+// file there while the directory still lists it as NFD.
 func normalizationVariant(dir *os.File, want string) string {
 	if !mayHaveVariants(want) {
 		return want
@@ -194,9 +198,12 @@ func normalizationVariant(dir *os.File, want string) string {
 	key := norm.NFC.String(want)
 	match := ""
 	for _, name := range names {
+		if name == want {
+			return want
+		}
 		// An ASCII name is its own NFC form, so it can only equal key by
 		// being want itself.
-		if name == want || isASCII(name) || norm.NFC.String(name) != key {
+		if isASCII(name) || norm.NFC.String(name) != key {
 			continue
 		}
 		if match != "" {
@@ -208,6 +215,33 @@ func normalizationVariant(dir *os.File, want string) string {
 		return want
 	}
 	return match
+}
+
+// storedSpelling returns the spelling under which dir stores name, an entry
+// that a lookup of name reaches. Only a filesystem that matches names
+// regardless of normalization (APFS) can store it differently; there, both
+// canonical spellings reach the same entry. Two stats tell the cases apart,
+// so a byte-exact filesystem (Linux, Samba) never pays for a directory
+// read - which, once per claimed file, made claiming a whole directory of
+// accented names quadratic.
+func storedSpelling(dir *os.File, name string) string {
+	if isASCII(name) {
+		return name
+	}
+	other := norm.NFD.String(name)
+	if other == name {
+		other = norm.NFC.String(name)
+	}
+	if other == name {
+		return name // no other canonical spelling
+	}
+	var a, b unix.Stat_t
+	if unix.Fstatat(fd(dir), name, &a, unix.AT_SYMLINK_NOFOLLOW) != nil ||
+		unix.Fstatat(fd(dir), other, &b, unix.AT_SYMLINK_NOFOLLOW) != nil ||
+		a.Dev != b.Dev || a.Ino != b.Ino {
+		return name // byte-exact: the lookup that reached name was exact
+	}
+	return normalizationVariant(dir, name)
 }
 
 // mayHaveVariants reports whether another spelling of name can normalize to

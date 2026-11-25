@@ -24,9 +24,14 @@ const holdingPrefix = ".syncd-hold-"
 // as an issue (see Tree.Scan). A sibling rename costs one metadata
 // operation, where a private holding directory per claim cost three more
 // (mkdir, open, rmdir) - round trips on a network share.
-func claimEntry(parent *os.File, leaf string) (*Tree, string, func(error) error, error) {
+//
+// It also returns the spelling under which parent stored leaf (see
+// storedSpelling). A restore puts the entry back under that name, and
+// a caller publishing a replacement must use it too: on APFS the NFC key
+// reaches an NFD-stored file, and republishing under the key would rename it.
+func claimEntry(parent *os.File, leaf string) (claimed *Tree, held, stored string, finish func(error) error, err error) {
+	leaf = storedSpelling(parent, leaf)
 	var hold string
-	var err error
 	for range maxTempSiblingAttempts {
 		hold = holdingPrefix + tempSiblingPath(leaf)
 		if err = publishExclusive(parent, leaf, parent, hold); !os.IsExist(err) {
@@ -34,9 +39,9 @@ func claimEntry(parent *os.File, leaf string) (*Tree, string, func(error) error,
 		}
 	}
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
-	finish := func(cause error) error {
+	finish = func(cause error) error {
 		if cause != nil {
 			if err := publishExclusive(parent, hold, parent, leaf); err != nil {
 				return fmt.Errorf("%w; original retained at %s (restore failed: %v)", cause, filepath.Join(parent.Name(), hold), err)
@@ -44,7 +49,7 @@ func claimEntry(parent *os.File, leaf string) (*Tree, string, func(error) error,
 		}
 		return cause
 	}
-	return &Tree{dir: parent, borrowed: true}, hold, finish, nil
+	return &Tree{dir: parent, borrowed: true}, hold, leaf, finish, nil
 }
 
 // exclusiveRename and hardLink are seams so tests can simulate a mount
