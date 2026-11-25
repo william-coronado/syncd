@@ -81,7 +81,7 @@ func (t *Trash) RemoveFrom(source *Tree, rel string, check EntryCheck) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("refusing to remove non-regular entry: %s", rel)
 	}
-	claimed, held, finish, err := claimEntry(parent, leaf)
+	claimed, held, _, finish, err := claimEntry(parent, leaf)
 	if os.IsNotExist(err) {
 		return nil
 	}

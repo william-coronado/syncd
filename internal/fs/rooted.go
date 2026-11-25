@@ -171,11 +171,15 @@ func resolveLeaf(dir *os.File, want string) string {
 	return normalizationVariant(dir, want)
 }
 
-// normalizationVariant returns the one entry of dir, other than want, that
-// is the same name as want up to Unicode normalization - or want itself if
-// there is none, or several (the collision the scanner refuses to sync;
-// picking one would act on a file the scan never attributed to this path).
-// Callers have already found want itself missing.
+// normalizationVariant returns the spelling under which dir stores want:
+// want itself if dir holds those exact bytes, else the one entry that is
+// the same name up to Unicode normalization - or want if there is none, or
+// several (the collision the scanner refuses to sync; picking one would act
+// on a file the scan never attributed to this path).
+//
+// Finding want by lookup is not enough to know its spelling: APFS matches
+// names regardless of normalization, so the NFC key opens an NFD-stored
+// file there while the directory still lists it as NFD.
 func normalizationVariant(dir *os.File, want string) string {
 	if !mayHaveVariants(want) {
 		return want
@@ -194,9 +198,12 @@ func normalizationVariant(dir *os.File, want string) string {
 	key := norm.NFC.String(want)
 	match := ""
 	for _, name := range names {
+		if name == want {
+			return want
+		}
 		// An ASCII name is its own NFC form, so it can only equal key by
 		// being want itself.
-		if name == want || isASCII(name) || norm.NFC.String(name) != key {
+		if isASCII(name) || norm.NFC.String(name) != key {
 			continue
 		}
 		if match != "" {

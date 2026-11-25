@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -149,6 +150,75 @@ func TestTree_AmbiguousNormalizationVariantsAreNotResolved(t *testing.T) {
 	defer tree.Close()
 	if _, err := tree.Lstat(nfc); !os.IsNotExist(err) {
 		t.Fatalf("want not-exist for an ambiguous name, got %v", err)
+	}
+}
+
+// A replace claims the existing entry, then publishes the new file under
+// the name it was claimed by. On a normalization-insensitive filesystem
+// (APFS) the NFC key already reaches an NFD-stored file, so that name must
+// be the stored spelling, not the key: otherwise the replacement quietly
+// renames the user's file to NFC.
+func TestCopyChecked_ReplaceKeepsStoredNormalizationForm(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, nfcCafe+".txt"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, nfdCafe+".txt"), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source, err := OpenTree(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	dest, err := OpenTree(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+
+	accept := func(*Tree, string) error { return nil }
+	if err := CopyChecked(source, nfcCafe+".txt", dest, nfcCafe+".txt", true, accept, nil); err != nil {
+		t.Fatalf("CopyChecked: %v", err)
+	}
+	assertOnlyName(t, dst, nfdCafe+".txt")
+	if got, _ := os.ReadFile(filepath.Join(dst, nfdCafe+".txt")); string(got) != "v2" {
+		t.Fatalf("content = %q, want the replacement", got)
+	}
+}
+
+// A removal refused after the claim puts the file back under the spelling
+// it had, not the NFC key it was looked up by.
+func TestTrashRemoveFrom_RefusalRestoresStoredNormalizationForm(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, nfdCafe+".txt"), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := OpenTree(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+
+	refuse := func(*Tree, string) error { return os.ErrPermission }
+	if err := NewTrash(t.TempDir()).RemoveFrom(tree, nfcCafe+".txt", refuse); err == nil {
+		t.Fatal("RemoveFrom succeeded despite the refusing check")
+	}
+	assertOnlyName(t, root, nfdCafe+".txt")
+}
+
+func assertOnlyName(t *testing.T, dir, name string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != name {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, fmt.Sprintf("%+q", e.Name()))
+		}
+		t.Fatalf("%s holds %v, want only %+q", dir, names, name)
 	}
 }
 
