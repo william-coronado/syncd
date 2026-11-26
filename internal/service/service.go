@@ -38,14 +38,30 @@ type Runner func(name string, args ...string) (string, error)
 // systemctl that hangs must not hang syncd with it.
 const commandTimeout = 30 * time.Second
 
-// ExecRunner is the Runner that really runs commands. Every caller in this
-// package passes a literal program name (launchctl, systemctl, loginctl);
-// the only user-supplied text in the arguments is a service name already
-// restricted by validateName.
+// allowedCommands are the only programs ExecRunner will run: the service
+// managers this package drives. Anything else is refused.
+var allowedCommands = map[string]bool{
+	"launchctl": true,
+	"systemctl": true,
+	"loginctl":  true,
+}
+
+// ExecRunner is the Runner that really runs commands. It runs only the
+// programs in allowedCommands, resolved with exec.LookPath, and passes
+// arguments straight to the program (never through a shell). The only
+// user-supplied text in the arguments is a service name already restricted
+// by validateName.
 func ExecRunner(name string, args ...string) (string, error) {
+	if !allowedCommands[name] {
+		return "", fmt.Errorf("refusing to run %q: not a service-manager command", name)
+	}
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, path, args...).CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		return strings.TrimSpace(string(out)), fmt.Errorf("%s did not finish within %s", name, commandTimeout)
 	}
