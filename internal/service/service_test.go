@@ -336,3 +336,11 @@ func TestRejectsBadNameAndPlatform(t *testing.T) {
 		t.Error("Install succeeded on an unsupported platform")
 	}
 }
+
+func TestExecRunnerRefusesUnlistedCommand(t *testing.T) {
+	for _, name := range []string{"sh", "/bin/sh", "launchctl; rm -rf /", "./launchctl", ""} {
+		if _, err := ExecRunner(name, "-c", "true"); err == nil {
+			t.Errorf("ExecRunner(%q) ran; want refusal", name)
+		}
+	}
+}
