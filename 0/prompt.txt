@@ -1,0 +1,29 @@
+<pasted_content id="2c1a">
+Please fix the following security issue:
+
+<issue>
+Command injection from untrusted input passed to exec.Command
+
+Command injection could execute arbitrary system commands, enabling remote code execution and full server compromise.
+
+User-controlled strings build the command or arguments for exec.Command, or run via sh -c, without strict validation or allowlisting.
+</issue>
+
+<locations>
+internal/service/service.go:48
+</locations>
+
+<fix>
+Use a fixed executable path and pass user data only as separate arguments to exec.Command. Do not use sh -c or command concatenation. Validate or allowlist acceptable arguments and commands. Resolve executables with exec.LookPath.
+</fix>
+
+<fix_impact>
+Stricter validation or command allowlists may reject previously accepted command names or flags.
+</fix_impact>
+
+Keep the changes minimal - only make the necessary code changes to fix the security issue.
+</pasted_content id="2c1a">
+
+---
+
+put it on a branch and open a PR
